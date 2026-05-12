@@ -14,7 +14,7 @@ import (
 	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
 	"github.com/h2oflow/h2oflow/apps/api/internal/kmlimport"
 	"github.com/h2oflow/h2oflow/apps/api/internal/nldi"
-	gauge "github.com/h2oflow/h2oflow/packages/gauge-core"
+	gauge "github.com/h2oflow/h2oflow/apps/api/internal/gaugecore"
 )
 
 type AdminHandler struct {

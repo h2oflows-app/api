@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	gauge "github.com/h2oflow/h2oflow/packages/gauge-core"
+	gauge "github.com/h2oflow/h2oflow/apps/api/internal/gaugecore"
 	"github.com/h2oflow/h2oflow/apps/api/internal/db"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
