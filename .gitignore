@@ -1,0 +1,44 @@
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/vendor/
+
+# Built binaries (use `go run ./cmd/... instead)
+/bin/
+/server
+/import-kml
+/embed-reaches
+/seed-reaches
+/seed-state-reaches
+/cmd/server/__debug_bin*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Claude memory — all memory files stay local
+.claude/memory/
+
+# CodeSight generated analysis — regenerate with `codesight scan`
+.codesight/
+
+# Project decisions log — local only
+DECISIONS.md
+.mcp.json
