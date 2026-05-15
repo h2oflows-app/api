@@ -411,7 +411,7 @@ func dedupeFlowlines(features []nldi.Feature) []nldi.Feature {
 	for _, f := range features {
 		id := ""
 		if f.Props.NhdplusComID != nil {
-			id = *f.Props.NhdplusComID
+			id = string(*f.Props.NhdplusComID)
 		}
 		if id == "" {
 			out = append(out, f)

@@ -64,7 +64,7 @@ func fetchNLDIRiverLineWithClient(ctx context.Context, c *nldi.Client, putInLon,
 	// silently trimming against an unrelated mainstem tail.
 	foundTakeOut := false
 	for _, f := range coll.Features {
-		if f.Props.NhdplusComID != nil && *f.Props.NhdplusComID == takeOut.ComID {
+		if f.Props.NhdplusComID != nil && string(*f.Props.NhdplusComID) == takeOut.ComID {
 			foundTakeOut = true
 			break
 		}
@@ -109,7 +109,7 @@ func fetchNLDIRiverLineByComIDWithClient(ctx context.Context, c *nldi.Client, up
 
 	foundTakeOut := false
 	for _, f := range coll.Features {
-		if f.Props.NhdplusComID != nil && *f.Props.NhdplusComID == downComID {
+		if f.Props.NhdplusComID != nil && string(*f.Props.NhdplusComID) == downComID {
 			foundTakeOut = true
 			break
 		}

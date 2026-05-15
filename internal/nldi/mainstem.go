@@ -25,7 +25,7 @@ func SampleDownstreamComIDs(features []Feature, spacingKm float64, maxAnchors in
 		}
 		comid := ""
 		if f.Props.NhdplusComID != nil {
-			comid = *f.Props.NhdplusComID
+			comid = string(*f.Props.NhdplusComID)
 		}
 
 		coords, err := flowlineCoords(f)
@@ -84,7 +84,7 @@ func MergeMainstem(features []Feature, targetComID string) ([]Coord, error) {
 		} else {
 			out = append(out, coords[1:]...)
 		}
-		if targetComID != "" && f.Props.NhdplusComID != nil && *f.Props.NhdplusComID == targetComID {
+		if targetComID != "" && f.Props.NhdplusComID != nil && string(*f.Props.NhdplusComID) == targetComID {
 			break
 		}
 	}

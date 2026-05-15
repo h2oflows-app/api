@@ -9,14 +9,35 @@
 // Docs: https://api.water.usgs.gov/nldi/
 package nldi
 
+import "encoding/json"
+
+// ComIDValue is a string-typed ComID that unmarshals from both JSON string and
+// JSON number. NLDI historically documented nhdplus_comid as a string but now
+// returns it as an integer — this type handles both without breaking callers.
+type ComIDValue string
+
+func (v *ComIDValue) UnmarshalJSON(data []byte) error {
+	var n json.Number
+	if json.Unmarshal(data, &n) == nil {
+		*v = ComIDValue(n.String())
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	*v = ComIDValue(s)
+	return nil
+}
+
 // Feature is a GeoJSON feature as returned by NLDI endpoints.
 // Geometry coordinates are always [lng, lat] pairs (GeoJSON order).
 // The union on Coordinates mirrors the API: Point geometries return []float64,
 // LineString returns [][]float64, MultiLineString returns [][][]float64.
 type Feature struct {
-	Type     string          `json:"type"`
-	Geometry Geometry        `json:"geometry"`
-	Props    FeatureProps    `json:"properties"`
+	Type     string       `json:"type"`
+	Geometry Geometry     `json:"geometry"`
+	Props    FeatureProps `json:"properties"`
 }
 
 type Geometry struct {
@@ -27,13 +48,13 @@ type Geometry struct {
 // FeatureProps captures the subset of NLDI feature properties h2oflows reads.
 // NLDI returns additional fields we ignore (sourcename, mainstem, etc).
 type FeatureProps struct {
-	Identifier   string   `json:"identifier"`    // e.g. "USGS-09058000" for gauges, "14837340" for flowlines
-	Name         string   `json:"name"`          // gauge name or flowline GNIS name
-	NhdplusComID *string  `json:"nhdplus_comid"` // set on flowline features; NLDI returns as a JSON string
-	ComID        *string  `json:"comid"`         // set on gauge features — the reach the gauge sits on
-	ReachCode    *string  `json:"reachcode"`
-	GnisName     *string  `json:"gnis_name"`
-	TotDASqKm    *float64 `json:"totdasqkm"`
+	Identifier   string      `json:"identifier"`    // e.g. "USGS-09058000" for gauges, "14837340" for flowlines
+	Name         string      `json:"name"`          // gauge name or flowline GNIS name
+	NhdplusComID *ComIDValue `json:"nhdplus_comid"` // set on flowline features; NLDI returns int or string
+	ComID        *ComIDValue `json:"comid"`         // set on gauge features — the reach the gauge sits on; NLDI returns int or string
+	ReachCode    *string     `json:"reachcode"`
+	GnisName     *string     `json:"gnis_name"`
+	TotDASqKm    *float64    `json:"totdasqkm"`
 }
 
 type Collection struct {
