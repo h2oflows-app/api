@@ -2,9 +2,18 @@
 
 Current state as of May 2026. Phase 1 (gauge dashboard + reach pages + AI assistant) is complete. Backend routes exist for trip reports, trips, contributions, and proximity events — the frontend for those is stub. Everything below is unbuilt or incomplete.
 
+**Status snapshot (2026-05-14):**
+- ✅ Phase 2 (2.1–2.6) — shipped 2026-05-06
+- ✅ Phase 2b (2b.1–2b.7) — shipped 2026-05-07
+- ✅ Repository restructure — completed 2026-05-13; live at `h2oflows-app/{api,web,docs}`
+- 🔧 **Phase 2c — Pilot polish** (active; tracks issues filed on `h2oflows-app/web`)
+- ⏳ Demo Pack (0.3.0) — 3.1–3.4 pending
+- ⏳ Pilot rollout (0.x) — pending Phase 2c + Demo Pack
+- ⏳ Phase 3+ — deferred
+
 ---
 
-## Phase 2 — Pilot polish + personal data layer
+## Phase 2 — Pilot polish + personal data layer ✅ shipped 2026-05-06
 
 *Attractive interface + pilot onboarding. Private user reaches and custom gauges before any community/social features.*
 
@@ -355,7 +364,7 @@ Each migration self-contained, reversible. Order matters: 68 first (band format 
 
 ---
 
-## Phase 2b — Reports + multi-dashboards + theming
+## Phase 2b — Reports + multi-dashboards + theming ✅ shipped 2026-05-07
 
 *Contribution layer rebuilt around a unified Reports concept. Trip reports, hazard warnings, and conditions board collapse into one entity. Adds tabbed dashboards and a theme picker. Re-planned from `NewFeatures.md` 2026-05-06; supersedes the original 2b split.*
 
@@ -634,6 +643,73 @@ Old tables (`trip_reports`, `hazards`, `reach_conditions`) remain through 2b. A 
 
 ---
 
+## Phase 2c — Pilot polish (0.2.x patches)
+
+*Bug-and-polish pass driven by issues filed on `h2oflows-app/web` after 2b shipped. Gates pilot outreach — mobile acid-test scenarios and admin regressions must clear before any of the six contacts get a link. Sequenced as small PRs against `main`, each tagged as a `0.2.x` patch.*
+
+### 2c.0 — P0 regression
+
+**[web#11] NHD flowline unclickable in admin New Reach.** Regression in 2.2 admin reach flow — clicking a flowline does nothing on the map. Blocks all admin reach creation. Fix immediately as a standalone PR. Bisect recent map-related PRs; suspect MapLibre layer interactivity or pointer-event z-stacking.
+
+### 2c.1 — Mobile pilot blockers
+
+Pilot rollout (below) acid-tests on phones. Each of these breaks a core flow on mobile.
+
+- **[web#10] Fonts too small on mobile.** Root utility pass — bump base font-size + utility icon sizes via Tailwind responsive variants. Pad/margin pass to let content consume full viewport width on mobile.
+- **[web#13] Reach-detail buttons bleed off right edge on mobile.** "Add to dashboard" / "Edit" / "Share" stack or shrink to icons on narrow viewports. Resolved together with 2c.2 toolbar rework — same toolbar pattern.
+- **[web#9] Gauge / reach modals near-full-screen on mobile.** Maximize vertical + horizontal space, explicit X close button.
+- **[web#7] Dashboard toolbar margin gap.** Content shows through gap between AppHeader and sticky tab bar on scroll. Dashboard tab header must sit flush at bottom of navbar (no gap). Likely a `top-` offset mismatch — `feedback_appheader_height.md` notes AppHeader is `h-[50px]` and sticky bars use `top-12.75`.
+
+Bundle as one PR per fix or one polish PR — fixer's call. SEO blocking (3.4) piggybacks on whichever lands first.
+
+### 2c.2 — Reach detail + toolbar rework
+
+Layout pass on the reach detail page, plus a standardized toolbar shared with the dashboard.
+
+- **[web#15] Re-arrange reach detail page.**
+  - Description underneath the reach title
+  - Buttons minimized to icons in a toolbar at the top, right of title, above description
+  - "Ask" section moved under the toolbar
+  - Reports section moved to the bottom; paginated 5 / 10 / 50 max
+- **[web#14] Replace "Share" button with "Create Report" button on reach detail.** Pre-fills reach + date + any context already on hand. Already promised in 2b.2 ("Add report button — pre-fills reach"); just not built. Share lives in the report itself (already shipped 2b.3).
+- **[web#12] Standardize dashboard toolbar.** Common toolbar component shared with reach-detail toolbar from web#15. View-mode, group, expand-all, add-gauge in one row; consistent icon set, sizes, colors. "Expand all" gets an icon. "Add gauge" moves out of right-corner isolation into the utility cluster.
+
+Ship as one PR — toolbar component lands once, both surfaces consume it.
+
+### 2c.3 — Dashboard "My Reaches" merge
+
+**[web#8] Merge "My Reaches" into the main curated dashboard list.** Reverses the 2.4 decision to keep user reaches under the avatar menu only. New behavior: all reaches grouped together by state → basin → river, with a user-outline icon (primary color, no avatar circle) marking user reaches inline. The "My Reaches" sidebar/section is removed from the dashboard surface; avatar menu entry stays for the management view.
+
+*Caveat:* this is a deliberate reversal of a prior product call. Confirm intent with at least one pilot tester before shipping if pilot is imminent. If shipped, `feedback_user_content_private.md` still holds — these are private rows, just rendered inline.
+
+### 2c.4 — Polling polish (extends shipped 2.5)
+
+**[web#16] Offline gauge surfacing + cold-start UX.** 2.5 shipped `poll_health` columns and the `polled_gauge_ids` view; this is the missing user-visible layer.
+
+- Admin Rivers tab "offline" summary lists the specific reaches whose gauge is unhealthy, not just a count
+- When a gauge is added to a dashboard (watchlist) for the first time, fetch an instant value synchronously and start regular polling
+- If a gauge has no readings yet, the dashboard card shows a "waiting to collect data" placeholder near the sparkline (keeps the sparkline slot, doesn't collapse it)
+- Same "waiting" message on reach detail when the associated gauge has never been polled
+- Gauges that are polled but not associated with any reach or dashboard fall back to a 1× / week tick — keeps the row warm without paying the 15-minute cost
+
+No schema change required — extends `polled_gauge_ids` view union + adds a `last_polled_at IS NULL` UI branch. If a poll-cadence column is needed, add as migration `000084`.
+
+### Sequencing
+
+```
+0.2.1  →  2c.0 (#11)         + 3.4 SEO blocking (trivial piggyback)
+0.2.2  →  2c.1 (#10,#13,#9,#7) — mobile sprint
+0.2.3  →  2c.2 (#15,#14,#12) — reach detail + toolbar
+0.2.4  →  2c.3 (#8)           — my-reaches inline (confirm intent first)
+0.2.5  →  2c.4 (#16)          — polling polish
+
+→ then Demo Pack (0.3.0)
+```
+
+Web issues stay open against `h2oflows-app/web` until their PR merges; close on merge with the PR ref.
+
+---
+
 ## Demo Pack (0.3.0)
 
 *Pre-pilot feature extraction + new build to make the app demo-ready for the six pilot contacts. Each item below is either a polish-and-surface pass on an existing feature or a small new build. Lands as `0.3.0` once all four ship.*
@@ -683,9 +759,13 @@ Block search engines from indexing curated reach + report pages until 1.0 ships.
 
 ---
 
-## Repository restructure (pre-pilot)
+## Repository restructure (pre-pilot) ✅ completed 2026-05-13
 
 *Split the monorepo into a GitHub org with three independent repos before pilot outreach. Cleaner deployment story per surface, separate release cadence per layer, easier to hand a single repo to a contributor (e.g. AW collaboration) without exposing the rest.*
+
+**Outcome:** `h2oflows-app/{api,web,docs}` all LIVE. API on EC2 at `api.h2oflows.app` (docker+Caddy), web on Netlify at `h2oflows.app`, docs on Netlify at `docs.h2oflows.app`. Original monorepo archived with `pre-split` tag + redirect README. `packages/gauge-core` flattened into `api/internal/gaugecore/`. Branch protection enabled on `api` + `web` main (1 approval, stale review dismissal, no force push). See `project_repo_split.md` memory for the full decision log.
+
+The section below is preserved as the historical plan; for current deploy procedure see `h2oflows-app/api/CLAUDE.md`.
 
 GitHub org is `h2oflows-app` (the bare `h2oflows` org name was unavailable). Production domain is `h2oflows.app`.
 
