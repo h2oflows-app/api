@@ -776,6 +776,47 @@ No schema change required — extends `polled_gauge_ids` view union + adds a `la
 1. cmd + migration 000085 (corrections table) — independent
 2. migration 000084 — only after backfill verified
 
+### 2c.7 — Explore page polish
+
+**Problem.**
+- H2OFlows / My Reaches mode toggle lives at top of sidebar — pushes search down, mixed in with list metadata, easy to miss.
+- "+ New reach" button is a tiny ghost icon, admin-only, only triggers the curated-create flow. No path to import a shared reach from the explore page.
+
+**Changes:**
+
+**1. Floating mode toggle on map.**
+- Pill segmented control `[ H2OFlows | My Reaches ]` floating in the **top-left** of the map area (top-right reserved for MapLibre zoom controls).
+- Authenticated users only (same gating as today).
+- Replaces inline block at `explore.vue:25-41`. Same `mode` ref drives sidebar list + `mapSourceUrl` — relocation only, no logic change.
+- Mobile: pill at top-left of map; existing "N reaches" list-toggle button shifts to avoid collision.
+
+**2. Prominent + button at top of sidebar.**
+- Replace tiny ghost icon (`explore.vue:51-61`) with full-width button below search bar: `+  New reach`, primary-color icon, ~36px height.
+- Visible to all authenticated users (not just admins). Admin gating moves into the picker.
+- Click → popover positioned below the button:
+  ```
+  ┌──────────────────────┐
+  │ ✏  Create New        │
+  │ ↓  Import shared…    │
+  └──────────────────────┘
+  ```
+  - Admin in curated mode → "Create New" opens existing ReachAuthor modal.
+  - Non-admin or user mode → "Create New" routes to `/my/reaches/new`.
+  - "Import shared…" → opens new `ReachImportModal.vue` for all authenticated users.
+
+**3. Import flow.**
+- Extract paste-JSON UX from `GaugeSearchModal.vue:450-475` into reusable `components/reach/ReachImportModal.vue`.
+- Reuses existing `POST /api/v1/me/reaches/import` endpoint — no backend changes required.
+- Modal accepts pasted JSON for MVP. Share-URL handling (`/share/reach/<token>`) deferred to a separate roadmap item.
+
+**Effort:** ~4h. 1h toggle relocation, 1h + button + picker popover, 2h `ReachImportModal.vue` extraction + wiring.
+
+**Verification:**
+- Sidebar: search → big + button → list (no mode toggle inside sidebar).
+- Map: pill toggle visible top-left, mode persists across reloads via existing ref.
+- + picker: Create New routes correctly per admin/user; Import opens modal, paste valid JSON → reach lands in My Reaches mode.
+- Mobile: pill doesn't collide with map controls or list-toggle button.
+
 ### Sequencing
 
 ```
@@ -785,9 +826,10 @@ No schema change required — extends `polled_gauge_ids` view union + adds a `la
 0.2.4  →  2c.3 (#8)           — my-reaches inline (confirm intent first)
 0.2.5  →  2c.4 (#16)          — polling polish
 0.2.8  →  2c.6a               — river identity bugfix (unsticks NFK South Platte)  ✅
-0.2.9  →  2c.6b               — backfill cmd + corrections table migration
-0.2.10 →  2c.6c–e             — admin curation UI + user feedback banner + backend cleanup
-0.2.11 →  migration 000084    — gnis_id NOT NULL + drop verified/basin_locked (post-backfill)
+0.2.9  →  2c.7                — explore page polish (toggle relocation + import picker)
+0.2.10 →  2c.6b               — backfill cmd + corrections table migration
+0.2.11 →  2c.6c–e             — admin curation UI + user feedback banner + backend cleanup
+0.2.12 →  migration 000084    — gnis_id NOT NULL + drop verified/basin_locked (post-backfill)
 
 → then Demo Pack (0.3.0)
 ```
