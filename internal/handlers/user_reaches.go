@@ -29,9 +29,22 @@ func resolveOrCreateRiver(ctx context.Context, db *pgxpool.Pool, riverName, gnis
 
 	if rid == "" {
 		_ = db.QueryRow(ctx, `SELECT id FROM rivers WHERE lower(name) = lower($1) LIMIT 1`, riverName).Scan(&rid)
-		// Backfill GNIS ID on legacy row that pre-dates the gnis_id column.
-		if rid != "" && gnisID != "" {
-			_, _ = db.Exec(ctx, `UPDATE rivers SET gnis_id = $1 WHERE id = $2 AND gnis_id IS NULL`, gnisID, rid)
+	}
+
+	// Backfill GNIS ID + state/basin/huc8 on existing river if we now have a GNIS ID.
+	if rid != "" && gnisID != "" {
+		var existingGnis, existingState *string
+		_ = db.QueryRow(ctx, `SELECT gnis_id, state_abbr FROM rivers WHERE id = $1`, rid).Scan(&existingGnis, &existingState)
+		if existingGnis == nil || existingState == nil {
+			stateAbbr, basin, huc8 := riverMetaFromGNIS(ctx, gnisID)
+			_, _ = db.Exec(ctx, `
+				UPDATE rivers SET
+					gnis_id    = COALESCE(gnis_id, $2),
+					state_abbr = COALESCE(state_abbr, NULLIF($3,'')),
+					basin      = COALESCE(basin,      NULLIF($4,'')),
+					huc8       = COALESCE(huc8,       NULLIF($5,''))
+				WHERE id = $1
+			`, rid, gnisID, stateAbbr, basin, huc8)
 		}
 	}
 
@@ -45,7 +58,12 @@ func resolveOrCreateRiver(ctx context.Context, db *pgxpool.Pool, riverName, gnis
 		_ = db.QueryRow(ctx, `
 			INSERT INTO rivers (slug, name, gnis_id, state_abbr, basin, huc8)
 			VALUES ($1, $2, $3, NULLIF($4,''), NULLIF($5,''), NULLIF($6,''))
-			ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name
+			ON CONFLICT (slug) DO UPDATE SET
+				name       = EXCLUDED.name,
+				gnis_id    = COALESCE(rivers.gnis_id,    EXCLUDED.gnis_id),
+				state_abbr = COALESCE(rivers.state_abbr, EXCLUDED.state_abbr),
+				basin      = COALESCE(rivers.basin,      EXCLUDED.basin),
+				huc8       = COALESCE(rivers.huc8,       EXCLUDED.huc8)
 			RETURNING id
 		`, riverSlug, riverName, gnisParam, stateAbbr, basin, huc8).Scan(&rid)
 	}
@@ -771,6 +789,7 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		Name      *string `json:"name"`
 		Note      *string `json:"note"`
 		RiverName *string `json:"river_name"`
+		GnisID    *string `json:"gnis_id"`
 		PutIn     *latLng `json:"put_in"`
 		TakeOut   *latLng `json:"take_out"`
 		UpComID   *string `json:"up_comid"`
@@ -803,6 +822,20 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if err != nil || tag.RowsAffected() == 0 {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
 		return
+	}
+
+	// Re-resolve river when river_name is being set, so state/basin/huc8 get populated.
+	if riverName != nil {
+		gnisID := ""
+		if body.GnisID != nil {
+			gnisID = strings.TrimSpace(*body.GnisID)
+		}
+		rid := resolveOrCreateRiver(ctx, h.db, *riverName, gnisID)
+		if rid != "" {
+			_, _ = h.db.Exec(ctx,
+				`UPDATE user_reaches SET river_id = $3 WHERE owner_id = $1 AND slug = $2`,
+				ownerID, slug, rid)
+		}
 	}
 
 	// Geometry update — only when all four geometry fields provided.

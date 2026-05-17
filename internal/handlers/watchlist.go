@@ -24,6 +24,7 @@ type watchlistItem struct {
 	GaugeID       *string `json:"gauge_id"`
 	CustomGaugeID *string `json:"custom_gauge_id"`
 	ReachSlug     *string `json:"reach_slug"`
+	DashboardID   *string `json:"dashboard_id"`
 }
 
 // List handles GET /api/v1/watchlist?dashboard_id=<uuid>
@@ -48,14 +49,14 @@ func (h *WatchlistHandler) List(w http.ResponseWriter, r *http.Request) {
 
 	if dashboardID != "" {
 		pgrows, err = h.db.Query(r.Context(), `
-			SELECT gauge_id::text, custom_gauge_id::text, reach_slug
+			SELECT gauge_id::text, custom_gauge_id::text, reach_slug, dashboard_id::text
 			FROM   user_watchlists
 			WHERE  user_id = $1 AND dashboard_id = $2::uuid
 			ORDER  BY created_at
 		`, userID, dashboardID)
 	} else {
 		pgrows, err = h.db.Query(r.Context(), `
-			SELECT gauge_id::text, custom_gauge_id::text, reach_slug
+			SELECT gauge_id::text, custom_gauge_id::text, reach_slug, dashboard_id::text
 			FROM   user_watchlists
 			WHERE  user_id = $1
 			ORDER  BY created_at
@@ -70,7 +71,7 @@ func (h *WatchlistHandler) List(w http.ResponseWriter, r *http.Request) {
 	items := []watchlistItem{}
 	for pgrows.Next() {
 		var item watchlistItem
-		if err := pgrows.Scan(&item.GaugeID, &item.CustomGaugeID, &item.ReachSlug); err == nil {
+		if err := pgrows.Scan(&item.GaugeID, &item.CustomGaugeID, &item.ReachSlug, &item.DashboardID); err == nil {
 			if item.CustomGaugeID != nil {
 				item.Kind = "custom_gauge"
 			} else {
