@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -105,6 +106,27 @@ type userReachSummary struct {
 	CreatedAt        time.Time  `json:"created_at"`
 }
 
+type userReachRapid struct {
+	ID                string   `json:"id"`
+	Name              string   `json:"name"`
+	Description       *string  `json:"description"`
+	ClassRating       *float64 `json:"class_rating"`
+	IsSurfWave        bool     `json:"is_surf_wave"`
+	IsPermanentHazard bool     `json:"is_permanent_hazard"`
+	HazardType        *string  `json:"hazard_type"`
+	Lng               *float64 `json:"lng"`
+	Lat               *float64 `json:"lat"`
+}
+
+type userReachAccessPoint struct {
+	ID         string   `json:"id"`
+	AccessType string   `json:"access_type"`
+	Name       *string  `json:"name"`
+	Notes      *string  `json:"notes"`
+	Lng        *float64 `json:"lng"`
+	Lat        *float64 `json:"lat"`
+}
+
 type userReachDetail struct {
 	userReachSummary
 	RiverSlug       *string              `json:"river_slug"`
@@ -121,7 +143,9 @@ type userReachDetail struct {
 	GaugeLastPollSuccess  *time.Time           `json:"gauge_last_poll_success_at"`
 	CustomGaugeID         *string              `json:"custom_gauge_id"`
 	CustomGaugeName       *string              `json:"custom_gauge_name"`
-	FlowRanges            []userReachFlowRange `json:"flow_ranges"`
+	FlowRanges            []userReachFlowRange  `json:"flow_ranges"`
+	Rapids                []userReachRapid      `json:"rapids"`
+	AccessPoints          []userReachAccessPoint `json:"access_points"`
 }
 
 // ── MapAll ────────────────────────────────────────────────────────────────────
@@ -441,6 +465,48 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 			var fr userReachFlowRange
 			if frRows.Scan(&fr.Label, &fr.MinValue, &fr.MaxValue) == nil {
 				d.FlowRanges = append(d.FlowRanges, fr)
+			}
+		}
+	}
+
+	// Rapids
+	d.Rapids = make([]userReachRapid, 0)
+	rapRows, _ := h.db.Query(r.Context(), `
+		SELECT id, name, description, class_rating,
+		       is_surf_wave, is_permanent_hazard, hazard_type,
+		       ST_X(location::geometry), ST_Y(location::geometry)
+		FROM rapids
+		WHERE user_reach_id = $1
+		ORDER BY name
+	`, d.ID)
+	if rapRows != nil {
+		defer rapRows.Close()
+		for rapRows.Next() {
+			var rr userReachRapid
+			if rapRows.Scan(&rr.ID, &rr.Name, &rr.Description, &rr.ClassRating,
+				&rr.IsSurfWave, &rr.IsPermanentHazard, &rr.HazardType,
+				&rr.Lng, &rr.Lat) == nil {
+				d.Rapids = append(d.Rapids, rr)
+			}
+		}
+	}
+
+	// Access points
+	d.AccessPoints = make([]userReachAccessPoint, 0)
+	apRows, _ := h.db.Query(r.Context(), `
+		SELECT id, access_type, name, notes,
+		       ST_X(location::geometry), ST_Y(location::geometry)
+		FROM reach_access
+		WHERE user_reach_id = $1
+		ORDER BY access_type, name
+	`, d.ID)
+	if apRows != nil {
+		defer apRows.Close()
+		for apRows.Next() {
+			var ap userReachAccessPoint
+			if apRows.Scan(&ap.ID, &ap.AccessType, &ap.Name, &ap.Notes,
+				&ap.Lng, &ap.Lat) == nil {
+				d.AccessPoints = append(d.AccessPoints, ap)
 			}
 		}
 	}
@@ -1023,4 +1089,47 @@ func (h *UserReachHandler) SetGauge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// ImportKML handles POST /api/v1/me/reaches/{slug}/kml
+// Accepts multipart/form-data with a "file" field containing a KML or KMZ file.
+// Imports all point placemarks as pins into the authenticated owner's user reach.
+func (h *UserReachHandler) ImportKML(w http.ResponseWriter, r *http.Request) {
+	ownerID, ok := h.ownerID(r)
+	if !ok {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	slug := chi.URLParam(r, "slug")
+
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		errorResponse(w, http.StatusBadRequest, "invalid multipart form: "+err.Error())
+		return
+	}
+	f, _, err := r.FormFile("file")
+	if err != nil {
+		errorResponse(w, http.StatusBadRequest, "missing 'file' field")
+		return
+	}
+	defer f.Close()
+
+	data, err := io.ReadAll(f)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "read file: "+err.Error())
+		return
+	}
+
+	doc, err := kmlimport.ParseKMLBytes(data)
+	if err != nil {
+		errorResponse(w, http.StatusUnprocessableEntity, "parse KML: "+err.Error())
+		return
+	}
+
+	imp := kmlimport.New(h.db, false)
+	res, err := imp.ImportForUserReach(r.Context(), ownerID, slug, doc)
+	if err != nil {
+		errorResponse(w, http.StatusNotFound, err.Error())
+		return
+	}
+	jsonResponse(w, http.StatusOK, res)
 }
