@@ -41,13 +41,12 @@ func resolveOrCreateRiver(ctx context.Context, db *pgxpool.Pool, riverName, gnis
 			gnisParam = gnisID
 			stateAbbr, basin, huc8 = riverMetaFromGNIS(ctx, gnisID)
 		}
-		verified := gnisID != ""
 		_ = db.QueryRow(ctx, `
-			INSERT INTO rivers (slug, name, gnis_id, state_abbr, basin, huc8, verified)
-			VALUES ($1, $2, $3, NULLIF($4,''), NULLIF($5,''), NULLIF($6,''), $7)
+			INSERT INTO rivers (slug, name, gnis_id, state_abbr, basin, huc8)
+			VALUES ($1, $2, $3, NULLIF($4,''), NULLIF($5,''), NULLIF($6,''))
 			ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name
 			RETURNING id
-		`, riverSlug, riverName, gnisParam, stateAbbr, basin, huc8, verified).Scan(&rid)
+		`, riverSlug, riverName, gnisParam, stateAbbr, basin, huc8).Scan(&rid)
 	}
 	return rid
 }
@@ -108,6 +107,9 @@ type userReachSummary struct {
 
 type userReachDetail struct {
 	userReachSummary
+	RiverSlug       *string              `json:"river_slug"`
+	RiverStateAbbr  *string              `json:"river_state_abbr"`
+	RiverBasin      *string              `json:"river_basin"`
 	UpComID          *string              `json:"up_comid"`
 	DownComID        *string              `json:"down_comid"`
 	Centerline       *json.RawMessage     `json:"centerline"`
@@ -379,8 +381,12 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 				WHEN fr.label = 'high'    THEN 'flood'
 				ELSE 'unknown'
 			END AS flow_status,
-			fr.label AS flow_band
+			fr.label AS flow_band,
+			rv.slug AS river_slug,
+			rv.state_abbr AS river_state_abbr,
+			rv.basin AS river_basin
 		FROM user_reaches ur
+		LEFT JOIN rivers rv ON rv.id = ur.river_id
 		LEFT JOIN gauges g ON g.id = ur.primary_gauge_id
 		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
 		LEFT JOIN LATERAL (
@@ -409,6 +415,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 		&d.CustomGaugeID, &d.CustomGaugeName,
 		&d.CurrentCFS, &d.LastReadAt,
 		&d.FlowStatus, &d.FlowBand,
+		&d.RiverSlug, &d.RiverStateAbbr, &d.RiverBasin,
 	)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "user reach not found")

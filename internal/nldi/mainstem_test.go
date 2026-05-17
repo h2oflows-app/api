@@ -8,23 +8,25 @@ import (
 
 func makeLineStringFeature(comid string, coords [][]float64) Feature {
 	raw, _ := json.Marshal(coords)
+	v := ComIDValue(comid)
 	return Feature{
 		Geometry: Geometry{
 			Type:        "LineString",
 			Coordinates: json.RawMessage(raw),
 		},
-		Props: FeatureProps{NhdplusComID: &comid},
+		Props: FeatureProps{NhdplusComID: &v},
 	}
 }
 
 func makeMultiLineStringFeature(comid string, parts [][][]float64) Feature {
 	raw, _ := json.Marshal(parts)
+	v := ComIDValue(comid)
 	return Feature{
 		Geometry: Geometry{
 			Type:        "MultiLineString",
 			Coordinates: json.RawMessage(raw),
 		},
-		Props: FeatureProps{NhdplusComID: &comid},
+		Props: FeatureProps{NhdplusComID: &v},
 	}
 }
 

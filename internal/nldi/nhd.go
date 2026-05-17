@@ -161,18 +161,19 @@ func NHDLookupByName(ctx context.Context, name string) ([]NHDNameResult, error) 
 
 // GNISLookupResult holds the coordinate and HUC8 derived from an NHD GNIS ID query.
 type GNISLookupResult struct {
+	Name  string
 	Lat   float64
 	Lng   float64
 	HUC8  string // first 8 chars of reachcode
 }
 
 // NHDCoordByGNISID queries NHD layer 6 for the first flowline feature with the
-// given GNIS ID and returns its first path vertex (WGS84) and the HUC8 derived
-// from the reachcode. Returns an error when no feature is found.
+// given GNIS ID and returns its first path vertex (WGS84), the GNIS name, and
+// the HUC8 derived from the reachcode. Returns an error when no feature is found.
 func NHDCoordByGNISID(ctx context.Context, gnisID string) (*GNISLookupResult, error) {
 	params := url.Values{
 		"where":           {fmt.Sprintf("gnis_id='%s'", gnisID)},
-		"outFields":       {"gnis_id,reachcode"},
+		"outFields":       {"gnis_id,gnis_name,reachcode"},
 		"returnGeometry":  {"true"},
 		"resultRecordCount": {"1"},
 		"inSR":            {"4326"},
@@ -195,6 +196,7 @@ func NHDCoordByGNISID(ctx context.Context, gnisID string) (*GNISLookupResult, er
 	var result struct {
 		Features []struct {
 			Attributes struct {
+				GnisName  string `json:"gnis_name"`
 				ReachCode string `json:"reachcode"`
 			} `json:"attributes"`
 			Geometry struct {
@@ -220,5 +222,5 @@ func NHDCoordByGNISID(ctx context.Context, gnisID string) (*GNISLookupResult, er
 	if len(f.Attributes.ReachCode) >= 8 {
 		huc8 = f.Attributes.ReachCode[:8]
 	}
-	return &GNISLookupResult{Lat: pt[1], Lng: pt[0], HUC8: huc8}, nil
+	return &GNISLookupResult{Name: f.Attributes.GnisName, Lat: pt[1], Lng: pt[0], HUC8: huc8}, nil
 }
