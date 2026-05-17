@@ -696,32 +696,85 @@ No schema change required — extends `polled_gauge_ids` view union + adds a `la
 
 ### 2c.6 — River identity ownership
 
-**Problem.** Reach creation drives river creation, and the per-reach river_name override invites duplicates + identity drift. Concrete failure: when a `user_reach` is created on a river that already exists in `rivers` but lacks a `gnis_id` (legacy curated rows pre-`000061`), the Create handler matches by name, links the reach, but never backfills the GNIS ID. Later, `AutoFillRiverMeta` falls back to GNIS lookup, finds none, and 404s with "no reach coordinates or GNIS ID found." A second related issue: brand-new rivers created via `user_reaches` skip the `riverMetaFromGNIS` NLDI fill that admin's `auto-river` handler runs, so they show "needs review" even with a verified GNIS ID.
+**Model.** Rivers are 1:1 with GNIS IDs. `name`, `state_abbr`, `huc8`, `gnis_id` are NLDI-derived and immutable. `basin` is NLDI-defaulted but admin-overridable. Users cannot mutate any river field — but they can *suggest* corrections on `basin` or `state_abbr` via a feedback flow that admins curate.
 
-**Architectural fix.** Rivers are owned by NLDI/GNIS, not by reaches. Reach UI no longer mutates river identity.
+**Removed:**
+- `rivers.verified` column (all rivers are GNIS-verified by definition)
+- `rivers.basin_locked` column (admin-set basin is the source of truth; NLDI sync no longer touches basin once set)
+- Old "needs review" amber banner (semantically replaced — see 2c.6c)
+- Free-form "New river" modal (name + state + basin text inputs)
+- River-name override field on UserReachAuthor
+- "Auto-lookup basin & state" admin button (implicit on creation now)
 
-**2c.6a — bugfix (ship immediately, no UX change):**
-- `AutoFillRiverMeta` falls back to `user_reaches.put_in` when `reaches` has no coords for the river
+**Concrete bug this resolves.** A `user_reach` created on an existing GNIS-less legacy river (e.g. Foxton's "North Fork South Platte" seeded pre-`000061`) silently linked without backfilling gnis_id, leaving `AutoFillRiverMeta` to 404 on later admin lookup. 2c.6a shipped the immediate fix; 2c.6b–e remove the architectural conditions that made the bug possible.
+
+**2c.6a — bugfix (shipped v0.2.8):**
+- `AutoFillRiverMeta` falls back to `user_reaches.put_in` when `reaches` has no coords for the river.
 - New helper `resolveOrCreateRiver(ctx, db, name, gnisID)` in `user_reaches.go`: GNIS-match → backfill missing gnis_id on name-matched legacy rows → on INSERT, populate state_abbr/basin/huc8 via `riverMetaFromGNIS`. Replaces inline river-resolution in Create + Update handlers.
 
-**2c.6b — resolve endpoint (user-scoped only; admin path untouched):**
-- New `POST /api/v1/me/rivers/resolve` (dry-run): input `{ gnis_id, river_name, lat, lng }`, returns either `{ status: "matched", river_id, ...meta }`, `{ status: "matched_backfilled", river_id, ...meta }`, or `{ status: "needs_confirmation", proposed: { river_name, gnis_id, basin, state_abbr, huc8 } }`.
-- New `POST /api/v1/me/rivers` (commit): writes a river from a confirmed payload, allowing the caller to override `basin`. Sets `basin_locked = true` when basin came from a user override so future NLDI syncs leave it alone.
-- Factor `resolveOrCreateRiver` logic into the resolve/commit pair.
+**2c.6b — schema lockdown + corrections table:**
+- New `cmd/backfill-river-gnis`: walks `rivers WHERE gnis_id IS NULL`, NHD-by-name lookup, fills uniquely-matched rows, outputs ambiguous/unmatched lists for manual review. Run in prod before migrations 000084/085.
+- Migration `000084`: `ALTER TABLE rivers ALTER COLUMN gnis_id SET NOT NULL`, `DROP COLUMN verified`, `DROP COLUMN basin_locked`. **Do not bundle with backfill cmd in same PR** — NOT NULL constraint fails on any straggler row.
+- Migration `000085`: create `river_corrections` table:
+  ```sql
+  CREATE TABLE river_corrections (
+    id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    river_id        UUID        NOT NULL REFERENCES rivers(id) ON DELETE CASCADE,
+    proposed_by     TEXT        NOT NULL,
+    field           TEXT        NOT NULL CHECK (field IN ('basin', 'state_abbr')),
+    proposed_value  TEXT        NOT NULL,
+    note            TEXT,
+    status          TEXT        NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'accepted', 'rejected')),
+    reviewed_by     TEXT,
+    reviewed_at     TIMESTAMPTZ,
+    review_note     TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  CREATE INDEX river_corrections_status_idx ON river_corrections (status) WHERE status = 'pending';
+  CREATE INDEX river_corrections_river_idx  ON river_corrections (river_id);
+  ```
+  `field` is `basin` or `state_abbr` only. River name is GNIS-canonical, not user-mutable. Rebinding the wrong river to a reach is out of scope — admin handles via reach edit.
 
-**2c.6c — author UI rework:**
-- `UserReachAuthor.vue`: remove river-name override field. NHD-returned name is canonical.
-- On save: call `/me/rivers/resolve` first.
-  - `matched` / `matched_backfilled` → inline banner "Found: **North Fork South Platte** (CO · South Platte basin)"
-  - `needs_confirmation` → modal `RiverConfirmModal.vue` showing NHD name (read-only), GNIS, state, basin (editable), HUC8. Confirm → POST `/me/rivers` → use returned river_id.
-- Reach create payload simplifies to `river_id` only — drop `river_name` + `gnis_id` from reach Create JSON.
+**2c.6c — admin UI:**
+- "New river" modal becomes single-field GNIS ID input → NLDI preview card (name/state/basin/huc8 fetched live) → "Add" button. No free-form name/state/basin.
+- Edit-river modal: name/state/gnis_id/huc8 all read-only; only `basin` editable.
+- Drop old "needs review" amber banner (verified flag is gone).
+- **New "Needs review (N)" tab** at top of Rivers admin, listing pending `river_corrections` grouped by river:
+  ```
+  North Fork South Platte (CO · South Platte basin)
+    ┌─ basin → "Cherry Creek"   (user note: "this reach is in Cherry Creek drainage")
+    │  by user@x.com · 2d ago    [ Accept ]  [ Reject ]
+    └─ state → "WY"  (no note)
+       by user@y.com · 1d ago    [ Accept ]  [ Reject ]
+  ```
+  Accept → apply `proposed_value` to `rivers.{field}`, mark `accepted`. Reject → mark `rejected` with optional review_note.
+- Remove "Auto-lookup basin & state" button on edit modal (basin is the only mutable field; lookup is implicit at create-time).
 
-**2c.6d — edit flow alignment:**
-- Same change to user-reach edit flow. `Update` handler stops accepting `river_name`.
-- Curated `reaches` path left alone — admin's `auto-river` handler already does the right thing.
+**2c.6d — user reach flow:**
+- `UserReachAuthor.vue`: drop river-name override field. NHD-returned name is canonical.
+- Reach Create payload simplifies — accepts `{gnis_id, river_name}` for server-side `resolveOrCreateRiver` resolution; returns `river_id`. No client-side resolve modal (nothing for user to override).
+- Post-create banner on reach detail:
+  ```
+  ✓ Looks like Trout Creek (CO · Arkansas basin) — is this correct?
+                                                    [ Yes ]  [ No, fix... ]
+  ```
+  - **Yes** → dismiss, set localStorage flag so banner doesn't reappear for this user+reach.
+  - **No, fix...** → modal: radio `Basin` / `State`, single field input, optional note → `POST /me/river-corrections` → toast "Thanks — admin will review."
+- Banner only renders once per (user, reach) — gated on localStorage + correction status. Reaches whose user already submitted a correction skip the banner.
 
-**Migration 000084 — backfill legacy rivers lacking gnis_id:**
-One-shot pass over `rivers` rows where `gnis_id IS NULL`. For each, query NHD by name (best-effort); apply `riverMetaFromGNIS` when a unique match is found. Unmatched rows stay null and surface in admin's "needs review" list for manual cleanup. Run as a `cmd/backfill-river-gnis` command rather than a SQL migration since it makes external API calls.
+**2c.6e — backend handler cleanup:**
+- `UpdateRiver` accepts only `basin` (rejects name/state/gnis_id/huc8 changes).
+- Drop `auto-fill` endpoint (no longer needed — basin is the only mutable field).
+- Remove `verified`/`basin_locked` from all structs and SQL.
+- New `RiverCorrectionsHandler`:
+  - `POST /api/v1/me/river-corrections` (user) — creates pending row.
+  - `GET  /api/v1/admin/river-corrections?status=pending` — admin list.
+  - `PATCH /api/v1/admin/river-corrections/{id}` — accept/reject; on accept, also writes to `rivers.{field}`.
+
+**Sequencing risk:** can't ship 000084 (NOT NULL) until backfill cmd runs prod-clean. Two PRs minimum:
+1. cmd + migration 000085 (corrections table) — independent
+2. migration 000084 — only after backfill verified
 
 ### Sequencing
 
@@ -731,8 +784,10 @@ One-shot pass over `rivers` rows where `gnis_id IS NULL`. For each, query NHD by
 0.2.3  →  2c.2 (#15,#14,#12) — reach detail + toolbar
 0.2.4  →  2c.3 (#8)           — my-reaches inline (confirm intent first)
 0.2.5  →  2c.4 (#16)          — polling polish
-0.2.8  →  2c.6a               — river identity bugfix (unsticks NFK South Platte)
-0.2.9  →  2c.6b–d             — resolve endpoint + author UI rework + edit alignment
+0.2.8  →  2c.6a               — river identity bugfix (unsticks NFK South Platte)  ✅
+0.2.9  →  2c.6b               — backfill cmd + corrections table migration
+0.2.10 →  2c.6c–e             — admin curation UI + user feedback banner + backend cleanup
+0.2.11 →  migration 000084    — gnis_id NOT NULL + drop verified/basin_locked (post-backfill)
 
 → then Demo Pack (0.3.0)
 ```
