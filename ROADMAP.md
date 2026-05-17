@@ -694,6 +694,35 @@ Ship as one PR — toolbar component lands once, both surfaces consume it.
 
 No schema change required — extends `polled_gauge_ids` view union + adds a `last_polled_at IS NULL` UI branch. If a poll-cadence column is needed, add as migration `000084`.
 
+### 2c.6 — River identity ownership
+
+**Problem.** Reach creation drives river creation, and the per-reach river_name override invites duplicates + identity drift. Concrete failure: when a `user_reach` is created on a river that already exists in `rivers` but lacks a `gnis_id` (legacy curated rows pre-`000061`), the Create handler matches by name, links the reach, but never backfills the GNIS ID. Later, `AutoFillRiverMeta` falls back to GNIS lookup, finds none, and 404s with "no reach coordinates or GNIS ID found." A second related issue: brand-new rivers created via `user_reaches` skip the `riverMetaFromGNIS` NLDI fill that admin's `auto-river` handler runs, so they show "needs review" even with a verified GNIS ID.
+
+**Architectural fix.** Rivers are owned by NLDI/GNIS, not by reaches. Reach UI no longer mutates river identity.
+
+**2c.6a — bugfix (ship immediately, no UX change):**
+- `AutoFillRiverMeta` falls back to `user_reaches.put_in` when `reaches` has no coords for the river
+- New helper `resolveOrCreateRiver(ctx, db, name, gnisID)` in `user_reaches.go`: GNIS-match → backfill missing gnis_id on name-matched legacy rows → on INSERT, populate state_abbr/basin/huc8 via `riverMetaFromGNIS`. Replaces inline river-resolution in Create + Update handlers.
+
+**2c.6b — resolve endpoint (user-scoped only; admin path untouched):**
+- New `POST /api/v1/me/rivers/resolve` (dry-run): input `{ gnis_id, river_name, lat, lng }`, returns either `{ status: "matched", river_id, ...meta }`, `{ status: "matched_backfilled", river_id, ...meta }`, or `{ status: "needs_confirmation", proposed: { river_name, gnis_id, basin, state_abbr, huc8 } }`.
+- New `POST /api/v1/me/rivers` (commit): writes a river from a confirmed payload, allowing the caller to override `basin`. Sets `basin_locked = true` when basin came from a user override so future NLDI syncs leave it alone.
+- Factor `resolveOrCreateRiver` logic into the resolve/commit pair.
+
+**2c.6c — author UI rework:**
+- `UserReachAuthor.vue`: remove river-name override field. NHD-returned name is canonical.
+- On save: call `/me/rivers/resolve` first.
+  - `matched` / `matched_backfilled` → inline banner "Found: **North Fork South Platte** (CO · South Platte basin)"
+  - `needs_confirmation` → modal `RiverConfirmModal.vue` showing NHD name (read-only), GNIS, state, basin (editable), HUC8. Confirm → POST `/me/rivers` → use returned river_id.
+- Reach create payload simplifies to `river_id` only — drop `river_name` + `gnis_id` from reach Create JSON.
+
+**2c.6d — edit flow alignment:**
+- Same change to user-reach edit flow. `Update` handler stops accepting `river_name`.
+- Curated `reaches` path left alone — admin's `auto-river` handler already does the right thing.
+
+**Migration 000084 — backfill legacy rivers lacking gnis_id:**
+One-shot pass over `rivers` rows where `gnis_id IS NULL`. For each, query NHD by name (best-effort); apply `riverMetaFromGNIS` when a unique match is found. Unmatched rows stay null and surface in admin's "needs review" list for manual cleanup. Run as a `cmd/backfill-river-gnis` command rather than a SQL migration since it makes external API calls.
+
 ### Sequencing
 
 ```
@@ -702,6 +731,8 @@ No schema change required — extends `polled_gauge_ids` view union + adds a `la
 0.2.3  →  2c.2 (#15,#14,#12) — reach detail + toolbar
 0.2.4  →  2c.3 (#8)           — my-reaches inline (confirm intent first)
 0.2.5  →  2c.4 (#16)          — polling polish
+0.2.8  →  2c.6a               — river identity bugfix (unsticks NFK South Platte)
+0.2.9  →  2c.6b–d             — resolve endpoint + author UI rework + edit alignment
 
 → then Demo Pack (0.3.0)
 ```

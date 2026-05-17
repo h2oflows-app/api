@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -12,6 +13,44 @@ import (
 	"github.com/h2oflow/h2oflow/apps/api/internal/kmlimport"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// resolveOrCreateRiver finds a river by GNIS ID (preferred) or name, backfilling
+// gnis_id on existing legacy rows when a new GNIS match is now available. When
+// no match exists, INSERTs a new river — populating state_abbr/basin/huc8 via
+// NHD + WBD/TIGERweb when gnisID is present. Returns river ID, "" on failure.
+func resolveOrCreateRiver(ctx context.Context, db *pgxpool.Pool, riverName, gnisID string) string {
+	riverSlug := kmlimport.Slugify(riverName)
+	var rid string
+
+	if gnisID != "" {
+		_ = db.QueryRow(ctx, `SELECT id FROM rivers WHERE gnis_id = $1`, gnisID).Scan(&rid)
+	}
+
+	if rid == "" {
+		_ = db.QueryRow(ctx, `SELECT id FROM rivers WHERE lower(name) = lower($1) LIMIT 1`, riverName).Scan(&rid)
+		// Backfill GNIS ID on legacy row that pre-dates the gnis_id column.
+		if rid != "" && gnisID != "" {
+			_, _ = db.Exec(ctx, `UPDATE rivers SET gnis_id = $1 WHERE id = $2 AND gnis_id IS NULL`, gnisID, rid)
+		}
+	}
+
+	if rid == "" {
+		var gnisParam interface{}
+		var stateAbbr, basin, huc8 string
+		if gnisID != "" {
+			gnisParam = gnisID
+			stateAbbr, basin, huc8 = riverMetaFromGNIS(ctx, gnisID)
+		}
+		verified := gnisID != ""
+		_ = db.QueryRow(ctx, `
+			INSERT INTO rivers (slug, name, gnis_id, state_abbr, basin, huc8, verified)
+			VALUES ($1, $2, $3, NULLIF($4,''), NULLIF($5,''), NULLIF($6,''), $7)
+			ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name
+			RETURNING id
+		`, riverSlug, riverName, gnisParam, stateAbbr, basin, huc8, verified).Scan(&rid)
+	}
+	return rid
+}
 
 // UserReachHandler handles /api/v1/me/reaches routes.
 // All mutations are owner-scoped. devFallbackID is used in development when
@@ -460,27 +499,7 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var finalRiverName *string
 	if rn := strings.TrimSpace(body.RiverName); rn != "" {
 		finalRiverName = &rn
-		riverSlug := kmlimport.Slugify(rn)
-		var rid string
-		if body.GnisID != "" {
-			_ = h.db.QueryRow(ctx, `SELECT id FROM rivers WHERE gnis_id = $1`, body.GnisID).Scan(&rid)
-		}
-		if rid == "" {
-			_ = h.db.QueryRow(ctx, `SELECT id FROM rivers WHERE lower(name) = lower($1) LIMIT 1`, rn).Scan(&rid)
-		}
-		if rid == "" {
-			verified := body.GnisID != ""
-			var gnisParam interface{}
-			if body.GnisID != "" {
-				gnisParam = body.GnisID
-			}
-			_ = h.db.QueryRow(ctx, `
-				INSERT INTO rivers (slug, name, gnis_id, verified)
-				VALUES ($1, $2, $3, $4)
-				ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name
-				RETURNING id
-			`, riverSlug, rn, gnisParam, verified).Scan(&rid)
-		}
+		rid := resolveOrCreateRiver(ctx, h.db, rn, body.GnisID)
 		if rid != "" {
 			riverID = &rid
 		}
@@ -601,27 +620,7 @@ func (h *UserReachHandler) Import(w http.ResponseWriter, r *http.Request) {
 	var finalRiverName *string
 	if rn := strings.TrimSpace(body.RiverName); rn != "" {
 		finalRiverName = &rn
-		riverSlug := kmlimport.Slugify(rn)
-		var rid string
-		if body.GnisID != "" {
-			_ = h.db.QueryRow(ctx, `SELECT id FROM rivers WHERE gnis_id = $1`, body.GnisID).Scan(&rid)
-		}
-		if rid == "" {
-			_ = h.db.QueryRow(ctx, `SELECT id FROM rivers WHERE lower(name) = lower($1) LIMIT 1`, rn).Scan(&rid)
-		}
-		if rid == "" {
-			verified := body.GnisID != ""
-			var gnisParam interface{}
-			if body.GnisID != "" {
-				gnisParam = body.GnisID
-			}
-			_ = h.db.QueryRow(ctx, `
-				INSERT INTO rivers (slug, name, gnis_id, verified)
-				VALUES ($1, $2, $3, $4)
-				ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name
-				RETURNING id
-			`, riverSlug, rn, gnisParam, verified).Scan(&rid)
-		}
+		rid := resolveOrCreateRiver(ctx, h.db, rn, body.GnisID)
 		if rid != "" {
 			riverID = &rid
 		}
