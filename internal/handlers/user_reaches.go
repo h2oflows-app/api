@@ -49,6 +49,8 @@ type userReachSummary struct {
 	Slug        string     `json:"slug"`
 	Name        string     `json:"name"`
 	RiverName   *string    `json:"river_name"`
+	StateAbbr   *string    `json:"state_abbr"`
+	BasinGroup  *string    `json:"basin_group"`
 	PutInLng    float64    `json:"put_in_lng"`
 	PutInLat    float64    `json:"put_in_lat"`
 	TakeOutLng  float64    `json:"take_out_lng"`
@@ -231,6 +233,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.db.Query(r.Context(), `
 		SELECT
 			ur.id, ur.slug, ur.name, ur.river_name,
+			rv.state_abbr, rv.basin AS basin_group,
 			ST_X(ur.put_in::geometry)    AS put_in_lng,
 			ST_Y(ur.put_in::geometry)    AS put_in_lat,
 			ST_X(ur.take_out::geometry)  AS take_out_lng,
@@ -251,6 +254,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			cg.slug AS custom_gauge_slug,
 			cg.name AS custom_gauge_name
 		FROM user_reaches ur
+		LEFT JOIN rivers rv ON rv.id = ur.river_id
 		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
 		LEFT JOIN LATERAL (
 			SELECT value, timestamp FROM gauge_readings
@@ -280,6 +284,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 		var s userReachSummary
 		if err := rows.Scan(
 			&s.ID, &s.Slug, &s.Name, &s.RiverName,
+			&s.StateAbbr, &s.BasinGroup,
 			&s.PutInLng, &s.PutInLat, &s.TakeOutLng, &s.TakeOutLat,
 			&s.Note, &s.CreatedAt,
 			&s.CurrentCFS, &s.LastReadAt,
