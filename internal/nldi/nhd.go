@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 )
 
 // FirstCoord returns the first [lng, lat] pair from a GeoJSON geometry, or nil
@@ -89,6 +90,73 @@ func NHDStreamNameAt(ctx context.Context, lat, lng float64) (name, gnisID string
 		}
 	}
 	return "", "", nil
+}
+
+// NHDNameResult is one GNIS entry returned by NHDLookupByName.
+type NHDNameResult struct {
+	GnisID string
+	Name   string
+	HUC8   string // first 8 chars of reachcode, may be empty
+}
+
+// NHDLookupByName queries NHD layer 6 for flowlines whose gnis_name matches
+// name (case-insensitive). Returns all distinct GNIS IDs found — callers check
+// for uniqueness: 1 result = safe to backfill, >1 = ambiguous, 0 = no match.
+func NHDLookupByName(ctx context.Context, name string) ([]NHDNameResult, error) {
+	escaped := strings.ReplaceAll(name, "'", "''")
+	params := url.Values{
+		"where":           {fmt.Sprintf("UPPER(gnis_name) = UPPER('%s')", escaped)},
+		"outFields":       {"gnis_id,gnis_name,reachcode"},
+		"returnGeometry":  {"false"},
+		"resultRecordCount": {"10"},
+		"f":               {"json"},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, nhdArcGISURL+"?"+params.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "h2oflows/1.0 (https://h2oflows.org)")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("nhd name lookup: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	var result struct {
+		Features []struct {
+			Attributes struct {
+				GnisID    string `json:"gnis_id"`
+				GnisName  string `json:"gnis_name"`
+				ReachCode string `json:"reachcode"`
+			} `json:"attributes"`
+		} `json:"features"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("nhd name lookup parse: %w", err)
+	}
+
+	seen := map[string]NHDNameResult{}
+	for _, f := range result.Features {
+		id := f.Attributes.GnisID
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; !ok {
+			huc8 := ""
+			if len(f.Attributes.ReachCode) >= 8 {
+				huc8 = f.Attributes.ReachCode[:8]
+			}
+			seen[id] = NHDNameResult{GnisID: id, Name: f.Attributes.GnisName, HUC8: huc8}
+		}
+	}
+
+	out := make([]NHDNameResult, 0, len(seen))
+	for _, v := range seen {
+		out = append(out, v)
+	}
+	return out, nil
 }
 
 // GNISLookupResult holds the coordinate and HUC8 derived from an NHD GNIS ID query.
