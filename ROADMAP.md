@@ -817,6 +817,109 @@ No schema change required — extends `polled_gauge_ids` view union + adds a `la
 - + picker: Create New routes correctly per admin/user; Import opens modal, paste valid JSON → reach lands in My Reaches mode.
 - Mobile: pill doesn't collide with map controls or list-toggle button.
 
+### 2c.8 — KML import for user reaches
+
+**Problem.** Today only admins import KMZ/KML, via the global `/api/v1/import/kmz` endpoint that walks folders, slug-matches against `reaches.slug`, and writes pins (rapids, hazards, access points, parking, campsites, waves) into `rapids` + `reach_access`, both FK'd to `reaches.id`. Users who build their own reaches have no path to attach pins — their map renders only the centerline + put-in/take-out endpoints.
+
+**Schema (migration `000086_pins_user_reach_id`):**
+- Add `user_reach_id UUID NULL REFERENCES user_reaches(id) ON DELETE CASCADE` to `rapids` and `reach_access`.
+- Relax `reach_id` from `NOT NULL` to `NULL`.
+- Add CHECK: `(reach_id IS NOT NULL) <> (user_reach_id IS NOT NULL)` on both tables (XOR — exactly one parent).
+- Partial indexes on `(user_reach_id)` where `user_reach_id IS NOT NULL`.
+- Existing unique constraints `(reach_id, name)` / `(reach_id, access_type, name)` extend: add parallel `(user_reach_id, …)` partial uniques.
+
+**Importer refactor (`internal/kmlimport`).**
+- `Importer` gains optional `OwnerScope` config: when set, resolver skips the `reaches` slug lookup and instead matches against `user_reaches WHERE owner_id = ? AND slug = ?`. Single-reach mode — pins are direct children of the doc, no folder structure required (folders ignored if present).
+- All `upsert*` helpers (`upsertRapidLocation`, `upsertAccess`, `upsertParking`) accept a target struct `{ ReachID, UserReachID *string }` and route to the right FK.
+- Skip reach-metadata writes (description, flow bands, river-name lookup, centerline backfill) when in user-reach mode — user reach has its own NHD repin + flow-range UI; KML is pin-only for users.
+- Admin path unchanged — folder-walk multi-reach import still calls the curated-reach code path.
+
+**API.**
+- `POST /api/v1/me/reaches/{slug}/kml` — multipart `file` field, scoped to authenticated owner.
+- Owner check via existing `UserReachHandler.ownerID`.
+- Returns same `ReachResult` shape (counts + log) so the UI can render an import log identical to the admin panel.
+
+**User reach Get handler.**
+- `userReachDetail` currently does not include rapids / access lists. Extend the Get query (or add separate sub-queries) to return:
+  - `rapids[]` — `{ id, name, description, class_rating, is_surf_wave, is_permanent_hazard, hazard_type, lng, lat }`
+  - `access_points[]` — `{ id, access_type, name, notes, lng, lat }`
+- Reach detail map (`my/reaches/[slug].vue`) reads from these arrays and renders pin markers reusing the curated `ReachMap` pin rendering logic.
+
+**Vue.**
+- New `components/reach/UserKmlImportPanel.vue` — adapted from `admin/KmlImportPanel.vue`. Simpler help text (pins go directly in the doc, no slug placemark / folder structure). Drag-drop optional.
+- Mount on `pages/my/reaches/[slug].vue` form panel, below the gauge / flow-line section.
+- Show import-log toast on success; re-`load()` reach so new pins render immediately.
+
+**Effort.** ~6h. 1h migration + Go schema, 3h importer refactor (most surface area — every upsert touched), 1h endpoint + handler + Get-query extension, 1h Vue panel + map wiring.
+
+**Verification.**
+- Upload KML containing `Rapid: Phone Boof (IV)`, `Hazard: Strainer`, `Parking: Lot A` against a user reach → 3 pins persist with `user_reach_id` set.
+- Detail map renders new pins styled identically to curated reaches.
+- Admin global import still imports curated multi-reach KMZ unchanged.
+
+### 2c.9 — Theme palette overhaul
+
+**Problem.** Current palette picker = 9 colors × 2 neutrals = 18 entries, presented as a two-row swatch grid (Slate row + Stone row) in the AppHeader appearance dropdown. Users must reason about two axes. We want a single curated list of 11 named themes, each pairing a primary with a tinted neutral, no slate/stone toggle.
+
+**Prerequisite.**
+- Bump `@nuxt/ui` to `^4.7.1` (currently `^4.6.0`). Smoke test that TW 4.2 tinted neutral scales (`mist`, `olive`, `mauve`, `taupe`) resolve through Nuxt UI color tokens. If they don't auto-resolve, register them via `@theme` block in `assets/css/main.css` (TW 4 customization path).
+- Pin exact version after smoke — Nuxt UI minors have flipped API surface before.
+
+**`app.config.ts` rewrite.**
+- Replace `PALETTES` (18 entries) with `THEMES` (11 entries):
+  ```ts
+  { id: 'h2oflows', label: 'H2OFlows', primary: 'blue',    neutral: 'mist'    },
+  { id: 'ocean',    label: 'Ocean',    primary: 'teal',    neutral: 'olive'   },
+  { id: 'river',    label: 'River',    primary: 'sky',     neutral: 'mist'    },
+  { id: 'forest',   label: 'Forest',   primary: 'emerald', neutral: 'olive'   },
+  { id: 'dawn',     label: 'Dawn',     primary: 'amber',   neutral: 'mauve'   },
+  { id: 'coral',    label: 'Coral',    primary: 'rose',    neutral: 'neutral' },
+  { id: 'sunset',   label: 'Sunset',   primary: 'orange',  neutral: 'mauve'   },
+  { id: 'moss',     label: 'Moss',     primary: 'lime',    neutral: 'stone'   },
+  { id: 'cosmic',   label: 'Cosmic',   primary: 'pink',    neutral: 'mauve'   },
+  { id: 'night',    label: 'Night',    primary: 'indigo',  neutral: 'slate'   },
+  { id: 'sunrise',  label: 'Sunrise',  primary: 'yellow',  neutral: 'mauve'   },
+  ```
+- Each entry adds `primarySwatch` / `neutralSwatch` hex (TW 4.2 ramp level 500).
+- Export `ThemeId = typeof THEMES[number]['id']`.
+
+**`stores/theme.ts`.**
+- Rename `paletteId` → `themeId`, type `ThemeId`, default `'h2oflows'`.
+- Legacy ID migration in `plugins/theme.client.ts` (runs once on hydration):
+  - Strip `-slate` / `-stone` suffix → look up base.
+  - Map old → new where the visual mapping changed:
+    - `h2oflows-*` → `h2oflows`
+    - `ocean-*`    → `ocean`   (was sky+neutral, now teal+olive — visual change)
+    - `river-*`    → `river`   (was teal+neutral, now sky+mist — visual change)
+    - `forest-*`   → `forest`
+    - `indigo-*`   → `night`
+    - `sunset-*`   → `sunset`
+    - `coral-*`    → `coral`   (was fuchsia, now rose — visual change)
+    - `dawn-*`     → `dawn`    (was rose, now amber — visual change)
+    - `moss-*`     → `moss`
+  - Unknown legacy ID → fall back to `'h2oflows'`.
+
+**`AppHeader.vue` UI rebuild (lines 142–186).**
+- Drop two-row `Slate` / `Stone` grid + `Mode` row stays untouched.
+- Replace with single vertical list inside the appearance dropdown:
+  ```
+  ●●  H2OFlows           ✓
+  ●●  Ocean
+  ●●  River
+  ...
+  ```
+- Each row = full-width button, two-tone circular swatch (primary + neutral split) on left, label, checkmark on active. Click → `applyTheme(id)` → store + `appConfig.ui.colors.primary` + `appConfig.ui.colors.neutral`.
+- Dropdown auto-sizes to list height (11 rows ≈ 280px); add internal scroll if needed.
+
+**Effort.** ~4h. 1h npm bump + TW 4.2 neutral smoke test, 1h `app.config.ts` rewrite + theme store rename + migration, 2h AppHeader UI rebuild + visual QA across all 11 themes in light + dark.
+
+**Verification.**
+- All 11 themes render distinctly in light + dark mode.
+- Existing users with `paletteId = 'forest-stone'` (etc.) land on the right new theme without console errors.
+- Active theme swatch in the AppHeader chip preview shows correct two-tone.
+
+**Risk note.** Coral and Dawn change visually (Coral fuchsia→rose, Dawn rose→amber). Visual diff is acceptable since pilot hasn't started.
+
 ### Sequencing
 
 ```
@@ -830,6 +933,8 @@ No schema change required — extends `polled_gauge_ids` view union + adds a `la
 0.2.10 →  2c.6b               — backfill cmd + corrections table migration
 0.2.11 →  2c.6c–e             — admin curation UI + user feedback banner + backend cleanup
 0.2.12 →  migration 000084    — gnis_id NOT NULL + drop verified/basin_locked (post-backfill)
+0.2.13 →  2c.8                — KML import for user reaches (schema + importer refactor + UI)
+0.2.14 →  2c.9                — theme palette overhaul (11 named themes + Nuxt UI 4.7.1 bump)
 
 → then Demo Pack (0.3.0)
 ```
@@ -1332,4 +1437,6 @@ New sources require one file in `packages/gauge-core`:
 *Speculative or low-priority concepts kept on the roadmap for memory but not scheduled. Revisit only when adjacent phases create the right conditions.*
 
 - **Google Earth picture layer** — overlay user photos at their EXIF GPS points on a 3D terrain view. Design coupled to photos-on-map; only worth revisiting once Reports photo upload has enough data to know what EXIF metadata users actually attach. Originally scoped in 2b, moved here as not pilot-relevant.
+- **In-app pin editor on map.** Click-to-place pin UI for both curated and user reaches, replacing the KML round-trip for manual edits. Pin types match existing taxonomy (rapid / hazard / put-in / take-out / parking / campsite / wave). KML import (admin global + user per-reach from 2c.8) stays as the bulk path. Build once 2c.8 ships and the polymorphic pin schema is in place.
+- **Auto-anchor KML imports.** Extend user KML import (and re-extend admin import) so the importer reads put-in/take-out KML pins, snaps each to the nearest NHD ComID via the existing NLDI service, picks the up/down ComIDs, and runs the same trimmed-centerline preview the manual repin flow uses today. Output: imported reach lands with put-in/take-out, pins, AND centerline in one step. Gated behind the manual repin flow proving stable in production (which it has, per recent ComID work).
 - Other speculative ideas land here as they come up.
