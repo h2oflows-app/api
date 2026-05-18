@@ -990,6 +990,21 @@ Block search engines from indexing curated reach + report pages until 1.0 ships.
 - Pulled in the 1.0 release as part of the launch checklist
 - Trivial; ships with whichever PR is first to merge after this section starts
 
+### 3.5 — Dashboard share (deferred, post-0.3)
+
+Three-dot menu on the dashboard gains "Share dashboard". Generates a portable JSON payload — same pattern as 3.3 — that bundles: the active tab's gauge watchlist, hidden-reach set, pinned custom gauges (full formula payload, not by reference), embedded user reaches (geometry + flow bands + gauge binding payload, including embedded `custom_gauge` blocks introduced in 3.3 fix).
+
+Recipient imports via the existing import picker on `/explore` (or new dashboard-import entry). Pure clone semantics — no DB sharing, no subscriber tracking, no notifications. Same privacy boundary as 3.3: only fields included in the payload travel, owner's notes stay private.
+
+- New top-level payload type `dashboard` whose body is `{ watchlist_entries[], custom_gauges[], user_reaches[] }`
+- Each `user_reach` carries its own optional `custom_gauge` block (recursive 3.3 codec)
+- Import order: custom gauges first (assign new IDs), then user reaches (link new IDs), then watchlist (resolve curated reaches by slug, user reaches by new ID)
+- Defer until post-pilot; pilot users can share individual reaches/gauges via 3.3 today
+
+### 3.6 — Rethink hazards (deferred)
+
+Trip report `hazard_warning` field was removed in 0.3.0 polish (liability/bad-info concern). Reintroduce later with proper guardrails: stronger UX warnings on display, attribution to author (not "h2oflows says"), reach-author moderation, possibly admin-confirmed-only. Must reintegrate with RAG context generation (currently dropped from `report_context.go`). Open question: is hazard-as-trip-report the right model at all, or should it be a separate reach-attached object with author attribution and admin review?
+
 ---
 
 ## Repository restructure (pre-pilot) ✅ completed 2026-05-13
