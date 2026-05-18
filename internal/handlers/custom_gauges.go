@@ -544,6 +544,27 @@ func (h *CustomGaugeHandler) Import(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Seed last_value_cfs immediately so the gauge shows CFS without waiting for the poller.
+	var seedVal float64
+	var seedCount int
+	seedErr := h.db.QueryRow(r.Context(), `
+		SELECT
+			COALESCE(SUM(cgi.sign * lr.value), 0),
+			COUNT(DISTINCT cgi.gauge_id)
+		FROM custom_gauge_inputs cgi
+		JOIN LATERAL (
+			SELECT value FROM gauge_readings
+			WHERE gauge_id = cgi.gauge_id
+			ORDER BY timestamp DESC LIMIT 1
+		) lr ON true
+		WHERE cgi.custom_gauge_id = $1::uuid
+	`, id).Scan(&seedVal, &seedCount)
+	if seedErr == nil && seedCount == len(resolved) && len(resolved) > 0 {
+		_, _ = h.db.Exec(r.Context(),
+			`UPDATE custom_gauges SET last_value_cfs = $1, last_value_at = NOW() WHERE id = $2::uuid`,
+			seedVal, id)
+	}
+
 	jsonResponse(w, http.StatusCreated, map[string]string{"id": id, "slug": slug})
 }
 
