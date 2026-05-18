@@ -1321,3 +1321,225 @@ func SyncCenterlineNLDIByComID(ctx context.Context, pool *pgxpool.Pool, slug str
 }
 
 func sq(x float64) float64 { return x * x }
+
+// ── User-reach KML import ─────────────────────────────────────────────────────
+
+// pinTarget routes a pin write to either a curated reach or a user reach.
+// col is "reach_id" or "user_reach_id" — set by this package, never from user input.
+type pinTarget struct {
+	col string
+	id  string
+}
+
+func curatedTarget(reachID string) pinTarget    { return pinTarget{"reach_id", reachID} }
+func userReachTarget(urID string) pinTarget     { return pinTarget{"user_reach_id", urID} }
+
+// ImportForUserReach imports all pin placemarks from doc into a single user reach.
+// No folder structure is required — all point placemarks across all folders are
+// treated as pins for the target reach. Metadata placemarks (flow ranges, gauge,
+// description, etc.) are ignored; those are managed through the user reach UI.
+func (imp *Importer) ImportForUserReach(ctx context.Context, ownerID, reachSlug string, doc *KMLDoc) (*Result, error) {
+	var urID, urName string
+	if err := imp.pool.QueryRow(ctx,
+		`SELECT id, name FROM user_reaches WHERE owner_id = $1 AND slug = $2`,
+		ownerID, reachSlug,
+	).Scan(&urID, &urName); err != nil {
+		return nil, fmt.Errorf("user reach %q not found for owner", reachSlug)
+	}
+
+	res := &Result{
+		MapName: doc.Name,
+		Reaches: map[string]*ReachResult{},
+	}
+	target := userReachTarget(urID)
+
+	// Collect all point placemarks regardless of folder structure.
+	var pins []KMLPlacemark
+	for _, folder := range doc.Folders {
+		for _, pm := range folder.Placemarks {
+			if pm.Point != nil {
+				pins = append(pins, pm)
+			}
+		}
+	}
+
+	if len(pins) == 0 {
+		res.Log = append(res.Log, "⚠  no point placemarks found in document")
+		return res, nil
+	}
+
+	// Clear prior import-sourced data for this user reach.
+	if !imp.cleared[urID] {
+		if err := imp.clearImportDataForTarget(ctx, target); err != nil {
+			res.Log = append(res.Log, fmt.Sprintf("⚠  clear failed: %v", err))
+		} else {
+			imp.cleared[urID] = true
+			res.Log = append(res.Log, fmt.Sprintf("↺  [%s] cleared previous import data", urName))
+		}
+	}
+
+	st := res.reachStats(reachSlug, urName)
+
+	for _, pm := range pins {
+		lon, lat, ok := ParseCoords(pm.Point.Coordinates)
+		if !ok {
+			res.Log = append(res.Log, fmt.Sprintf("⚠  %q — bad coordinates", pm.Name))
+			continue
+		}
+		prefix, pinName := SplitPrefixWithHint(pm.Name, pm.Description, "")
+		desc := strings.TrimSpace(pm.Description)
+
+		switch prefix {
+		case "rapid", "wave":
+			isSurf := prefix == "wave"
+			if err := imp.upsertRapidForTarget(ctx, target, pinName, desc, isSurf, false, "", lon, lat); err != nil {
+				st.Errors = append(st.Errors, fmt.Sprintf("rapid %q: %v", pinName, err))
+				res.Log = append(res.Log, fmt.Sprintf("✗ [%s] rapid %q: %v", urName, pinName, err))
+			} else {
+				st.Rapids++
+				res.Log = append(res.Log, fmt.Sprintf("✓ [%s] %s: %s", urName, prefix, pinName))
+			}
+		case "hazard":
+			htype := inferHazardType(desc + " " + pinName)
+			if err := imp.upsertRapidForTarget(ctx, target, pinName, desc, false, true, htype, lon, lat); err != nil {
+				st.Errors = append(st.Errors, fmt.Sprintf("hazard %q: %v", pinName, err))
+				res.Log = append(res.Log, fmt.Sprintf("✗ [%s] hazard %q: %v", urName, pinName, err))
+			} else {
+				st.Hazards++
+				res.Log = append(res.Log, fmt.Sprintf("✓ [%s] hazard (%s): %s", urName, htype, pinName))
+			}
+		case "put-in":
+			if err := imp.upsertAccessForTarget(ctx, target, "put_in", pinName, desc, lon, lat); err != nil {
+				st.Errors = append(st.Errors, fmt.Sprintf("put-in %q: %v", pinName, err))
+				res.Log = append(res.Log, fmt.Sprintf("✗ [%s] put-in %q: %v", urName, pinName, err))
+			} else {
+				st.PutIns++
+				res.Log = append(res.Log, fmt.Sprintf("✓ [%s] put-in: %s", urName, pinName))
+			}
+		case "take-out":
+			if err := imp.upsertAccessForTarget(ctx, target, "take_out", pinName, desc, lon, lat); err != nil {
+				st.Errors = append(st.Errors, fmt.Sprintf("take-out %q: %v", pinName, err))
+				res.Log = append(res.Log, fmt.Sprintf("✗ [%s] take-out %q: %v", urName, pinName, err))
+			} else {
+				st.TakeOuts++
+				res.Log = append(res.Log, fmt.Sprintf("✓ [%s] take-out: %s", urName, pinName))
+			}
+		case "parking":
+			if err := imp.upsertParkingForTarget(ctx, target, pinName, desc, lon, lat); err != nil {
+				st.Errors = append(st.Errors, fmt.Sprintf("parking %q: %v", pinName, err))
+				res.Log = append(res.Log, fmt.Sprintf("✗ [%s] parking %q: %v", urName, pinName, err))
+			} else {
+				st.Parking++
+				res.Log = append(res.Log, fmt.Sprintf("✓ [%s] parking: %s", urName, pinName))
+			}
+		case "campsite":
+			if err := imp.upsertAccessForTarget(ctx, target, "camp", pinName, desc, lon, lat); err != nil {
+				st.Errors = append(st.Errors, fmt.Sprintf("campsite %q: %v", pinName, err))
+				res.Log = append(res.Log, fmt.Sprintf("✗ [%s] campsite %q: %v", urName, pinName, err))
+			} else {
+				st.Campsites++
+				res.Log = append(res.Log, fmt.Sprintf("✓ [%s] campsite: %s", urName, pinName))
+			}
+		default:
+			res.Log = append(res.Log, fmt.Sprintf("⚠  [%s] %q — unknown type, skipping", urName, pm.Name))
+		}
+	}
+
+	return res, nil
+}
+
+func (imp *Importer) upsertRapidForTarget(ctx context.Context, t pinTarget, name, desc string, isSurfWave, isPermanentHazard bool, hazardType string, lon, lat float64) error {
+	if imp.DryRun {
+		return nil
+	}
+	classRating := ParseClassRating(name, desc)
+	cleanName := stripClassSuffix(name)
+	tag, err := imp.pool.Exec(ctx, fmt.Sprintf(`
+		UPDATE rapids
+		SET location             = ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography,
+		    description          = CASE WHEN $5 <> '' THEN $5 ELSE description END,
+		    class_rating         = CASE WHEN $6::numeric IS NOT NULL THEN $6::numeric ELSE class_rating END,
+		    is_surf_wave         = is_surf_wave OR $7,
+		    is_permanent_hazard  = is_permanent_hazard OR $8,
+		    hazard_type          = CASE WHEN $9 <> '' THEN $9 ELSE hazard_type END
+		WHERE %s = $1 AND LOWER(name) = LOWER($2)
+	`, t.col), t.id, cleanName, lon, lat, desc, classRating, isSurfWave, isPermanentHazard, hazardType)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		_, err = imp.pool.Exec(ctx, fmt.Sprintf(`
+			INSERT INTO rapids (%s, name, location, description, class_rating,
+			                    is_surf_wave, is_permanent_hazard, hazard_type,
+			                    data_source, verified)
+			VALUES ($1, $2, ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography,
+			        NULLIF($5,''), $6::numeric, $7, $8, NULLIF($9,''), 'import', true)
+			ON CONFLICT (%s, name) WHERE %s IS NOT NULL DO UPDATE
+			  SET location            = EXCLUDED.location,
+			      description         = COALESCE(EXCLUDED.description, rapids.description),
+			      class_rating        = COALESCE(EXCLUDED.class_rating, rapids.class_rating),
+			      is_surf_wave        = rapids.is_surf_wave OR EXCLUDED.is_surf_wave,
+			      is_permanent_hazard = rapids.is_permanent_hazard OR EXCLUDED.is_permanent_hazard,
+			      hazard_type         = COALESCE(EXCLUDED.hazard_type, rapids.hazard_type)
+		`, t.col, t.col, t.col), t.id, cleanName, lon, lat, desc, classRating, isSurfWave, isPermanentHazard, hazardType)
+	}
+	return err
+}
+
+func (imp *Importer) upsertAccessForTarget(ctx context.Context, t pinTarget, accessType, name, notes string, lon, lat float64) error {
+	if imp.DryRun {
+		return nil
+	}
+	_, err := imp.pool.Exec(ctx, fmt.Sprintf(`
+		INSERT INTO reach_access
+			(%s, access_type, name, notes,
+			 location, data_source, verified)
+		VALUES
+			($1, $2, $3, NULLIF($4, ''),
+			 ST_SetSRID(ST_MakePoint($5, $6), 4326)::geography, 'import', true)
+		ON CONFLICT (%s, access_type, name) WHERE %s IS NOT NULL DO UPDATE
+		  SET location = EXCLUDED.location,
+		      notes    = COALESCE(EXCLUDED.notes, reach_access.notes),
+		      verified = true
+	`, t.col, t.col, t.col), t.id, accessType, name, notes, lon, lat)
+	return err
+}
+
+func (imp *Importer) upsertParkingForTarget(ctx context.Context, t pinTarget, name, notes string, lon, lat float64) error {
+	if imp.DryRun {
+		return nil
+	}
+	_, err := imp.pool.Exec(ctx, fmt.Sprintf(`
+		INSERT INTO reach_access
+			(%s, access_type, name, notes,
+			 location, parking_location, data_source, verified)
+		VALUES
+			($1, 'parking', $2, NULLIF($3, ''),
+			 ST_SetSRID(ST_MakePoint($4, $5), 4326)::geography,
+			 ST_SetSRID(ST_MakePoint($4, $5), 4326)::geography,
+			 'import', true)
+		ON CONFLICT (%s, access_type, name) WHERE %s IS NOT NULL DO UPDATE
+		  SET location         = EXCLUDED.location,
+		      parking_location = EXCLUDED.parking_location,
+		      notes            = COALESCE(EXCLUDED.notes, reach_access.notes),
+		      verified         = true
+	`, t.col, t.col, t.col), t.id, name, notes, lon, lat)
+	return err
+}
+
+func (imp *Importer) clearImportDataForTarget(ctx context.Context, t pinTarget) error {
+	if imp.DryRun {
+		return nil
+	}
+	if _, err := imp.pool.Exec(ctx,
+		fmt.Sprintf(`DELETE FROM rapids WHERE %s = $1 AND data_source IN ('import', 'ai_seed')`, t.col),
+		t.id,
+	); err != nil {
+		return err
+	}
+	_, err := imp.pool.Exec(ctx,
+		fmt.Sprintf(`DELETE FROM reach_access WHERE %s = $1 AND data_source IN ('import', 'ai_seed')`, t.col),
+		t.id,
+	)
+	return err
+}

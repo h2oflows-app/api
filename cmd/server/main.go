@@ -106,6 +106,7 @@ func main() {
 	reaches     := handlers.NewReachHandler(pool, asker).WithPoller(p)
 	watchlist   := handlers.NewWatchlistHandler(pool)
 	admin       := handlers.NewAdminHandler(pool)
+	corrections := handlers.NewCorrectionsHandler(pool)
 	userReaches  := handlers.NewUserReachHandler(pool, devFallbackID)
 	customGauges := handlers.NewCustomGaugeHandler(pool, devFallbackID)
 	nldiH    := handlers.NewNLDIHandler(pool).WithAnthropicKey(cfg.AnthropicAPIKey).WithCacheWarmer(func() { reaches.WarmCache(context.Background()) })
@@ -203,6 +204,8 @@ func main() {
 		r.Delete("/me/reaches/{slug}/centerline", userReaches.ClearCenterline)
 		r.Put("/me/reaches/{slug}/gauge", userReaches.SetGauge)
 		r.Delete("/me/reaches/{slug}/gauge", userReaches.ClearGauge)
+		r.Post("/me/reaches/{slug}/kml", userReaches.ImportKML)
+		r.Post("/me/river-corrections", corrections.CreateRiverCorrection)
 
 		// Custom gauges — private to owner, auth gated via ownerID() + devFallbackID.
 		r.Get("/me/custom-gauges", customGauges.List)
@@ -231,8 +234,9 @@ func main() {
 			r.Post("/admin/rivers", admin.CreateRiver)
 			r.Put("/admin/rivers/{riverSlug}", admin.UpdateRiver)
 			r.Delete("/admin/rivers/{riverSlug}", admin.DeleteRiver)
-			r.Get("/admin/rivers/{riverSlug}/auto-fill", admin.AutoFillRiverMeta)
 			r.Post("/admin/rivers/{riverSlug}/reorder-reaches", admin.ReorderReachesForRiver)
+			r.Get("/admin/river-corrections", corrections.ListRiverCorrections)
+			r.Patch("/admin/river-corrections/{id}", corrections.ReviewRiverCorrection)
 			r.Get("/admin/rivers/gnis-lookup", admin.GNISLookup)
 			r.Get("/admin/nldi/watershed", nldiH.WatershedExplorer)
 			r.Get("/admin/nldi/upstream-tributaries", nldiH.UpstreamTributaries)

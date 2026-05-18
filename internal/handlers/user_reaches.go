@@ -1,8 +1,10 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -12,6 +14,61 @@ import (
 	"github.com/h2oflow/h2oflow/apps/api/internal/kmlimport"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// resolveOrCreateRiver finds a river by GNIS ID (preferred) or name, backfilling
+// gnis_id on existing legacy rows when a new GNIS match is now available. When
+// no match exists, INSERTs a new river — populating state_abbr/basin/huc8 via
+// NHD + WBD/TIGERweb when gnisID is present. Returns river ID, "" on failure.
+func resolveOrCreateRiver(ctx context.Context, db *pgxpool.Pool, riverName, gnisID string) string {
+	riverSlug := kmlimport.Slugify(riverName)
+	var rid string
+
+	if gnisID != "" {
+		_ = db.QueryRow(ctx, `SELECT id FROM rivers WHERE gnis_id = $1`, gnisID).Scan(&rid)
+	}
+
+	if rid == "" {
+		_ = db.QueryRow(ctx, `SELECT id FROM rivers WHERE lower(name) = lower($1) LIMIT 1`, riverName).Scan(&rid)
+	}
+
+	// Backfill GNIS ID + state/basin/huc8 on existing river if we now have a GNIS ID.
+	if rid != "" && gnisID != "" {
+		var existingGnis, existingState *string
+		_ = db.QueryRow(ctx, `SELECT gnis_id, state_abbr FROM rivers WHERE id = $1`, rid).Scan(&existingGnis, &existingState)
+		if existingGnis == nil || existingState == nil {
+			stateAbbr, basin, huc8 := riverMetaFromGNIS(ctx, gnisID)
+			_, _ = db.Exec(ctx, `
+				UPDATE rivers SET
+					gnis_id    = COALESCE(gnis_id, $2),
+					state_abbr = COALESCE(state_abbr, NULLIF($3,'')),
+					basin      = COALESCE(basin,      NULLIF($4,'')),
+					huc8       = COALESCE(huc8,       NULLIF($5,''))
+				WHERE id = $1
+			`, rid, gnisID, stateAbbr, basin, huc8)
+		}
+	}
+
+	if rid == "" {
+		var gnisParam interface{}
+		var stateAbbr, basin, huc8 string
+		if gnisID != "" {
+			gnisParam = gnisID
+			stateAbbr, basin, huc8 = riverMetaFromGNIS(ctx, gnisID)
+		}
+		_ = db.QueryRow(ctx, `
+			INSERT INTO rivers (slug, name, gnis_id, state_abbr, basin, huc8)
+			VALUES ($1, $2, $3, NULLIF($4,''), NULLIF($5,''), NULLIF($6,''))
+			ON CONFLICT (slug) DO UPDATE SET
+				name       = EXCLUDED.name,
+				gnis_id    = COALESCE(rivers.gnis_id,    EXCLUDED.gnis_id),
+				state_abbr = COALESCE(rivers.state_abbr, EXCLUDED.state_abbr),
+				basin      = COALESCE(rivers.basin,      EXCLUDED.basin),
+				huc8       = COALESCE(rivers.huc8,       EXCLUDED.huc8)
+			RETURNING id
+		`, riverSlug, riverName, gnisParam, stateAbbr, basin, huc8).Scan(&rid)
+	}
+	return rid
+}
 
 // UserReachHandler handles /api/v1/me/reaches routes.
 // All mutations are owner-scoped. devFallbackID is used in development when
@@ -49,6 +106,8 @@ type userReachSummary struct {
 	Slug        string     `json:"slug"`
 	Name        string     `json:"name"`
 	RiverName   *string    `json:"river_name"`
+	StateAbbr   *string    `json:"state_abbr"`
+	BasinGroup  *string    `json:"basin_group"`
 	PutInLng    float64    `json:"put_in_lng"`
 	PutInLat    float64    `json:"put_in_lat"`
 	TakeOutLng  float64    `json:"take_out_lng"`
@@ -65,8 +124,32 @@ type userReachSummary struct {
 	CreatedAt        time.Time  `json:"created_at"`
 }
 
+type userReachRapid struct {
+	ID                string   `json:"id"`
+	Name              string   `json:"name"`
+	Description       *string  `json:"description"`
+	ClassRating       *float64 `json:"class_rating"`
+	IsSurfWave        bool     `json:"is_surf_wave"`
+	IsPermanentHazard bool     `json:"is_permanent_hazard"`
+	HazardType        *string  `json:"hazard_type"`
+	Lng               *float64 `json:"lng"`
+	Lat               *float64 `json:"lat"`
+}
+
+type userReachAccessPoint struct {
+	ID         string   `json:"id"`
+	AccessType string   `json:"access_type"`
+	Name       *string  `json:"name"`
+	Notes      *string  `json:"notes"`
+	Lng        *float64 `json:"lng"`
+	Lat        *float64 `json:"lat"`
+}
+
 type userReachDetail struct {
 	userReachSummary
+	RiverSlug       *string              `json:"river_slug"`
+	RiverStateAbbr  *string              `json:"river_state_abbr"`
+	RiverBasin      *string              `json:"river_basin"`
 	UpComID          *string              `json:"up_comid"`
 	DownComID        *string              `json:"down_comid"`
 	Centerline       *json.RawMessage     `json:"centerline"`
@@ -78,7 +161,9 @@ type userReachDetail struct {
 	GaugeLastPollSuccess  *time.Time           `json:"gauge_last_poll_success_at"`
 	CustomGaugeID         *string              `json:"custom_gauge_id"`
 	CustomGaugeName       *string              `json:"custom_gauge_name"`
-	FlowRanges            []userReachFlowRange `json:"flow_ranges"`
+	FlowRanges            []userReachFlowRange  `json:"flow_ranges"`
+	Rapids                []userReachRapid      `json:"rapids"`
+	AccessPoints          []userReachAccessPoint `json:"access_points"`
 }
 
 // ── MapAll ────────────────────────────────────────────────────────────────────
@@ -231,6 +316,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.db.Query(r.Context(), `
 		SELECT
 			ur.id, ur.slug, ur.name, ur.river_name,
+			rv.state_abbr, rv.basin AS basin_group,
 			ST_X(ur.put_in::geometry)    AS put_in_lng,
 			ST_Y(ur.put_in::geometry)    AS put_in_lat,
 			ST_X(ur.take_out::geometry)  AS take_out_lng,
@@ -251,6 +337,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			cg.slug AS custom_gauge_slug,
 			cg.name AS custom_gauge_name
 		FROM user_reaches ur
+		LEFT JOIN rivers rv ON rv.id = ur.river_id
 		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
 		LEFT JOIN LATERAL (
 			SELECT value, timestamp FROM gauge_readings
@@ -280,6 +367,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 		var s userReachSummary
 		if err := rows.Scan(
 			&s.ID, &s.Slug, &s.Name, &s.RiverName,
+			&s.StateAbbr, &s.BasinGroup,
 			&s.PutInLng, &s.PutInLat, &s.TakeOutLng, &s.TakeOutLat,
 			&s.Note, &s.CreatedAt,
 			&s.CurrentCFS, &s.LastReadAt,
@@ -335,8 +423,12 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 				WHEN fr.label = 'high'    THEN 'flood'
 				ELSE 'unknown'
 			END AS flow_status,
-			fr.label AS flow_band
+			fr.label AS flow_band,
+			rv.slug AS river_slug,
+			rv.state_abbr AS river_state_abbr,
+			rv.basin AS river_basin
 		FROM user_reaches ur
+		LEFT JOIN rivers rv ON rv.id = ur.river_id
 		LEFT JOIN gauges g ON g.id = ur.primary_gauge_id
 		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
 		LEFT JOIN LATERAL (
@@ -365,6 +457,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 		&d.CustomGaugeID, &d.CustomGaugeName,
 		&d.CurrentCFS, &d.LastReadAt,
 		&d.FlowStatus, &d.FlowBand,
+		&d.RiverSlug, &d.RiverStateAbbr, &d.RiverBasin,
 	)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
@@ -390,6 +483,48 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 			var fr userReachFlowRange
 			if frRows.Scan(&fr.Label, &fr.MinValue, &fr.MaxValue) == nil {
 				d.FlowRanges = append(d.FlowRanges, fr)
+			}
+		}
+	}
+
+	// Rapids
+	d.Rapids = make([]userReachRapid, 0)
+	rapRows, _ := h.db.Query(r.Context(), `
+		SELECT id, name, description, class_rating,
+		       is_surf_wave, is_permanent_hazard, hazard_type,
+		       ST_X(location::geometry), ST_Y(location::geometry)
+		FROM rapids
+		WHERE user_reach_id = $1
+		ORDER BY name
+	`, d.ID)
+	if rapRows != nil {
+		defer rapRows.Close()
+		for rapRows.Next() {
+			var rr userReachRapid
+			if rapRows.Scan(&rr.ID, &rr.Name, &rr.Description, &rr.ClassRating,
+				&rr.IsSurfWave, &rr.IsPermanentHazard, &rr.HazardType,
+				&rr.Lng, &rr.Lat) == nil {
+				d.Rapids = append(d.Rapids, rr)
+			}
+		}
+	}
+
+	// Access points
+	d.AccessPoints = make([]userReachAccessPoint, 0)
+	apRows, _ := h.db.Query(r.Context(), `
+		SELECT id, access_type, name, notes,
+		       ST_X(location::geometry), ST_Y(location::geometry)
+		FROM reach_access
+		WHERE user_reach_id = $1
+		ORDER BY access_type, name
+	`, d.ID)
+	if apRows != nil {
+		defer apRows.Close()
+		for apRows.Next() {
+			var ap userReachAccessPoint
+			if apRows.Scan(&ap.ID, &ap.AccessType, &ap.Name, &ap.Notes,
+				&ap.Lng, &ap.Lat) == nil {
+				d.AccessPoints = append(d.AccessPoints, ap)
 			}
 		}
 	}
@@ -455,27 +590,7 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var finalRiverName *string
 	if rn := strings.TrimSpace(body.RiverName); rn != "" {
 		finalRiverName = &rn
-		riverSlug := kmlimport.Slugify(rn)
-		var rid string
-		if body.GnisID != "" {
-			_ = h.db.QueryRow(ctx, `SELECT id FROM rivers WHERE gnis_id = $1`, body.GnisID).Scan(&rid)
-		}
-		if rid == "" {
-			_ = h.db.QueryRow(ctx, `SELECT id FROM rivers WHERE lower(name) = lower($1) LIMIT 1`, rn).Scan(&rid)
-		}
-		if rid == "" {
-			verified := body.GnisID != ""
-			var gnisParam interface{}
-			if body.GnisID != "" {
-				gnisParam = body.GnisID
-			}
-			_ = h.db.QueryRow(ctx, `
-				INSERT INTO rivers (slug, name, gnis_id, verified)
-				VALUES ($1, $2, $3, $4)
-				ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name
-				RETURNING id
-			`, riverSlug, rn, gnisParam, verified).Scan(&rid)
-		}
+		rid := resolveOrCreateRiver(ctx, h.db, rn, body.GnisID)
 		if rid != "" {
 			riverID = &rid
 		}
@@ -596,27 +711,7 @@ func (h *UserReachHandler) Import(w http.ResponseWriter, r *http.Request) {
 	var finalRiverName *string
 	if rn := strings.TrimSpace(body.RiverName); rn != "" {
 		finalRiverName = &rn
-		riverSlug := kmlimport.Slugify(rn)
-		var rid string
-		if body.GnisID != "" {
-			_ = h.db.QueryRow(ctx, `SELECT id FROM rivers WHERE gnis_id = $1`, body.GnisID).Scan(&rid)
-		}
-		if rid == "" {
-			_ = h.db.QueryRow(ctx, `SELECT id FROM rivers WHERE lower(name) = lower($1) LIMIT 1`, rn).Scan(&rid)
-		}
-		if rid == "" {
-			verified := body.GnisID != ""
-			var gnisParam interface{}
-			if body.GnisID != "" {
-				gnisParam = body.GnisID
-			}
-			_ = h.db.QueryRow(ctx, `
-				INSERT INTO rivers (slug, name, gnis_id, verified)
-				VALUES ($1, $2, $3, $4)
-				ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name
-				RETURNING id
-			`, riverSlug, rn, gnisParam, verified).Scan(&rid)
-		}
+		rid := resolveOrCreateRiver(ctx, h.db, rn, body.GnisID)
 		if rid != "" {
 			riverID = &rid
 		}
@@ -694,6 +789,7 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		Name      *string `json:"name"`
 		Note      *string `json:"note"`
 		RiverName *string `json:"river_name"`
+		GnisID    *string `json:"gnis_id"`
 		PutIn     *latLng `json:"put_in"`
 		TakeOut   *latLng `json:"take_out"`
 		UpComID   *string `json:"up_comid"`
@@ -726,6 +822,20 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if err != nil || tag.RowsAffected() == 0 {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
 		return
+	}
+
+	// Re-resolve river when river_name is being set, so state/basin/huc8 get populated.
+	if riverName != nil {
+		gnisID := ""
+		if body.GnisID != nil {
+			gnisID = strings.TrimSpace(*body.GnisID)
+		}
+		rid := resolveOrCreateRiver(ctx, h.db, *riverName, gnisID)
+		if rid != "" {
+			_, _ = h.db.Exec(ctx,
+				`UPDATE user_reaches SET river_id = $3 WHERE owner_id = $1 AND slug = $2`,
+				ownerID, slug, rid)
+		}
 	}
 
 	// Geometry update — only when all four geometry fields provided.
@@ -1012,4 +1122,47 @@ func (h *UserReachHandler) SetGauge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// ImportKML handles POST /api/v1/me/reaches/{slug}/kml
+// Accepts multipart/form-data with a "file" field containing a KML or KMZ file.
+// Imports all point placemarks as pins into the authenticated owner's user reach.
+func (h *UserReachHandler) ImportKML(w http.ResponseWriter, r *http.Request) {
+	ownerID, ok := h.ownerID(r)
+	if !ok {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	slug := chi.URLParam(r, "slug")
+
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		errorResponse(w, http.StatusBadRequest, "invalid multipart form: "+err.Error())
+		return
+	}
+	f, _, err := r.FormFile("file")
+	if err != nil {
+		errorResponse(w, http.StatusBadRequest, "missing 'file' field")
+		return
+	}
+	defer f.Close()
+
+	data, err := io.ReadAll(f)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "read file: "+err.Error())
+		return
+	}
+
+	doc, err := kmlimport.ParseKMLBytes(data)
+	if err != nil {
+		errorResponse(w, http.StatusUnprocessableEntity, "parse KML: "+err.Error())
+		return
+	}
+
+	imp := kmlimport.New(h.db, false)
+	res, err := imp.ImportForUserReach(r.Context(), ownerID, slug, doc)
+	if err != nil {
+		errorResponse(w, http.StatusNotFound, err.Error())
+		return
+	}
+	jsonResponse(w, http.StatusOK, res)
 }

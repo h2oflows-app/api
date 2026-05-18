@@ -49,8 +49,8 @@ func (h *AdminHandler) SlugCheck(w http.ResponseWriter, r *http.Request) {
 // GET /api/v1/admin/rivers
 func (h *AdminHandler) ListRivers(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.db.Query(r.Context(), `
-		SELECT rv.id, rv.slug, rv.name, rv.gnis_id, rv.basin, rv.basin_locked, rv.state_abbr,
-		       rv.verified, COUNT(re.id) AS reach_count,
+		SELECT rv.id, rv.slug, rv.name, rv.gnis_id, rv.basin, rv.state_abbr,
+		       COUNT(re.id) AS reach_count,
 		       COUNT(g.id) FILTER (WHERE g.poll_health = 'degraded')    AS gauges_degraded,
 		       COUNT(g.id) FILTER (WHERE g.poll_health = 'stale')       AS gauges_stale,
 		       COUNT(g.id) FILTER (WHERE g.poll_health = 'unreachable') AS gauges_unreachable
@@ -72,9 +72,7 @@ func (h *AdminHandler) ListRivers(w http.ResponseWriter, r *http.Request) {
 		Name              string  `json:"name"`
 		GNISID            *string `json:"gnis_id"`
 		Basin             *string `json:"basin"`
-		BasinLocked       bool    `json:"basin_locked"`
 		StateAbbr         *string `json:"state_abbr"`
-		Verified          bool    `json:"verified"`
 		ReachCount        int     `json:"reach_count"`
 		GaugesDegraded    int     `json:"gauges_degraded"`
 		GaugesStale       int     `json:"gauges_stale"`
@@ -85,8 +83,8 @@ func (h *AdminHandler) ListRivers(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var rv River
 		if err := rows.Scan(
-			&rv.ID, &rv.Slug, &rv.Name, &rv.GNISID, &rv.Basin, &rv.BasinLocked, &rv.StateAbbr,
-			&rv.Verified, &rv.ReachCount,
+			&rv.ID, &rv.Slug, &rv.Name, &rv.GNISID, &rv.Basin, &rv.StateAbbr,
+			&rv.ReachCount,
 			&rv.GaugesDegraded, &rv.GaugesStale, &rv.GaugesUnreachable,
 		); err != nil {
 			continue
@@ -113,20 +111,20 @@ func (h *AdminHandler) GetRiver(w http.ResponseWriter, r *http.Request) {
 		RiverOrder    *int16   `json:"river_order"`
 	}
 	type RiverDetail struct {
-		ID          string  `json:"id"`
-		Slug        string  `json:"slug"`
-		Name        string  `json:"name"`
-		GNISID      *string `json:"gnis_id"`
-		Basin       *string `json:"basin"`
-		BasinLocked bool    `json:"basin_locked"`
-		StateAbbr   *string `json:"state_abbr"`
-		Reaches     []Reach `json:"reaches"`
+		ID        string  `json:"id"`
+		Slug      string  `json:"slug"`
+		Name      string  `json:"name"`
+		GNISID    *string `json:"gnis_id"`
+		Basin     *string `json:"basin"`
+		StateAbbr *string `json:"state_abbr"`
+		HUC8      *string `json:"huc8"`
+		Reaches   []Reach `json:"reaches"`
 	}
 
 	var rv RiverDetail
 	err := h.db.QueryRow(r.Context(), `
-		SELECT id, slug, name, gnis_id, basin, basin_locked, state_abbr FROM rivers WHERE slug = $1
-	`, slug).Scan(&rv.ID, &rv.Slug, &rv.Name, &rv.GNISID, &rv.Basin, &rv.BasinLocked, &rv.StateAbbr)
+		SELECT id, slug, name, gnis_id, basin, state_abbr, huc8 FROM rivers WHERE slug = $1
+	`, slug).Scan(&rv.ID, &rv.Slug, &rv.Name, &rv.GNISID, &rv.Basin, &rv.StateAbbr, &rv.HUC8)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "river not found")
 		return
@@ -158,51 +156,55 @@ func (h *AdminHandler) GetRiver(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, rv)
 }
 
-// CreateRiver creates a new river.
+// CreateRiver creates a new river from a GNIS ID.
 // POST /api/v1/admin/rivers
+// Only accepts gnis_id — name, state, basin, huc8 are derived from NHD.
 func (h *AdminHandler) CreateRiver(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Slug      string  `json:"slug"`
-		Name      string  `json:"name"`
-		Basin     *string `json:"basin"`
-		StateAbbr *string `json:"state_abbr"`
-		GnisID    *string `json:"gnis_id"`
-		HUC8      *string `json:"huc8"`
+		GnisID string `json:"gnis_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	if body.Slug == "" || body.Name == "" {
-		errorResponse(w, http.StatusBadRequest, "slug and name are required")
+	body.GnisID = strings.TrimSpace(body.GnisID)
+	if body.GnisID == "" {
+		errorResponse(w, http.StatusBadRequest, "gnis_id is required")
 		return
 	}
 
-	// Auto-fill geo meta from GNIS ID when basin/state are not explicitly provided.
-	if body.GnisID != nil && *body.GnisID != "" && body.Basin == nil && body.StateAbbr == nil {
-		stateAbbr, basin, huc8 := riverMetaFromGNIS(r.Context(), *body.GnisID)
-		if stateAbbr != "" {
-			body.StateAbbr = &stateAbbr
-		}
-		if basin != "" {
-			body.Basin = &basin
-		}
-		if huc8 != "" {
-			body.HUC8 = &huc8
-		}
+	ctx := r.Context()
+	coord, err := nldi.NHDCoordByGNISID(ctx, body.GnisID)
+	if err != nil {
+		errorResponse(w, http.StatusBadRequest, fmt.Sprintf("GNIS ID not found in NHD: %v", err))
+		return
 	}
+	if coord.Name == "" {
+		errorResponse(w, http.StatusBadRequest, "NHD feature has no GNIS name")
+		return
+	}
+
+	stateAbbr, basin, huc8 := riverMetaFromGNIS(ctx, body.GnisID)
+	slug := kmlimport.Slugify(coord.Name)
 
 	var id string
-	err := h.db.QueryRow(r.Context(), `
-		INSERT INTO rivers (slug, name, basin, state_abbr, gnis_id, huc8)
-		VALUES ($1, $2, $3, $4, $5, $6)
+	dbErr := h.db.QueryRow(ctx, `
+		INSERT INTO rivers (slug, name, gnis_id, state_abbr, basin, huc8)
+		VALUES ($1, $2, $3, NULLIF($4,''), NULLIF($5,''), NULLIF($6,''))
 		RETURNING id
-	`, body.Slug, body.Name, body.Basin, body.StateAbbr, body.GnisID, body.HUC8).Scan(&id)
-	if err != nil {
-		errorResponse(w, http.StatusConflict, "river already exists or invalid data")
+	`, slug, coord.Name, body.GnisID, stateAbbr, basin, huc8).Scan(&id)
+	if dbErr != nil {
+		errorResponse(w, http.StatusConflict, "river already exists (GNIS ID or slug conflict)")
 		return
 	}
-	jsonResponse(w, http.StatusCreated, map[string]string{"id": id})
+	jsonResponse(w, http.StatusCreated, map[string]any{
+		"id":         id,
+		"slug":       slug,
+		"name":       coord.Name,
+		"state_abbr": stateAbbr,
+		"basin":      basin,
+		"huc8":       huc8,
+	})
 }
 
 // DeleteRiver permanently deletes a river and unlinks its reaches.
@@ -232,38 +234,28 @@ func (h *AdminHandler) DeleteRiver(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// UpdateRiver updates a river's metadata.
+// UpdateRiver updates a river's basin. Only basin is mutable by admin.
+// Name, state, GNIS ID, and HUC8 are GNIS-canonical and not modifiable here.
 // PUT /api/v1/admin/rivers/{riverSlug}
-// When basin is provided it is always written (even if identical) so the
-// caller can explicitly set it. basin_locked controls whether the metadata
-// sync is allowed to overwrite it in the future.
 func (h *AdminHandler) UpdateRiver(w http.ResponseWriter, r *http.Request) {
 	slug := chi.URLParam(r, "riverSlug")
 	var body struct {
-		Name        *string `json:"name"`
-		Basin       *string `json:"basin"`
-		BasinLocked *bool   `json:"basin_locked"`
-		StateAbbr   *string `json:"state_abbr"`
-		GnisID      *string `json:"gnis_id"`
-		HUC8        *string `json:"huc8"`
+		Basin *string `json:"basin"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
+	if body.Basin == nil {
+		errorResponse(w, http.StatusBadRequest, "basin is required")
+		return
+	}
 
-	_, err := h.db.Exec(r.Context(), `
-		UPDATE rivers
-		SET name         = COALESCE($2, name),
-		    basin        = COALESCE($3, basin),
-		    basin_locked = COALESCE($4, basin_locked),
-		    state_abbr   = COALESCE($5, state_abbr),
-		    gnis_id      = COALESCE($6, gnis_id),
-		    huc8         = COALESCE($7, huc8)
-		WHERE slug = $1
-	`, slug, body.Name, body.Basin, body.BasinLocked, body.StateAbbr, body.GnisID, body.HUC8)
-	if err != nil {
-		errorResponse(w, http.StatusInternalServerError, "update failed")
+	tag, err := h.db.Exec(r.Context(), `
+		UPDATE rivers SET basin = $2 WHERE slug = $1
+	`, slug, body.Basin)
+	if err != nil || tag.RowsAffected() == 0 {
+		errorResponse(w, http.StatusNotFound, "river not found")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -355,13 +347,11 @@ func (h *AdminHandler) AutoAssignRiver(w http.ResponseWriter, r *http.Request) {
 			gnisParam = body.GnisID
 			stateAbbr, basin, huc8 = riverMetaFromGNIS(ctx, body.GnisID)
 		}
-		// verified = true when GNIS match confirms the river identity, false otherwise.
-		verified := body.GnisID != ""
 		if err := h.db.QueryRow(ctx, `
-			INSERT INTO rivers (slug, name, gnis_id, state_abbr, basin, huc8, verified)
-			VALUES ($1, $2, $3, NULLIF($4,''), NULLIF($5,''), NULLIF($6,''), $7)
+			INSERT INTO rivers (slug, name, gnis_id, state_abbr, basin, huc8)
+			VALUES ($1, $2, $3, NULLIF($4,''), NULLIF($5,''), NULLIF($6,''))
 			RETURNING id, name, slug, gnis_id
-		`, riverSlug, body.RiverName, gnisParam, stateAbbr, basin, huc8, verified).Scan(&riverID, &riverName, &riverSlugOut, &riverGnisID); err != nil {
+		`, riverSlug, body.RiverName, gnisParam, stateAbbr, basin, huc8).Scan(&riverID, &riverName, &riverSlugOut, &riverGnisID); err != nil {
 			errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("insert river: %v", err))
 			return
 		}
@@ -661,77 +651,6 @@ func (h *AdminHandler) GetMyRoles(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// AutoFillRiverMeta returns suggested state and basin for a river by querying
-// external geo services at the upstream-most reach coordinate.
-// GET /api/v1/admin/rivers/{riverSlug}/auto-fill
-func (h *AdminHandler) AutoFillRiverMeta(w http.ResponseWriter, r *http.Request) {
-	riverSlug := chi.URLParam(r, "riverSlug")
-	ctx := r.Context()
-
-	var lat, lng float64
-	err := h.db.QueryRow(ctx, `
-		SELECT COALESCE(ST_Y(start_point::geometry), ST_Y(ST_StartPoint(centerline::geometry))),
-		       COALESCE(ST_X(start_point::geometry), ST_X(ST_StartPoint(centerline::geometry)))
-		FROM reaches
-		WHERE river_id = (SELECT id FROM rivers WHERE slug = $1)
-		  AND (start_point IS NOT NULL OR centerline IS NOT NULL)
-		LIMIT 1
-	`, riverSlug).Scan(&lat, &lng)
-	if err != nil {
-		// No reach coordinates — fall back to GNIS ID if the river has one.
-		var gnisID *string
-		_ = h.db.QueryRow(ctx, `SELECT gnis_id FROM rivers WHERE slug = $1`, riverSlug).Scan(&gnisID)
-		if gnisID == nil || *gnisID == "" {
-			errorResponse(w, http.StatusNotFound, "no reach coordinates or GNIS ID found for river — add a GNIS ID first")
-			return
-		}
-		coord, gErr := nldi.NHDCoordByGNISID(ctx, *gnisID)
-		if gErr != nil {
-			errorResponse(w, http.StatusNotFound, fmt.Sprintf("no reach coordinates found and GNIS lookup failed: %v", gErr))
-			return
-		}
-		lat, lng = coord.Lat, coord.Lng
-	}
-
-	type stateResult struct {
-		val string
-		err error
-	}
-	type basinResult struct {
-		info nldi.BasinInfo
-		err  error
-	}
-	stateCh := make(chan stateResult, 1)
-	basinCh := make(chan basinResult, 1)
-	go func() { v, e := nldi.StateAt(ctx, lat, lng); stateCh <- stateResult{v, e} }()
-	go func() { v, e := nldi.BasinAt(ctx, lat, lng); basinCh <- basinResult{v, e} }()
-
-	stateRes := <-stateCh
-	basinRes := <-basinCh
-
-	if stateRes.err != nil {
-		log.Printf("auto-fill river %s: state lookup: %v", riverSlug, stateRes.err)
-	}
-	if basinRes.err != nil {
-		log.Printf("auto-fill river %s: basin lookup: %v", riverSlug, basinRes.err)
-	}
-
-	// Prefer state from TIGERweb; fall back to first state in WBD states field.
-	stateAbbr := stateRes.val
-	if stateAbbr == "" && basinRes.info.States != "" {
-		stateAbbr = strings.SplitN(basinRes.info.States, ",", 2)[0]
-	}
-
-	jsonResponse(w, http.StatusOK, map[string]any{
-		"state_abbr": stateAbbr,
-		"basin":      gauge.CanonicalBasin(basinRes.info.HUC8),
-		"huc8":       basinRes.info.HUC8,
-		"states":     basinRes.info.States,
-		"lat":        lat,
-		"lng":        lng,
-	})
-}
-
 // GNISLookup handles GET /api/v1/admin/rivers/gnis-lookup?gnis_id=X
 //
 // Resolves a GNIS stream ID to state, basin name, and HUC8. Uses the NHD
@@ -774,6 +693,7 @@ func (h *AdminHandler) GNISLookup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonResponse(w, http.StatusOK, map[string]any{
+		"name":       coord.Name,
 		"state_abbr": stateAbbr,
 		"basin":      gauge.CanonicalBasin(basinRes.info.HUC8),
 		"huc8":       basinRes.info.HUC8,
