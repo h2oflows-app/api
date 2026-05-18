@@ -117,6 +117,7 @@ func main() {
 	contributions := handlers.NewContributionHandler(pool)
 	reports       := handlers.NewReportHandler(pool, devFallbackID)
 	preferences   := handlers.NewPreferencesHandler(pool, devFallbackID)
+	profile       := handlers.NewProfileHandler(pool, devFallbackID)
 	dashboards    := handlers.NewDashboardHandler(pool, devFallbackID)
 	var importEmbedder *ai.Embedder
 	if cfg.VoyageAPIKey != "" {
@@ -285,6 +286,8 @@ func main() {
 		r.Post("/me/reports/{slug}/aw-sync", reports.AWSync)
 		r.Get("/me/preferences", preferences.Get)
 		r.Patch("/me/preferences", preferences.Update)
+		r.Get("/me/profile", profile.Get)
+		r.Patch("/me/profile", profile.Update)
 		r.Get("/me/dashboards", dashboards.List)
 		r.Post("/me/dashboards", dashboards.Create)
 		r.Get("/me/dashboards/{slug}", dashboards.Get)
