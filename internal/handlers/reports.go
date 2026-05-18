@@ -611,7 +611,7 @@ func (h *ReportHandler) ListMine(w http.ResponseWriter, r *http.Request) {
 		SELECT
 			rp.id, rp.slug,
 			rp.name, rp.report_date::TEXT, rp.report_time::TEXT,
-			rp.content, rp.hazard_warning, rp.paddled,
+			rp.content, rp.paddled,
 			rp.flow_cfs, rp.flow_band, rp.created_at,
 			COALESCE(re.name, '') AS reach_name,
 			COALESCE(re.slug, '') AS reach_slug,
@@ -630,20 +630,19 @@ func (h *ReportHandler) ListMine(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type myReport struct {
-		ID            string   `json:"id"`
-		Slug          string   `json:"slug"`
-		Name          string   `json:"name"`
-		ReportDate    string   `json:"report_date"`
-		ReportTime    *string  `json:"report_time,omitempty"`
-		Content       string   `json:"content"`
-		HazardWarning *string  `json:"hazard_warning,omitempty"`
-		Paddled       bool     `json:"paddled"`
-		FlowCFS       *float64 `json:"flow_cfs,omitempty"`
-		FlowBand      *string  `json:"flow_band,omitempty"`
-		CreatedAt     string   `json:"created_at"`
-		ReachName     string   `json:"reach_name"`
-		ReachSlug     string   `json:"reach_slug"`
-		URL           string   `json:"url,omitempty"`
+		ID         string   `json:"id"`
+		Slug       string   `json:"slug"`
+		Name       string   `json:"name"`
+		ReportDate string   `json:"report_date"`
+		ReportTime *string  `json:"report_time,omitempty"`
+		Content    string   `json:"content"`
+		Paddled    bool     `json:"paddled"`
+		FlowCFS    *float64 `json:"flow_cfs,omitempty"`
+		FlowBand   *string  `json:"flow_band,omitempty"`
+		CreatedAt  string   `json:"created_at"`
+		ReachName  string   `json:"reach_name"`
+		ReachSlug  string   `json:"reach_slug"`
+		URL        string   `json:"url,omitempty"`
 	}
 
 	var reports []myReport
@@ -654,7 +653,7 @@ func (h *ReportHandler) ListMine(w http.ResponseWriter, r *http.Request) {
 		if err := rows.Scan(
 			&rep.ID, &rep.Slug,
 			&rep.Name, &rep.ReportDate, &rep.ReportTime,
-			&rep.Content, &rep.HazardWarning, &rep.Paddled,
+			&rep.Content, &rep.Paddled,
 			&rep.FlowCFS, &rep.FlowBand, &createdAt,
 			&rep.ReachName, &rep.ReachSlug,
 			&handle,
@@ -672,43 +671,3 @@ func (h *ReportHandler) ListMine(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, reports)
 }
 
-// ── GET /reaches/active-hazards ───────────────────────────────────────────────
-
-// ActiveHazards returns all reaches with hazard reports filed within the last 2
-// days — one call lets the dashboard badge every card in the watchlist at once.
-func (h *ReportHandler) ActiveHazards(w http.ResponseWriter, r *http.Request) {
-	type activeHazard struct {
-		Slug          string `json:"slug"`
-		HazardWarning string `json:"hazard_warning"`
-		ReportDate    string `json:"report_date"`
-		ReporterName  string `json:"reporter_name"`
-	}
-
-	rows, err := h.db.Query(r.Context(), `
-		SELECT re.slug, rp.hazard_warning, rp.report_date::TEXT, rp.name
-		FROM reports rp
-		JOIN reaches re ON re.id = rp.reach_id
-		WHERE rp.hazard_warning IS NOT NULL
-		  AND rp.report_date >= CURRENT_DATE - INTERVAL '2 days'
-		ORDER BY rp.report_date DESC, rp.created_at DESC
-	`)
-	if err != nil {
-		errorResponse(w, http.StatusInternalServerError, "query failed")
-		return
-	}
-	defer rows.Close()
-
-	var hazards []activeHazard
-	for rows.Next() {
-		var item activeHazard
-		if err := rows.Scan(&item.Slug, &item.HazardWarning, &item.ReportDate, &item.ReporterName); err != nil {
-			continue
-		}
-		hazards = append(hazards, item)
-	}
-	if hazards == nil {
-		hazards = []activeHazard{}
-	}
-	w.Header().Set("Cache-Control", "public, max-age=60")
-	jsonResponse(w, http.StatusOK, hazards)
-}
