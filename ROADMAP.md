@@ -968,7 +968,7 @@ Dendritic tree view of the real gauges behind a dashboard, accessed via a link/b
 
 Generate the AW trip-report submission form structure (gathered by inspecting AW's submit form as a logged-in member). On "submit", show the constructed HTTP request + body in a modal instead of posting. User can copy the body and paste it into AW manually.
 
-- Unblocks demos to Owen + Greg (AW tech team + AW Stream Team) without needing prior AW board approval to actually POST
+- Unblocks demos to AW-side contacts (tech team + Stream Team) without needing prior AW board approval to actually POST
 - Sets the table for Phase 5 outbound AW integration once approval is in hand — same payload, different submit handler
 - Form schema lives in `/me/preferences` `aw_band_mapping` adjacent (already shipped 2b.3); add `aw_form_schema` JSONB if needed
 
@@ -1094,25 +1094,27 @@ Repos can ship patches independently (`api@v0.2.1` for a poller fix without touc
 
 The app pivoted from a generic flow tracker to "build your own reaches and dashboards on top of curated content." Curated reaches stay; user reaches and custom gauges are the personal layer. Each contact below gets a distinct pitch.
 
-| Contact | Role / context | Lead with | Docs to link |
+Contacts are referenced by archetype only — actual names + contact details live in a private memory note outside the repo. Each archetype gets a distinct pitch.
+
+| Archetype | Role / context | Lead with | Docs to link |
 |---|---|---|---|
-| **Nik** | Whitewater kayak instructor; AW stream team contributor; long-time paddling partner | Custom gauges (gauge math is his world) | Custom gauge builder; user reach creation |
-| **Owen** | AW tech team | Data schema standard for an AW pipeline; auto-share Reports → AW trip-report pre-fill (2b.3); public API contract | Reports + AW cross-post (2b.3); public API (Phase 4) |
-| **Greg** | AW Stream Team Google Group; previously floated an alt whitewater DB; emailed direct | "Complementary, not competing" — H2OFlows as the load-shedding seam AW didn't want to host | Public API; reach + gauge data model framed as offload |
-| **Tim Kunin** | Expert paddler since 2014; deep community presence | Custom reach creation + flow tracking + Reports | User reach flow; custom gauges; reports |
-| **Matt Beaman** | Paddler, non-technical | Plain UX walkthrough — no jargon, will catch dreadful breakage | Dashboard + add reach + reports |
-| **Jamie Knight** | PNW paddler, ex-CO; active community member | Reports + conditions across regions; flow tracking | Reports; basin / state navigation |
+| **Pilot A** | Whitewater kayak instructor; AW stream team contributor | Custom gauges (gauge math is their world) | Custom gauge builder; user reach creation |
+| **Pilot B** | AW tech team | Data schema standard for an AW pipeline; auto-share Reports → AW trip-report pre-fill (2b.3); public API contract | Reports + AW cross-post (2b.3); public API (Phase 4) |
+| **Pilot C** | AW Stream Team Google Group; previously floated an alt whitewater DB | "Complementary, not competing" — H2OFlows as the load-shedding seam AW didn't want to host | Public API; reach + gauge data model framed as offload |
+| **Pilot D** | Expert paddler; deep community presence | Custom reach creation + flow tracking + Reports | User reach flow; custom gauges; reports |
+| **Pilot E** | Paddler, non-technical | Plain UX walkthrough — no jargon, will catch dreadful breakage | Dashboard + add reach + reports |
+| **Pilot F** | PNW paddler, ex-CO; active community member | Reports + conditions across regions; flow tracking | Reports; basin / state navigation |
 
 **Send strategy:**
-- Nik gets a cold link — he'll just load up and explore
+- Pilot A gets a cold link — explore unprompted
 - Everyone else gets a personalized DM/email with: (1) why them specifically, (2) one or two features tailored to them, (3) direct links to the docs pages for those features, (4) ask for an acid-test pass on phone + laptop
 - Drafts kept in a `pilot-outreach/` scratch dir (not committed) until ready to send
 
 ### Pitch differentiation
 
-- **Nik / Tim / Matt / Jamie** — paddler users; pitch the personal-dashboard + custom-reach angle. They use the app, they file reports, they break the UX.
-- **Owen** — AW-internal; pitch the data interop angle. Lead with the share-back-to-AW flow (2b.3) and the public API (Phase 4) as a way for AW to receive structured submissions without operating the public API themselves. Open the door to schema-standard collaboration.
-- **Greg** — pitch H2OFlows as an *offload*, not a replacement. Frame the public API as the interop seam. Acknowledge his concern (AW server load from a public API) and demonstrate H2OFlows already shouldering it. Reframes my earlier pushback against an AW alternative — the alternative is a complement, not a fork.
+- **Pilots A / D / E / F** — paddler users; pitch the personal-dashboard + custom-reach angle. They use the app, they file reports, they break the UX.
+- **Pilot B** — AW-internal; pitch the data interop angle. Lead with the share-back-to-AW flow (2b.3) and the public API (Phase 4) as a way for AW to receive structured submissions without operating the public API themselves. Open the door to schema-standard collaboration.
+- **Pilot C** — pitch H2OFlows as an *offload*, not a replacement. Frame the public API as the interop seam. Acknowledge their concern (AW server load from a public API) and demonstrate H2OFlows already shouldering it. Reframes earlier pushback against an AW alternative — the alternative is a complement, not a fork.
 
 ### Pilot docs site
 
