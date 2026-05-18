@@ -686,8 +686,9 @@ func (h *UserReachHandler) Import(w http.ResponseWriter, r *http.Request) { //no
 			Running *bandRange `json:"running"`
 			High    *bandRange `json:"high"`
 		} `json:"flow_ranges"`
-		GaugeExternalID string `json:"gauge_external_id"`
-		GaugeSource     string `json:"gauge_source"`
+		GaugeExternalID string        `json:"gauge_external_id"`
+		GaugeSource     string        `json:"gauge_source"`
+		CustomGauge     *sharePayload `json:"custom_gauge"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid share payload")
@@ -769,8 +770,15 @@ func (h *UserReachHandler) Import(w http.ResponseWriter, r *http.Request) { //no
 		}
 	}
 
-	// Restore primary gauge association from share payload.
-	if body.GaugeExternalID != "" && body.GaugeSource != "" {
+	// Restore gauge association: custom gauge takes precedence over primary gauge.
+	if body.CustomGauge != nil && body.CustomGauge.Name != "" {
+		cgID, _ := importCustomGaugeForOwner(ctx, h.db, ownerID, *body.CustomGauge)
+		if cgID != "" {
+			_, _ = h.db.Exec(ctx,
+				`UPDATE user_reaches SET custom_gauge_id = $1::uuid, updated_at = NOW() WHERE id = $2`,
+				cgID, reachID)
+		}
+	} else if body.GaugeExternalID != "" && body.GaugeSource != "" {
 		var gaugeID string
 		if lookupErr := h.db.QueryRow(ctx,
 			`SELECT id::text FROM gauges WHERE external_id = $1 AND source = $2`,
