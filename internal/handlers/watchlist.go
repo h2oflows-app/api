@@ -106,12 +106,12 @@ func (h *WatchlistHandler) Add(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	if body.GaugeID == nil && body.CustomGaugeID == nil {
-		errorResponse(w, http.StatusBadRequest, "gauge_id or custom_gauge_id required")
-		return
-	}
 	if body.GaugeID != nil && body.CustomGaugeID != nil {
 		errorResponse(w, http.StatusBadRequest, "only one of gauge_id or custom_gauge_id allowed")
+		return
+	}
+	if body.GaugeID == nil && body.CustomGaugeID == nil && (body.ReachSlug == nil || *body.ReachSlug == "") {
+		errorResponse(w, http.StatusBadRequest, "gauge_id, custom_gauge_id, or reach_slug required")
 		return
 	}
 
@@ -140,18 +140,26 @@ func (h *WatchlistHandler) Add(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var err error
-	if body.GaugeID != nil {
+	switch {
+	case body.GaugeID != nil:
 		_, err = h.db.Exec(r.Context(), `
 			INSERT INTO user_watchlists (user_id, gauge_id, reach_slug, dashboard_id)
 			VALUES ($1, $2::uuid, $3, $4::uuid)
 			ON CONFLICT DO NOTHING
 		`, userID, body.GaugeID, body.ReachSlug, dashboardID)
-	} else {
+	case body.CustomGaugeID != nil:
 		_, err = h.db.Exec(r.Context(), `
 			INSERT INTO user_watchlists (user_id, custom_gauge_id, reach_slug, dashboard_id)
 			VALUES ($1, $2::uuid, $3, $4::uuid)
 			ON CONFLICT DO NOTHING
 		`, userID, body.CustomGaugeID, body.ReachSlug, dashboardID)
+	default:
+		// Reach-only entry: ungauged user reach pinned to a dashboard.
+		_, err = h.db.Exec(r.Context(), `
+			INSERT INTO user_watchlists (user_id, reach_slug, dashboard_id)
+			VALUES ($1, $2, $3::uuid)
+			ON CONFLICT DO NOTHING
+		`, userID, body.ReachSlug, dashboardID)
 	}
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "insert failed")
@@ -187,19 +195,36 @@ func (h *WatchlistHandler) Remove(w http.ResponseWriter, r *http.Request) {
 		reachSlugPtr = &reachSlug
 	}
 
+	dashboardID := r.URL.Query().Get("dashboard_id")
+	var dashboardIDPtr *string
+	if dashboardID != "" {
+		dashboardIDPtr = &dashboardID
+	}
+
 	var err error
-	if kind == "custom_gauge" {
+	switch kind {
+	case "reach":
+		// id is the reach_slug (text), removes reach-only entries.
+		_, err = h.db.Exec(r.Context(), `
+			DELETE FROM user_watchlists
+			WHERE user_id = $1 AND gauge_id IS NULL AND custom_gauge_id IS NULL
+			  AND reach_slug = $2
+			  AND ($3::uuid IS NULL OR dashboard_id = $3::uuid)
+		`, userID, id, dashboardIDPtr)
+	case "custom_gauge":
 		_, err = h.db.Exec(r.Context(), `
 			DELETE FROM user_watchlists
 			WHERE user_id = $1 AND custom_gauge_id = $2::uuid
 			  AND reach_slug IS NOT DISTINCT FROM $3
-		`, userID, id, reachSlugPtr)
-	} else {
+			  AND ($4::uuid IS NULL OR dashboard_id = $4::uuid)
+		`, userID, id, reachSlugPtr, dashboardIDPtr)
+	default:
 		_, err = h.db.Exec(r.Context(), `
 			DELETE FROM user_watchlists
 			WHERE user_id = $1 AND gauge_id = $2::uuid
 			  AND reach_slug IS NOT DISTINCT FROM $3
-		`, userID, id, reachSlugPtr)
+			  AND ($4::uuid IS NULL OR dashboard_id = $4::uuid)
+		`, userID, id, reachSlugPtr, dashboardIDPtr)
 	}
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "delete failed")
