@@ -119,6 +119,7 @@ func main() {
 	preferences   := handlers.NewPreferencesHandler(pool, devFallbackID)
 	profile       := handlers.NewProfileHandler(pool, devFallbackID)
 	dashboards    := handlers.NewDashboardHandler(pool, devFallbackID)
+	ogh           := handlers.NewOGHandler(pool)
 	var importEmbedder *ai.Embedder
 	if cfg.VoyageAPIKey != "" {
 		importEmbedder = ai.NewEmbedder(cfg.VoyageAPIKey)
@@ -302,6 +303,12 @@ func main() {
 		r.Patch("/trips/{id}", trips.Patch)
 		r.Post("/trips/{id}/describe", trips.Describe)
 	})
+
+	// OpenGraph share-card PNGs — no auth, top-level path so social scrapers
+	// can fetch directly without prefix.
+	r.Get("/og/reaches/{slug}", ogh.Reach)
+	r.Get("/og/reports/{id}", ogh.Report)
+	r.Get("/og/gauges/{id}", ogh.Gauge)
 
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%s", cfg.Port),
