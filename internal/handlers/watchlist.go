@@ -204,11 +204,10 @@ func (h *WatchlistHandler) Remove(w http.ResponseWriter, r *http.Request) {
 	var err error
 	switch kind {
 	case "reach":
-		// id is the reach_slug (text), removes reach-only entries.
+		// id is the reach_slug (text); removes all entries for this reach (gauge-linked or not).
 		_, err = h.db.Exec(r.Context(), `
 			DELETE FROM user_watchlists
-			WHERE user_id = $1 AND gauge_id IS NULL AND custom_gauge_id IS NULL
-			  AND reach_slug = $2
+			WHERE user_id = $1 AND reach_slug = $2
 			  AND ($3::uuid IS NULL OR dashboard_id = $3::uuid)
 		`, userID, id, dashboardIDPtr)
 	case "custom_gauge":
