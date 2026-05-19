@@ -657,7 +657,7 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 // POST /api/v1/me/reaches/import
 // Accepts a share payload (same shape as Create body) and creates a new reach
 // owned by the authenticated user. Slug is re-generated to avoid collisions.
-func (h *UserReachHandler) Import(w http.ResponseWriter, r *http.Request) {
+func (h *UserReachHandler) Import(w http.ResponseWriter, r *http.Request) { //nolint:cyclop
 	ownerID, ok := h.ownerID(r)
 	if !ok {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
@@ -686,6 +686,9 @@ func (h *UserReachHandler) Import(w http.ResponseWriter, r *http.Request) {
 			Running *bandRange `json:"running"`
 			High    *bandRange `json:"high"`
 		} `json:"flow_ranges"`
+		GaugeExternalID string        `json:"gauge_external_id"`
+		GaugeSource     string        `json:"gauge_source"`
+		CustomGauge     *sharePayload `json:"custom_gauge"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid share payload")
@@ -764,6 +767,26 @@ func (h *UserReachHandler) Import(w http.ResponseWriter, r *http.Request) {
 				ON CONFLICT (user_reach_id, label) DO UPDATE
 					SET min_value = EXCLUDED.min_value, max_value = EXCLUDED.max_value
 			`, reachID, e.label, e.r.MinValue, e.r.MaxValue)
+		}
+	}
+
+	// Restore gauge association: custom gauge takes precedence over primary gauge.
+	if body.CustomGauge != nil && body.CustomGauge.Name != "" {
+		cgID, _ := importCustomGaugeForOwner(ctx, h.db, ownerID, *body.CustomGauge)
+		if cgID != "" {
+			_, _ = h.db.Exec(ctx,
+				`UPDATE user_reaches SET custom_gauge_id = $1::uuid, updated_at = NOW() WHERE id = $2`,
+				cgID, reachID)
+		}
+	} else if body.GaugeExternalID != "" && body.GaugeSource != "" {
+		var gaugeID string
+		if lookupErr := h.db.QueryRow(ctx,
+			`SELECT id::text FROM gauges WHERE external_id = $1 AND source = $2`,
+			body.GaugeExternalID, body.GaugeSource,
+		).Scan(&gaugeID); lookupErr == nil {
+			_, _ = h.db.Exec(ctx,
+				`UPDATE user_reaches SET primary_gauge_id = $1::uuid, updated_at = NOW() WHERE id = $2`,
+				gaugeID, reachID)
 		}
 	}
 

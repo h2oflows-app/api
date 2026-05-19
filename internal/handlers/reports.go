@@ -239,13 +239,12 @@ func (h *ReportHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		Name          string  `json:"name"`
-		ReportDate    string  `json:"report_date"`
-		ReportTime    string  `json:"report_time"`
-		Content       string  `json:"content"`
-		HazardWarning *string `json:"hazard_warning"`
-		Paddled       bool    `json:"paddled"`
-		Slug          string  `json:"slug"`
+		Name       string `json:"name"`
+		ReportDate string `json:"report_date"`
+		ReportTime string `json:"report_time"`
+		Content    string `json:"content"`
+		Paddled    bool   `json:"paddled"`
+		Slug       string `json:"slug"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid JSON")
@@ -299,12 +298,12 @@ func (h *ReportHandler) Create(w http.ResponseWriter, r *http.Request) {
 	err = h.db.QueryRow(ctx, `
 		INSERT INTO reports
 			(owner_id, slug, reach_id, name, report_date, report_time,
-			 content, hazard_warning, paddled, flow_cfs, flow_band)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+			 content, paddled, flow_cfs, flow_band)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
 		RETURNING id
 	`,
 		ownerID, reportSlug, reachID, body.Name, body.ReportDate, reportTimeVal,
-		body.Content, body.HazardWarning, body.Paddled, cfs, band,
+		body.Content, body.Paddled, cfs, band,
 	).Scan(&id)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("create report: %v", err))
@@ -344,7 +343,7 @@ func (h *ReportHandler) ListByReach(w http.ResponseWriter, r *http.Request) {
 	if cursor != "" {
 		query = `
 			SELECT rp.id, rp.slug, rp.name, rp.report_date::TEXT, rp.report_time::TEXT,
-			       rp.content, rp.hazard_warning, rp.paddled,
+			       rp.content, rp.paddled,
 			       rp.flow_cfs, rp.flow_band, rp.created_at, up.handle
 			FROM reports rp
 			LEFT JOIN user_profiles up ON up.owner_id = rp.owner_id
@@ -355,7 +354,7 @@ func (h *ReportHandler) ListByReach(w http.ResponseWriter, r *http.Request) {
 	} else {
 		query = `
 			SELECT rp.id, rp.slug, rp.name, rp.report_date::TEXT, rp.report_time::TEXT,
-			       rp.content, rp.hazard_warning, rp.paddled,
+			       rp.content, rp.paddled,
 			       rp.flow_cfs, rp.flow_band, rp.created_at, up.handle
 			FROM reports rp
 			LEFT JOIN user_profiles up ON up.owner_id = rp.owner_id
@@ -373,19 +372,18 @@ func (h *ReportHandler) ListByReach(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type reportRow struct {
-		ID            string   `json:"id"`
-		Slug          string   `json:"slug"`
-		Name          string   `json:"name"`
-		ReportDate    string   `json:"report_date"`
-		ReportTime    *string  `json:"report_time,omitempty"`
-		Content       string   `json:"content"`
-		HazardWarning *string  `json:"hazard_warning,omitempty"`
-		Paddled       bool     `json:"paddled"`
-		FlowCFS       *float64 `json:"flow_cfs,omitempty"`
-		FlowBand      *string  `json:"flow_band,omitempty"`
-		CreatedAt     string   `json:"created_at"`
-		Handle        *string  `json:"handle,omitempty"`
-		URL           string   `json:"url,omitempty"`
+		ID         string   `json:"id"`
+		Slug       string   `json:"slug"`
+		Name       string   `json:"name"`
+		ReportDate string   `json:"report_date"`
+		ReportTime *string  `json:"report_time,omitempty"`
+		Content    string   `json:"content"`
+		Paddled    bool     `json:"paddled"`
+		FlowCFS    *float64 `json:"flow_cfs,omitempty"`
+		FlowBand   *string  `json:"flow_band,omitempty"`
+		CreatedAt  string   `json:"created_at"`
+		Handle     *string  `json:"handle,omitempty"`
+		URL        string   `json:"url,omitempty"`
 	}
 
 	var reports []reportRow
@@ -395,7 +393,7 @@ func (h *ReportHandler) ListByReach(w http.ResponseWriter, r *http.Request) {
 		if err := rows.Scan(
 			&rep.ID, &rep.Slug, &rep.Name,
 			&rep.ReportDate, &rep.ReportTime,
-			&rep.Content, &rep.HazardWarning, &rep.Paddled,
+			&rep.Content, &rep.Paddled,
 			&rep.FlowCFS, &rep.FlowBand, &createdAt,
 			&rep.Handle,
 		); err != nil {
@@ -417,19 +415,8 @@ func (h *ReportHandler) ListByReach(w http.ResponseWriter, r *http.Request) {
 		nextCursor = &last
 	}
 
-	// Hazard reports float to top within the page.
-	var hazards, rest []reportRow
-	for _, rep := range reports {
-		if rep.HazardWarning != nil && *rep.HazardWarning != "" {
-			hazards = append(hazards, rep)
-		} else {
-			rest = append(rest, rep)
-		}
-	}
-	sorted := append(hazards, rest...)
-
 	jsonResponse(w, http.StatusOK, map[string]any{
-		"reports":     sorted,
+		"reports":     reports,
 		"next_cursor": nextCursor,
 	})
 }
@@ -441,21 +428,20 @@ func (h *ReportHandler) Get(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	type detail struct {
-		ID            string   `json:"id"`
-		Slug          string   `json:"slug"`
-		Handle        string   `json:"handle"`
-		Name          string   `json:"name"`
-		ReportDate    string   `json:"report_date"`
-		ReportTime    *string  `json:"report_time,omitempty"`
-		Content       string   `json:"content"`
-		HazardWarning *string  `json:"hazard_warning,omitempty"`
-		Paddled       bool     `json:"paddled"`
-		FlowCFS       *float64 `json:"flow_cfs,omitempty"`
-		FlowBand      *string  `json:"flow_band,omitempty"`
-		AWsyncedAt    *string  `json:"aw_synced_at,omitempty"`
-		CreatedAt     string   `json:"created_at"`
-		ReachName     string   `json:"reach_name"`
-		ReachSlug     string   `json:"reach_slug"`
+		ID         string   `json:"id"`
+		Slug       string   `json:"slug"`
+		Handle     string   `json:"handle"`
+		Name       string   `json:"name"`
+		ReportDate string   `json:"report_date"`
+		ReportTime *string  `json:"report_time,omitempty"`
+		Content    string   `json:"content"`
+		Paddled    bool     `json:"paddled"`
+		FlowCFS    *float64 `json:"flow_cfs,omitempty"`
+		FlowBand   *string  `json:"flow_band,omitempty"`
+		AWsyncedAt *string  `json:"aw_synced_at,omitempty"`
+		CreatedAt  string   `json:"created_at"`
+		ReachName  string   `json:"reach_name"`
+		ReachSlug  string   `json:"reach_slug"`
 	}
 
 	var d detail
@@ -465,7 +451,7 @@ func (h *ReportHandler) Get(w http.ResponseWriter, r *http.Request) {
 		SELECT
 			rp.id, rp.slug, COALESCE(up.handle, '') AS handle,
 			rp.name, rp.report_date::TEXT, rp.report_time::TEXT,
-			rp.content, rp.hazard_warning, rp.paddled,
+			rp.content, rp.paddled,
 			rp.flow_cfs, rp.flow_band, rp.aw_synced_at, rp.created_at,
 			COALESCE(re.name, '') AS reach_name,
 			COALESCE(re.slug, '') AS reach_slug
@@ -476,7 +462,7 @@ func (h *ReportHandler) Get(w http.ResponseWriter, r *http.Request) {
 	`, id).Scan(
 		&d.ID, &d.Slug, &d.Handle,
 		&d.Name, &d.ReportDate, &d.ReportTime,
-		&d.Content, &d.HazardWarning, &d.Paddled,
+		&d.Content, &d.Paddled,
 		&d.FlowCFS, &d.FlowBand, &awSyncedAt, &createdAt,
 		&d.ReachName, &d.ReachSlug,
 	)
@@ -504,11 +490,10 @@ func (h *ReportHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		Name          *string `json:"name"`
-		Content       *string `json:"content"`
-		HazardWarning *string `json:"hazard_warning"`
-		Paddled       *bool   `json:"paddled"`
-		ReportTime    *string `json:"report_time"`
+		Name       *string `json:"name"`
+		Content    *string `json:"content"`
+		Paddled    *bool   `json:"paddled"`
+		ReportTime *string `json:"report_time"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid JSON")
@@ -538,14 +523,13 @@ func (h *ReportHandler) Update(w http.ResponseWriter, r *http.Request) {
 	tag, err := h.db.Exec(ctx, `
 		UPDATE reports
 		SET
-			name           = COALESCE($1, name),
-			content        = COALESCE($2, content),
-			hazard_warning = COALESCE($3, hazard_warning),
-			paddled        = COALESCE($4, paddled),
-			report_time    = COALESCE($5, report_time),
-			updated_at     = NOW()
-		WHERE owner_id = $6 AND slug = $7
-	`, body.Name, body.Content, body.HazardWarning, body.Paddled, body.ReportTime,
+			name        = COALESCE($1, name),
+			content     = COALESCE($2, content),
+			paddled     = COALESCE($3, paddled),
+			report_time = COALESCE($4, report_time),
+			updated_at  = NOW()
+		WHERE owner_id = $5 AND slug = $6
+	`, body.Name, body.Content, body.Paddled, body.ReportTime,
 		ownerID, slug)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "update failed")
@@ -627,7 +611,7 @@ func (h *ReportHandler) ListMine(w http.ResponseWriter, r *http.Request) {
 		SELECT
 			rp.id, rp.slug,
 			rp.name, rp.report_date::TEXT, rp.report_time::TEXT,
-			rp.content, rp.hazard_warning, rp.paddled,
+			rp.content, rp.paddled,
 			rp.flow_cfs, rp.flow_band, rp.created_at,
 			COALESCE(re.name, '') AS reach_name,
 			COALESCE(re.slug, '') AS reach_slug,
@@ -646,20 +630,19 @@ func (h *ReportHandler) ListMine(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type myReport struct {
-		ID            string   `json:"id"`
-		Slug          string   `json:"slug"`
-		Name          string   `json:"name"`
-		ReportDate    string   `json:"report_date"`
-		ReportTime    *string  `json:"report_time,omitempty"`
-		Content       string   `json:"content"`
-		HazardWarning *string  `json:"hazard_warning,omitempty"`
-		Paddled       bool     `json:"paddled"`
-		FlowCFS       *float64 `json:"flow_cfs,omitempty"`
-		FlowBand      *string  `json:"flow_band,omitempty"`
-		CreatedAt     string   `json:"created_at"`
-		ReachName     string   `json:"reach_name"`
-		ReachSlug     string   `json:"reach_slug"`
-		URL           string   `json:"url,omitempty"`
+		ID         string   `json:"id"`
+		Slug       string   `json:"slug"`
+		Name       string   `json:"name"`
+		ReportDate string   `json:"report_date"`
+		ReportTime *string  `json:"report_time,omitempty"`
+		Content    string   `json:"content"`
+		Paddled    bool     `json:"paddled"`
+		FlowCFS    *float64 `json:"flow_cfs,omitempty"`
+		FlowBand   *string  `json:"flow_band,omitempty"`
+		CreatedAt  string   `json:"created_at"`
+		ReachName  string   `json:"reach_name"`
+		ReachSlug  string   `json:"reach_slug"`
+		URL        string   `json:"url,omitempty"`
 	}
 
 	var reports []myReport
@@ -670,7 +653,7 @@ func (h *ReportHandler) ListMine(w http.ResponseWriter, r *http.Request) {
 		if err := rows.Scan(
 			&rep.ID, &rep.Slug,
 			&rep.Name, &rep.ReportDate, &rep.ReportTime,
-			&rep.Content, &rep.HazardWarning, &rep.Paddled,
+			&rep.Content, &rep.Paddled,
 			&rep.FlowCFS, &rep.FlowBand, &createdAt,
 			&rep.ReachName, &rep.ReachSlug,
 			&handle,
@@ -688,43 +671,3 @@ func (h *ReportHandler) ListMine(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, reports)
 }
 
-// ── GET /reaches/active-hazards ───────────────────────────────────────────────
-
-// ActiveHazards returns all reaches with hazard reports filed within the last 2
-// days — one call lets the dashboard badge every card in the watchlist at once.
-func (h *ReportHandler) ActiveHazards(w http.ResponseWriter, r *http.Request) {
-	type activeHazard struct {
-		Slug          string `json:"slug"`
-		HazardWarning string `json:"hazard_warning"`
-		ReportDate    string `json:"report_date"`
-		ReporterName  string `json:"reporter_name"`
-	}
-
-	rows, err := h.db.Query(r.Context(), `
-		SELECT re.slug, rp.hazard_warning, rp.report_date::TEXT, rp.name
-		FROM reports rp
-		JOIN reaches re ON re.id = rp.reach_id
-		WHERE rp.hazard_warning IS NOT NULL
-		  AND rp.report_date >= CURRENT_DATE - INTERVAL '2 days'
-		ORDER BY rp.report_date DESC, rp.created_at DESC
-	`)
-	if err != nil {
-		errorResponse(w, http.StatusInternalServerError, "query failed")
-		return
-	}
-	defer rows.Close()
-
-	var hazards []activeHazard
-	for rows.Next() {
-		var item activeHazard
-		if err := rows.Scan(&item.Slug, &item.HazardWarning, &item.ReportDate, &item.ReporterName); err != nil {
-			continue
-		}
-		hazards = append(hazards, item)
-	}
-	if hazards == nil {
-		hazards = []activeHazard{}
-	}
-	w.Header().Set("Cache-Control", "public, max-age=60")
-	jsonResponse(w, http.StatusOK, hazards)
-}

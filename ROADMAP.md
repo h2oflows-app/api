@@ -2,14 +2,18 @@
 
 Current state as of May 2026. Phase 1 (gauge dashboard + reach pages + AI assistant) is complete. Backend routes exist for trip reports, trips, contributions, and proximity events — the frontend for those is stub. Everything below is unbuilt or incomplete.
 
-**Status snapshot (2026-05-14):**
+**Status snapshot (2026-05-18):**
 - ✅ Phase 2 (2.1–2.6) — shipped 2026-05-06
 - ✅ Phase 2b (2b.1–2b.7) — shipped 2026-05-07
 - ✅ Repository restructure — completed 2026-05-13; live at `h2oflows-app/{api,web,docs}`
-- 🔧 **Phase 2c — Pilot polish** (active; tracks issues filed on `h2oflows-app/web`)
-- ⏳ Demo Pack (0.3.0) — 3.1–3.4 pending
-- ⏳ Pilot rollout (0.x) — pending Phase 2c + Demo Pack
-- ⏳ Phase 3+ — deferred
+- ✅ Phase 2c — Pilot polish — shipped 2026-05-17 (v0.2.1–v0.2.17)
+- ✅ Demo Pack (0.3.0) — shipped 2026-05-18, tagged v0.3.3
+- ✅ Pre-pilot polish (PR #35) — merged 2026-05-18; all web GH issues closed except #16 (deferred to Phase 3+)
+- ⏳ Pilot rollout (0.x) — on hold per user
+- 🔧 **Phase 3 — SEO infra** (active; build behind noindex wall, flip robots.txt at 1.0 launch)
+- ⏳ Phase 4 — Public API + PATs + data export (expanded 2026-05-18; depends on pilot signal)
+- ⏳ Phase 5 — American Whitewater interop (`reach-ingest-v1` schema drafted 2026-05-18)
+- ⏳ Phase 6+ — deferred
 
 ---
 
@@ -968,7 +972,7 @@ Dendritic tree view of the real gauges behind a dashboard, accessed via a link/b
 
 Generate the AW trip-report submission form structure (gathered by inspecting AW's submit form as a logged-in member). On "submit", show the constructed HTTP request + body in a modal instead of posting. User can copy the body and paste it into AW manually.
 
-- Unblocks demos to Owen + Greg (AW tech team + AW Stream Team) without needing prior AW board approval to actually POST
+- Unblocks demos to AW-side contacts (tech team + Stream Team) without needing prior AW board approval to actually POST
 - Sets the table for Phase 5 outbound AW integration once approval is in hand — same payload, different submit handler
 - Form schema lives in `/me/preferences` `aw_band_mapping` adjacent (already shipped 2b.3); add `aw_form_schema` JSONB if needed
 
@@ -989,6 +993,21 @@ Block search engines from indexing curated reach + report pages until 1.0 ships.
 - `<meta name="robots" content="noindex, nofollow">` on layout default
 - Pulled in the 1.0 release as part of the launch checklist
 - Trivial; ships with whichever PR is first to merge after this section starts
+
+### 3.5 — Dashboard share (deferred, post-0.3)
+
+Three-dot menu on the dashboard gains "Share dashboard". Generates a portable JSON payload — same pattern as 3.3 — that bundles: the active tab's gauge watchlist, hidden-reach set, pinned custom gauges (full formula payload, not by reference), embedded user reaches (geometry + flow bands + gauge binding payload, including embedded `custom_gauge` blocks introduced in 3.3 fix).
+
+Recipient imports via the existing import picker on `/explore` (or new dashboard-import entry). Pure clone semantics — no DB sharing, no subscriber tracking, no notifications. Same privacy boundary as 3.3: only fields included in the payload travel, owner's notes stay private.
+
+- New top-level payload type `dashboard` whose body is `{ watchlist_entries[], custom_gauges[], user_reaches[] }`
+- Each `user_reach` carries its own optional `custom_gauge` block (recursive 3.3 codec)
+- Import order: custom gauges first (assign new IDs), then user reaches (link new IDs), then watchlist (resolve curated reaches by slug, user reaches by new ID)
+- Defer until post-pilot; pilot users can share individual reaches/gauges via 3.3 today
+
+### 3.6 — Rethink hazards (deferred)
+
+Trip report `hazard_warning` field was removed in 0.3.0 polish (liability/bad-info concern). Reintroduce later with proper guardrails: stronger UX warnings on display, attribution to author (not "h2oflows says"), reach-author moderation, possibly admin-confirmed-only. Must reintegrate with RAG context generation (currently dropped from `report_context.go`). Open question: is hazard-as-trip-report the right model at all, or should it be a separate reach-attached object with author attribution and admin review?
 
 ---
 
@@ -1079,25 +1098,27 @@ Repos can ship patches independently (`api@v0.2.1` for a poller fix without touc
 
 The app pivoted from a generic flow tracker to "build your own reaches and dashboards on top of curated content." Curated reaches stay; user reaches and custom gauges are the personal layer. Each contact below gets a distinct pitch.
 
-| Contact | Role / context | Lead with | Docs to link |
+Contacts are referenced by archetype only — actual names + contact details live in a private memory note outside the repo. Each archetype gets a distinct pitch.
+
+| Archetype | Role / context | Lead with | Docs to link |
 |---|---|---|---|
-| **Nik** | Whitewater kayak instructor; AW stream team contributor; long-time paddling partner | Custom gauges (gauge math is his world) | Custom gauge builder; user reach creation |
-| **Owen** | AW tech team | Data schema standard for an AW pipeline; auto-share Reports → AW trip-report pre-fill (2b.3); public API contract | Reports + AW cross-post (2b.3); public API (Phase 4) |
-| **Greg** | AW Stream Team Google Group; previously floated an alt whitewater DB; emailed direct | "Complementary, not competing" — H2OFlows as the load-shedding seam AW didn't want to host | Public API; reach + gauge data model framed as offload |
-| **Tim Kunin** | Expert paddler since 2014; deep community presence | Custom reach creation + flow tracking + Reports | User reach flow; custom gauges; reports |
-| **Matt Beaman** | Paddler, non-technical | Plain UX walkthrough — no jargon, will catch dreadful breakage | Dashboard + add reach + reports |
-| **Jamie Knight** | PNW paddler, ex-CO; active community member | Reports + conditions across regions; flow tracking | Reports; basin / state navigation |
+| **Pilot A** | Whitewater kayak instructor; AW stream team contributor | Custom gauges (gauge math is their world) | Custom gauge builder; user reach creation |
+| **Pilot B** | AW tech team | Data schema standard for an AW pipeline; auto-share Reports → AW trip-report pre-fill (2b.3); public API contract | Reports + AW cross-post (2b.3); public API (Phase 4) |
+| **Pilot C** | AW Stream Team Google Group; previously floated an alt whitewater DB | "Complementary, not competing" — H2OFlows as the load-shedding seam AW didn't want to host | Public API; reach + gauge data model framed as offload |
+| **Pilot D** | Expert paddler; deep community presence | Custom reach creation + flow tracking + Reports | User reach flow; custom gauges; reports |
+| **Pilot E** | Paddler, non-technical | Plain UX walkthrough — no jargon, will catch dreadful breakage | Dashboard + add reach + reports |
+| **Pilot F** | PNW paddler, ex-CO; active community member | Reports + conditions across regions; flow tracking | Reports; basin / state navigation |
 
 **Send strategy:**
-- Nik gets a cold link — he'll just load up and explore
+- Pilot A gets a cold link — explore unprompted
 - Everyone else gets a personalized DM/email with: (1) why them specifically, (2) one or two features tailored to them, (3) direct links to the docs pages for those features, (4) ask for an acid-test pass on phone + laptop
 - Drafts kept in a `pilot-outreach/` scratch dir (not committed) until ready to send
 
 ### Pitch differentiation
 
-- **Nik / Tim / Matt / Jamie** — paddler users; pitch the personal-dashboard + custom-reach angle. They use the app, they file reports, they break the UX.
-- **Owen** — AW-internal; pitch the data interop angle. Lead with the share-back-to-AW flow (2b.3) and the public API (Phase 4) as a way for AW to receive structured submissions without operating the public API themselves. Open the door to schema-standard collaboration.
-- **Greg** — pitch H2OFlows as an *offload*, not a replacement. Frame the public API as the interop seam. Acknowledge his concern (AW server load from a public API) and demonstrate H2OFlows already shouldering it. Reframes my earlier pushback against an AW alternative — the alternative is a complement, not a fork.
+- **Pilots A / D / E / F** — paddler users; pitch the personal-dashboard + custom-reach angle. They use the app, they file reports, they break the UX.
+- **Pilot B** — AW-internal; pitch the data interop angle. Lead with the share-back-to-AW flow (2b.3) and the public API (Phase 4) as a way for AW to receive structured submissions without operating the public API themselves. Open the door to schema-standard collaboration.
+- **Pilot C** — pitch H2OFlows as an *offload*, not a replacement. Frame the public API as the interop seam. Acknowledge their concern (AW server load from a public API) and demonstrate H2OFlows already shouldering it. Reframes earlier pushback against an AW alternative — the alternative is a complement, not a fork.
 
 ### Pilot docs site
 
@@ -1189,26 +1210,90 @@ User reaches and custom gauges excluded — non-permanent pages, no indexing.
 
 ---
 
-## Phase 4 — Public API
+## Phase 4 — Public API + route-tree split + user data export
 
 *H2OFlows is infrastructure. The app is just the first consumer.*
 
-### Token issuance
+### 4.1 Route-tree split (single binary, three trees)
+
+Single repo, single Go binary. **Do not** split into separate API repos or ports — operational burden outweighs separation benefit until well past 50k users. Use Chi route groups with per-tree middleware.
+
+```
+/api/v1/public/*    no auth (or PAT), rate-limited, GET-only, CDN-friendly, OpenAPI documented
+/api/v1/me/*        PAT or Supabase JWT, user-scoped data + exports
+/internal/*         Supabase JWT only, web/pwa only, no versioning promise, no public docs
+```
+
+Middleware stacks per tree:
+- `public`: rate limiter (per-IP + per-token), cache headers, response shaping, OpenAPI
+- `me`: PAT-or-JWT auth, audit log of writes, no cache headers
+- `internal`: Supabase JWT, free shape changes per release
+
+Migration approach: move existing `/api/v1/*` handlers under appropriate tree without breaking web. Web client uses `/internal/*` going forward.
+
+### 4.2 Personal Access Tokens (PATs)
+
+User-generated tokens for `/api/v1/me/*` access. Single-scope v1 (full account access). Add scope strings later (`reports:read`, `reaches:write`) if needed.
+
+```sql
+CREATE TABLE user_api_tokens (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id     uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  name        text NOT NULL,         -- "iPhone Shortcuts", "trip log script"
+  token_hash  text NOT NULL,         -- argon2id or sha256
+  prefix      text NOT NULL,         -- "hflo_abc123…" visible identifier
+  last_used_at timestamptz,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  revoked_at  timestamptz
+);
+CREATE INDEX ON user_api_tokens (user_id) WHERE revoked_at IS NULL;
+```
+
+UI: Settings → API tokens. Show token plaintext once on creation, then never. List + revoke.
+
+### 4.3 User data export (`/api/v1/me/export`)
+
+Streaming zip of all user-owned data. GDPR-friendly; same endpoint serves "delete my account" flow later.
+
+```
+GET /api/v1/me/export
+  → application/zip stream
+```
+
+Zip layout:
+```
+profile.json              # handle, email, created_at
+reaches.json              # user-created reaches with geometry
+gauges.json               # custom gauges (sum/difference formulas)
+dashboards.json           # dashboard list with reach/gauge memberships
+reports/
+  {yyyy-mm-dd}-{slug}.md  # frontmatter (report_date, flow_cfs, flow_band,
+                          #  reach_slug, paddled) + body
+  {yyyy-mm-dd}-{slug}/
+    photos/{n}.jpg        # if photos attached
+```
+
+Implementation notes:
+- Use `archive/zip` writer directly to `http.ResponseWriter`; do not buffer.
+- Photos streamed from R2 / S3 via signed-URL fetch into zip writer.
+- Settings UI: "Export my data" button + last-export timestamp + confirmation modal.
+
+### 4.4 Token issuance (legacy section — folds into 4.2 PATs)
 
 - API token tied to user account — issued from profile/settings page
 - Token scopes: `read` (public data), `write` (contributions), `elevated` (higher rate limits)
 - Tokens stored hashed; revocable from settings
 
-### Rate limiting
+### 4.5 Rate limiting
 
 - Anonymous: 100 req/hour
 - Free token (`read`): 1000 req/hour
 - Community contributor: 5000 req/hour (auto-granted on first verified trip report)
 - Commercial/outfitter tier: paid, negotiated
 
-### Versioned public endpoints
+### 4.6 Versioned public endpoints
 
-All under `/api/v1/`. Currently functional but undocumented:
+All under `/api/v1/public/` after the route-tree split. Currently functional under `/api/v1/` but undocumented:
 
 ```
 GET  /reaches                       paginated, filterable by region/class/state
@@ -1245,13 +1330,65 @@ GET  /gauges?near={lat},{lng}&r={km} proximity search
 
 ## Phase 5 — American Whitewater integration
 
-*Close the loop with the upstream data source.*
+*Close the loop with the upstream data source. Frame to AW tech team as **interoperability spec + reference adapter**, not tight coupling. Goal: AW can push reach data into h2oflows on their terms, or h2oflows can pull on a schedule.*
 
-### Inbound: AW reach import
+### 5.0 Public interop spec (`reach-ingest-v1`)
+
+Public, versioned JSON Schema document. Lives in `docs/specs/reach-ingest-v1.json`. Send to AW tech team as the contract.
+
+**Scope (v1):** map/geometry data + descriptions/rapids/access. **Not in v1:** photos, trip reports, user-generated content. Photos + AI-on-trip-reports gated to v2.
+
+**Required fields:** `name`, `geometry` (LineString put-in → take-out), `class_max`, `region` (state).
+**Optional fields:** `common_name`, `description`, `rapids[]`, `access[]`, `gauges[]`, `flow_ranges[]`, `permit_required`, `multi_day_days`, `external_id` (AW reach ID), `external_url`.
+
+**Derivation rules** (h2oflows-side enrichment when partner can't provide):
+- **ComIDs missing** → derive from put-in/take-out coords via NLDI flowline trace.
+- **River name missing** → derive via GNIS reverse lookup on put-in coord.
+- **Basin missing** → derive via PostGIS containment against HUC8 basins table.
+- **Gauge association missing** → propose nearest USGS gauge within 25 mi of put-in; partner confirms or rejects.
+
+Source-of-truth field on every reach: `source` (`curated|user|aw|partner:slug`). Partners get their own slug for attribution + diff/conflict tooling.
+
+### 5.1 Inbound: AW reach import (push + pull)
+
+Two ingest paths — partner picks one:
+
+**Push** (preferred — partner automates):
+```
+POST /api/v1/ingest/reaches
+Authorization: Bearer <partner_token>
+Content-Type: application/json
+
+{ "reaches": [ ... reach-ingest-v1 objects ... ] }
+```
+- Partner token = scoped PAT issued to AW tech team. Separate table `partner_tokens` (not user-scoped).
+- Idempotent: re-posting same `external_id` updates the existing reach.
+- Response: per-reach status (created / updated / rejected with reason).
+
+**Pull** (fallback — h2oflows automates):
+- Worker hits AW REST endpoint on schedule (e.g. `www.americanwhitewater.org/content/River/list/`).
+- Diff against existing `source='aw'` rows. Insert new, update changed, soft-delete missing.
+- Weekly cron.
+
+**Diff/review path:**
+- Conflict with existing `source='curated'` row → write to `partner_reach_proposals` table, surface in admin UI.
+- Stewards (Phase 6 roles) can accept/reject diff per field.
+
+### 5.2 Reference adapter (`cmd/aw-ingest/`)
+
+Standalone CLI tool that:
+1. Fetches AW JSON
+2. Maps to `reach-ingest-v1` schema
+3. Enriches via NLDI/GNIS where needed
+4. POSTs to local or production h2oflows ingest endpoint
+
+Ships as Go binary + Dockerfile. Reference implementation AW can read; they can rewrite in their own stack.
+
+### 5.3 Legacy inbound notes
 
 - AW exposes a public JSON API (`www.americanwhitewater.org/content/River/list/`)
 - Import script: map AW reach ID → H2OFlows slug, pull description + rapids + access
-- Store with `data_source='aw_import'`, `aw_reach_id` foreign key
+- Store with `source='aw'`, `external_id` = AW reach ID
 - Diff against existing AI-seeded content; flag conflicts for human review
 - One-time bulk import + periodic sync (weekly cron)
 
@@ -1429,6 +1566,59 @@ New sources require one file in `packages/gauge-core`:
 | Environment Canada | Medium | BC, Alberta, Quebec paddling |
 | USGS stage-only gauges | Medium | Parameter `00065` instead of `00060` |
 | Manual / community gauge | Low | Spreadsheet-defined readings for ungauged runs |
+
+---
+
+## Infrastructure scaling plan
+
+*Capacity + cost model. Single-region is the right answer until well past pilot scale. Multi-region Postgres is hard, expensive, and unjustified under 50k users.*
+
+### Current setup (May 2026)
+
+- API on EC2 (`api.h2oflows.app`), docker-compose + Caddy
+- Postgres + PostGIS on same EC2 instance
+- Netlify for web (static + edge), Cloudflare DNS
+- Single region: us-east-2 (geographic CONUS center, cheapest east-coast pricing)
+
+### Pilot scale target (2000 users, 50-250 concurrent)
+
+Current sizing is sufficient. Reference cost estimate:
+
+| Tier            | Spec                          | $/mo (reserved) |
+|-----------------|-------------------------------|-----------------|
+| API EC2         | t3.large (2 vCPU, 8GB)        | ~$50            |
+| Postgres        | RDS db.t3.small + 50GB gp3    | ~$30            |
+| EBS / backups   | snapshots, S3                 | ~$10            |
+| **Total**       |                               | **~$90/mo**     |
+
+Cheaper variant: stay on docker-compose with Postgres on the same box → ~$50/mo. Move to RDS when ops burden (snapshots, point-in-time recovery, version upgrades) outweighs cost.
+
+### Scaling order (when needed)
+
+1. **Single region** stays correct under 50k users.
+2. **CDN in front of public GETs** (CloudFront → API): cache `/api/v1/public/reaches/*` and `/api/v1/public/gauges/*` for 5–60s. Cheap, large wins.
+3. **Vertical scale API box**: t3.large → t3.xlarge → m6g.xlarge.
+4. **Postgres read replica** when reads dominate (analytics, AI queries).
+5. **Multiple API instances behind ALB** when single box CPU-bound. Requires session stickiness only for SSE/poll endpoints.
+6. **Multi-region**: only if international expansion happens, or west-coast p99 complaints become real. ~70ms cross-CONUS is invisible vs API processing time.
+
+### Geo distribution rationale (NOT needed for pilot)
+
+- 2000 users in CONUS with 250 concurrent does not feel coast-to-coast latency.
+- Map tiles already CDN-served (MapLibre via external tile providers).
+- Cacheable public endpoints get CloudFront treatment first; that solves the same problem at 1/10 the complexity.
+- Postgres replication across regions = consistency hell. Avoid.
+
+### Capacity projections
+
+| Users     | Concurrent | API instance        | Postgres            | $/mo est. |
+|-----------|------------|---------------------|---------------------|-----------|
+| 2k        | 50-250     | t3.large            | db.t3.small         | $90       |
+| 10k       | 200-1000   | t3.xlarge           | db.t3.medium        | $200      |
+| 50k       | 1k-5k      | 2× m6g.large + ALB  | db.m6g.large + RR   | $600      |
+| 200k      | 5k-20k     | k8s/ECS, 4+ pods    | Multi-AZ + RR + CDN | $1500-3k  |
+
+100x growth is a good problem to have. Defer planning beyond Phase 7.
 
 ---
 

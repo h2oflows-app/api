@@ -117,6 +117,7 @@ func main() {
 	contributions := handlers.NewContributionHandler(pool)
 	reports       := handlers.NewReportHandler(pool, devFallbackID)
 	preferences   := handlers.NewPreferencesHandler(pool, devFallbackID)
+	profile       := handlers.NewProfileHandler(pool, devFallbackID)
 	dashboards    := handlers.NewDashboardHandler(pool, devFallbackID)
 	var importEmbedder *ai.Embedder
 	if cfg.VoyageAPIKey != "" {
@@ -166,7 +167,6 @@ func main() {
 		r.Get("/reaches/basin/{slug}/map", reaches.BasinMap)
 		r.Get("/reaches/basin/{slug}/network", reaches.BasinNetwork)
 		r.Get("/reaches", reaches.List)
-		r.Get("/reaches/active-hazards", reports.ActiveHazards)
 		r.Get("/reaches/{slug}", reaches.Get)
 		r.Get("/reaches/{slug}/conditions", reaches.GetConditions)
 		r.Get("/reaches/{slug}/hazards", reaches.GetHazards)
@@ -286,6 +286,8 @@ func main() {
 		r.Post("/me/reports/{slug}/aw-sync", reports.AWSync)
 		r.Get("/me/preferences", preferences.Get)
 		r.Patch("/me/preferences", preferences.Update)
+		r.Get("/me/profile", profile.Get)
+		r.Patch("/me/profile", profile.Update)
 		r.Get("/me/dashboards", dashboards.List)
 		r.Post("/me/dashboards", dashboards.Create)
 		r.Get("/me/dashboards/{slug}", dashboards.Get)

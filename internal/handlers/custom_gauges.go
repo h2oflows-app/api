@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -449,6 +450,77 @@ func (h *CustomGaugeHandler) Share(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, map[string]string{"token": token})
 }
 
+// importCustomGaugeForOwner creates a custom gauge from a sharePayload for the given owner.
+// Used by the reach import flow when a custom_gauge block is embedded in the share token.
+// Returns (id, slug) on success, ("", "") on failure — callers should treat failure as non-fatal.
+func importCustomGaugeForOwner(ctx context.Context, db *pgxpool.Pool, ownerID string, p sharePayload) (string, string) {
+	resolved := make([]inputSpec, 0, len(p.Inputs))
+	for _, inp := range p.Inputs {
+		var gaugeID string
+		if err := db.QueryRow(ctx,
+			`SELECT id::text FROM gauges WHERE external_id = $1 AND source = $2`,
+			inp.ExternalID, inp.Source,
+		).Scan(&gaugeID); err != nil {
+			continue
+		}
+		sign := inp.Sign
+		if sign != 1 && sign != -1 {
+			sign = 1
+		}
+		resolved = append(resolved, inputSpec{GaugeID: gaugeID, Sign: sign})
+	}
+	if len(resolved) == 0 {
+		return "", ""
+	}
+
+	unit := p.Unit
+	if unit == "" {
+		unit = "cfs"
+	}
+
+	slug := slugify(p.Name)
+	var id string
+	err := db.QueryRow(ctx, `
+		INSERT INTO custom_gauges (owner_id, slug, name, description, note, unit)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id::text
+	`, ownerID, slug, p.Name, p.Description, p.Note, unit).Scan(&id)
+	if err != nil && isUniqueViolation(err) {
+		slug = slug + "-import"
+		err = db.QueryRow(ctx, `
+			INSERT INTO custom_gauges (owner_id, slug, name, description, note, unit)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			RETURNING id::text
+		`, ownerID, slug, p.Name, p.Description, p.Note, unit).Scan(&id)
+	}
+	if err != nil || id == "" {
+		return "", ""
+	}
+
+	for i, inp := range resolved {
+		_, _ = db.Exec(ctx, `
+			INSERT INTO custom_gauge_inputs (custom_gauge_id, position, gauge_id, sign)
+			VALUES ($1::uuid, $2, $3::uuid, $4)
+		`, id, i, inp.GaugeID, inp.Sign)
+	}
+
+	var seedVal float64
+	var seedCount int
+	if seedErr := db.QueryRow(ctx, `
+		SELECT COALESCE(SUM(cgi.sign * lr.value), 0), COUNT(DISTINCT cgi.gauge_id)
+		FROM custom_gauge_inputs cgi
+		JOIN LATERAL (
+			SELECT value FROM gauge_readings
+			WHERE gauge_id = cgi.gauge_id ORDER BY timestamp DESC LIMIT 1
+		) lr ON true
+		WHERE cgi.custom_gauge_id = $1::uuid
+	`, id).Scan(&seedVal, &seedCount); seedErr == nil && seedCount == len(resolved) && len(resolved) > 0 {
+		_, _ = db.Exec(ctx, `UPDATE custom_gauges SET last_value_cfs = $1, last_value_at = NOW() WHERE id = $2::uuid`, seedVal, id)
+	}
+
+	return id, slug
+}
+
 // ── Import ────────────────────────────────────────────────────────────────────
 
 // POST /api/v1/me/custom-gauges/import
@@ -542,6 +614,27 @@ func (h *CustomGaugeHandler) Import(w http.ResponseWriter, r *http.Request) {
 	if err := replaceInputs(h.db, r, id, resolved); err != nil {
 		errorResponse(w, http.StatusInternalServerError, "insert inputs failed")
 		return
+	}
+
+	// Seed last_value_cfs immediately so the gauge shows CFS without waiting for the poller.
+	var seedVal float64
+	var seedCount int
+	seedErr := h.db.QueryRow(r.Context(), `
+		SELECT
+			COALESCE(SUM(cgi.sign * lr.value), 0),
+			COUNT(DISTINCT cgi.gauge_id)
+		FROM custom_gauge_inputs cgi
+		JOIN LATERAL (
+			SELECT value FROM gauge_readings
+			WHERE gauge_id = cgi.gauge_id
+			ORDER BY timestamp DESC LIMIT 1
+		) lr ON true
+		WHERE cgi.custom_gauge_id = $1::uuid
+	`, id).Scan(&seedVal, &seedCount)
+	if seedErr == nil && seedCount == len(resolved) && len(resolved) > 0 {
+		_, _ = h.db.Exec(r.Context(),
+			`UPDATE custom_gauges SET last_value_cfs = $1, last_value_at = NOW() WHERE id = $2::uuid`,
+			seedVal, id)
 	}
 
 	jsonResponse(w, http.StatusCreated, map[string]string{"id": id, "slug": slug})

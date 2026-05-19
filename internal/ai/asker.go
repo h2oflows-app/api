@@ -186,11 +186,7 @@ func (a *ReachAsker) Answer(ctx context.Context, reachID, reachName, question st
 	// 3. Load community reports for long-context grounding.
 	reachReports, _ := loadReachReports(ctx, a.db, reachID)
 
-	// 4. Deterministic hazard short-circuit — prepended regardless of question.
-	hazards := activeHazards(reachReports)
-	hazardPreamble := buildHazardPreamble(hazards)
-
-	// 5. Build system blocks. Reports block carries a prompt-cache breakpoint
+	// 4. Build system blocks. Reports block carries a prompt-cache breakpoint
 	//    so repeat queries to the same reach (within 5 min) skip re-tokenisation.
 	reachContext := strings.Join(chunks, "\n\n---\n\n")
 	systemBlocks := []anthropic.TextBlockParam{
@@ -218,5 +214,5 @@ func (a *ReachAsker) Answer(ctx context.Context, reachID, reachName, question st
 		return "", fmt.Errorf("claude: empty response")
 	}
 
-	return hazardPreamble + msg.Content[0].Text, nil
+	return msg.Content[0].Text, nil
 }
