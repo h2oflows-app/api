@@ -113,6 +113,8 @@ type userReachSummary struct {
 	TakeOutLng  float64    `json:"take_out_lng"`
 	TakeOutLat  float64    `json:"take_out_lat"`
 	Note        *string    `json:"note"`
+	ClassMin    *float64   `json:"class_min"`
+	ClassMax    *float64   `json:"class_max"`
 	CurrentCFS  *float64   `json:"current_cfs"`
 	FlowBand    *string    `json:"flow_band"`
 	FlowStatus  string     `json:"flow_status"`
@@ -196,7 +198,8 @@ func (h *UserReachHandler) MapAll(w http.ResponseWriter, r *http.Request) {
 				WHEN fr.label = 'high'    THEN 'flood'
 				ELSE 'unknown'
 			END AS flow_status,
-			ur.primary_gauge_id::text AS gauge_id
+			ur.primary_gauge_id::text AS gauge_id,
+			ur.class_max
 		FROM user_reaches ur
 		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
 		LEFT JOIN LATERAL (
@@ -250,12 +253,13 @@ func (h *UserReachHandler) MapAll(w http.ResponseWriter, r *http.Request) {
 			currentCFS      *float64
 			flowStatus      string
 			gaugeID         *string
+			classMax        *float64
 		)
 		if err := rows.Scan(
 			&id, &slug, &name, &riverName,
 			&centerlineJSON,
 			&putInLng, &putInLat, &takeOutLng, &takeOutLat,
-			&currentCFS, &flowStatus, &gaugeID,
+			&currentCFS, &flowStatus, &gaugeID, &classMax,
 		); err != nil {
 			continue
 		}
@@ -285,7 +289,7 @@ func (h *UserReachHandler) MapAll(w http.ResponseWriter, r *http.Request) {
 				Name:        name,
 				RiverName:   riverName,
 				CommonName:  nil,
-				ClassMax:    nil,
+				ClassMax:    classMax,
 				FlowStatus:  flowStatus,
 				CurrentCFS:  currentCFS,
 				GaugeID:     gaugeID,
@@ -322,6 +326,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			ST_X(ur.take_out::geometry)  AS take_out_lng,
 			ST_Y(ur.take_out::geometry)  AS take_out_lat,
 			ur.note, ur.created_at,
+			ur.class_min, ur.class_max,
 			COALESCE(lr.value, cg.last_value_cfs) AS current_cfs,
 			COALESCE(lr.timestamp, cg.last_value_at) AS last_reading_at,
 			CASE
@@ -370,6 +375,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			&s.StateAbbr, &s.BasinGroup,
 			&s.PutInLng, &s.PutInLat, &s.TakeOutLng, &s.TakeOutLat,
 			&s.Note, &s.CreatedAt,
+			&s.ClassMin, &s.ClassMax,
 			&s.CurrentCFS, &s.LastReadAt,
 			&s.FlowStatus, &s.FlowBand, &s.GaugeID,
 			&s.CustomGaugeID, &s.CustomGaugeSlug, &s.CustomGaugeName,
@@ -402,6 +408,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 			ST_X(ur.take_out::geometry)  AS take_out_lng,
 			ST_Y(ur.take_out::geometry)  AS take_out_lat,
 			ur.note, ur.created_at,
+			ur.class_min, ur.class_max,
 			ur.up_comid, ur.down_comid,
 			CASE WHEN ur.centerline IS NOT NULL
 				 THEN ST_AsGeoJSON(ur.centerline::geometry)
@@ -450,6 +457,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 		&d.ID, &d.Slug, &d.Name, &d.RiverName,
 		&d.PutInLng, &d.PutInLat, &d.TakeOutLng, &d.TakeOutLat,
 		&d.Note, &d.CreatedAt,
+		&d.ClassMin, &d.ClassMax,
 		&d.UpComID, &d.DownComID,
 		&geojsonBytes,
 		&d.GaugeID, &d.GaugeName, &d.GaugeSource, &d.GaugeExternalID,
@@ -551,14 +559,16 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 		MaxValue *float64 `json:"max_value"`
 	}
 	var body struct {
-		Name      string  `json:"name"`
-		RiverName string  `json:"river_name"`
-		GnisID    string  `json:"gnis_id"`
-		PutIn     latLng  `json:"put_in"`
-		TakeOut   latLng  `json:"take_out"`
-		UpComID   string  `json:"up_comid"`
-		DownComID string  `json:"down_comid"`
-		Note      *string `json:"note"`
+		Name      string   `json:"name"`
+		RiverName string   `json:"river_name"`
+		GnisID    string   `json:"gnis_id"`
+		PutIn     latLng   `json:"put_in"`
+		TakeOut   latLng   `json:"take_out"`
+		UpComID   string   `json:"up_comid"`
+		DownComID string   `json:"down_comid"`
+		Note      *string  `json:"note"`
+		ClassMin  *float64 `json:"class_min"`
+		ClassMax  *float64 `json:"class_max"`
 		FlowRanges *struct {
 			Low     *bandRange `json:"low"`
 			Running *bandRange `json:"running"`
@@ -613,17 +623,18 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var reachID string
 	err := h.db.QueryRow(ctx, `
 		INSERT INTO user_reaches
-			(owner_id, slug, name, river_id, river_name, put_in, take_out, up_comid, down_comid, note)
+			(owner_id, slug, name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, class_min, class_max)
 		VALUES
 			($1, $2, $3, $4, $5,
 			 ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography,
 			 ST_SetSRID(ST_MakePoint($8, $9), 4326)::geography,
-			 NULLIF($10,''), NULLIF($11,''), $12)
+			 NULLIF($10,''), NULLIF($11,''), $12, $13, $14)
 		RETURNING id
 	`, ownerID, slug, body.Name, riverID, finalRiverName,
 		body.PutIn.Lng, body.PutIn.Lat,
 		body.TakeOut.Lng, body.TakeOut.Lat,
 		body.UpComID, body.DownComID, body.Note,
+		body.ClassMin, body.ClassMax,
 	).Scan(&reachID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("create failed: %v", err))
@@ -809,14 +820,16 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		Lng float64 `json:"lng"`
 	}
 	var body struct {
-		Name      *string `json:"name"`
-		Note      *string `json:"note"`
-		RiverName *string `json:"river_name"`
-		GnisID    *string `json:"gnis_id"`
-		PutIn     *latLng `json:"put_in"`
-		TakeOut   *latLng `json:"take_out"`
-		UpComID   *string `json:"up_comid"`
-		DownComID *string `json:"down_comid"`
+		Name      *string  `json:"name"`
+		Note      *string  `json:"note"`
+		RiverName *string  `json:"river_name"`
+		GnisID    *string  `json:"gnis_id"`
+		PutIn     *latLng  `json:"put_in"`
+		TakeOut   *latLng  `json:"take_out"`
+		UpComID   *string  `json:"up_comid"`
+		DownComID *string  `json:"down_comid"`
+		ClassMin  *float64 `json:"class_min"`
+		ClassMax  *float64 `json:"class_max"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid JSON")
@@ -839,9 +852,13 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 			name       = COALESCE($3, name),
 			note       = $4,
 			river_name = CASE WHEN $5 THEN $6 ELSE river_name END,
+			class_min  = CASE WHEN $7 THEN $8::numeric ELSE class_min END,
+			class_max  = CASE WHEN $9 THEN $10::numeric ELSE class_max END,
 			updated_at = NOW()
 		WHERE owner_id = $1 AND slug = $2
-	`, ownerID, slug, body.Name, body.Note, body.RiverName != nil, riverName)
+	`, ownerID, slug, body.Name, body.Note, body.RiverName != nil, riverName,
+		body.ClassMin != nil, body.ClassMin,
+		body.ClassMax != nil, body.ClassMax)
 	if err != nil || tag.RowsAffected() == 0 {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
 		return
