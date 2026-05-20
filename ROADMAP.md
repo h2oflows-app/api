@@ -2,13 +2,14 @@
 
 Current state as of May 2026. Phase 1 (gauge dashboard + reach pages + AI assistant) is complete. Backend routes exist for trip reports, trips, contributions, and proximity events — the frontend for those is stub. Everything below is unbuilt or incomplete.
 
-**Status snapshot (2026-05-18):**
+**Status snapshot (2026-05-20):**
 - ✅ Phase 2 (2.1–2.6) — shipped 2026-05-06
 - ✅ Phase 2b (2b.1–2b.7) — shipped 2026-05-07
 - ✅ Repository restructure — completed 2026-05-13; live at `h2oflows-app/{api,web,docs}`
 - ✅ Phase 2c — Pilot polish — shipped 2026-05-17 (v0.2.1–v0.2.17)
 - ✅ Demo Pack (0.3.0) — shipped 2026-05-18, tagged v0.3.3
 - ✅ Pre-pilot polish (PR #35) — merged 2026-05-18; all web GH issues closed except #16 (deferred to Phase 3+)
+- ✅ **Phase 2d — Post-pre-pilot iteration (web#48 + api#11) — merged 2026-05-20.** Reach author parity (admin = user flow), per-dashboard prefs, gauge-map toggle, basin loading banner, user reach difficulty fields, reach-only watchlist path, theme-aware user reach line color.
 - ⏳ Pilot rollout (0.x) — on hold per user
 - 🔧 **Phase 3 — SEO infra** (active; build behind noindex wall, flip robots.txt at 1.0 launch)
 - ⏳ Phase 4 — Public API + PATs + data export (expanded 2026-05-18; depends on pilot signal)
@@ -1008,6 +1009,54 @@ Recipient imports via the existing import picker on `/explore` (or new dashboard
 ### 3.6 — Rethink hazards (deferred)
 
 Trip report `hazard_warning` field was removed in 0.3.0 polish (liability/bad-info concern). Reintroduce later with proper guardrails: stronger UX warnings on display, attribution to author (not "h2oflows says"), reach-author moderation, possibly admin-confirmed-only. Must reintegrate with RAG context generation (currently dropped from `report_context.go`). Open question: is hazard-as-trip-report the right model at all, or should it be a separate reach-attached object with author attribution and admin review?
+
+---
+
+## Phase 2d — Post-pre-pilot iteration ✅ shipped 2026-05-20
+
+*Bundled polish + small features driven by hands-on testing after PR #35 merged. Ships as `h2oflows-app/web#48` + `h2oflows-app/api#11`. Closes 16 web issues (#49–#64) + 1 api issue (#12).*
+
+### 2d.1 — Reach author parity
+
+Admin `ReachAuthor` now mirrors `UserReachAuthor`:
+- Anchor click sets put-in in one step (was two clicks)
+- No zoom-out on anchor pick — user controls map viewport while picking flowlines
+- "Upstream/Downstream" labels renamed to "Put-in/Take-out"
+- ComID `pair-lock` auto-engages after take-out is set, so stray flowline clicks while hunting for a gauge don't replace take-out
+
+Same `comIDPairLocked` fix applied to `UserReachAuthor`. Closes web#49, #50, #60.
+
+### 2d.2 — User reach difficulty
+
+Migration `000090_user_reaches_class` adds `class_min NUMERIC(3,1)` + `class_max NUMERIC(3,1)` columns on `user_reaches`. List/Get/Create/Update/MapAll all accept and emit the fields. PATCH semantics: nil pointer = keep existing (matches `name` field).
+
+UI: Class min/max inputs in user reach editor + new-reach form. Closes web#57, api#12.
+
+### 2d.3 — Per-dashboard preferences
+
+View mode, grouping (state/basin/gauge), filter (curated/myReaches/gauges), collapsed sections, and gauge-map visibility now persist per-dashboard. Switching tabs rehydrates from a single JSON blob keyed by `activeDashboardId`. Hydration flag suppresses the save watcher during rehydrate so dashboard A's prefs don't get written under dashboard B's key. Closes web#52, #61.
+
+### 2d.4 — Dashboard gauge-map toggle
+
+Toolbar adds map-icon button to show/hide the gauge map. Section header + divider hide entirely when the toggle is off. Closes web#53, #58.
+
+### 2d.5 — Phantom curated reach filter
+
+`byStateTree` filters watchlist gauges whose `contextReachSlug` matches a user reach slug — eliminates the phantom curated-reach card rendered under "Unknown River" when a user reach shared its primary gauge with a curated reach (caused by legacy gauge-bound watchlist entries from before the reach-only watchlist path).
+
+Pairs with explore-page change: user reach add-to-dashboard now goes through `addReachToWatchlist(slug, dashboardId)` (no `gauge_id`) and DELETE via `kind=reach`. Closes web#51, #59.
+
+### 2d.6 — Basin map loading banner
+
+Centered "Loading tributaries…" banner with spinner renders on `BasinMap` while NLDI fetch in flight on larger basins (`/basin/colorado`). Closes web#54.
+
+### 2d.7 — Misc UX polish
+
+- New Reach button on `/explore`: admin-only in curated mode (opens admin author directly); user mode keeps the picker (Create new + Import shared). Closes web#55.
+- `/my/reaches` index gets the same picker pattern. Closes web#62.
+- `/my/reaches/new` page gains an X close button in the header bar. Closes web#63.
+- User reach line color follows the active theme's `primarySwatch` hex (read from `THEMES`, not the Tailwind v4 `--color-primary-500` CSS var — oklch is rejected by MapLibre paint). Closes web#64.
+- Regression fix: explore map lines blanked out during the user-reach color expression iteration when nested `case` + null-typed comparator was used. Reverted to single-level `case` matching original working shape. Closes web#56.
 
 ---
 
