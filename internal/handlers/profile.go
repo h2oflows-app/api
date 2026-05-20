@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-var handleRe = regexp.MustCompile(`^[a-z0-9_]{3,32}$`)
+var handleRe = regexp.MustCompile(`^[\p{L}\p{N} ',.\-]{1,50}$`)
 
 // ProfileHandler handles /me/profile routes.
 type ProfileHandler struct {
@@ -74,9 +74,9 @@ func (h *ProfileHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if body.Handle != nil {
-		h := strings.ToLower(strings.TrimSpace(*body.Handle))
+		h := strings.TrimSpace(*body.Handle)
 		if !handleRe.MatchString(h) {
-			errorResponse(w, http.StatusBadRequest, "handle must be 3–32 lowercase letters, digits, or underscores")
+			errorResponse(w, http.StatusBadRequest, "name must be 1–50 characters")
 			return
 		}
 		*body.Handle = h
