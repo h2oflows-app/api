@@ -906,21 +906,21 @@ func (h *AdminHandler) ListAdminGauges(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type gaugeRow struct {
-		ID                    string  `json:"id"`
-		ExternalID            string  `json:"external_id"`
-		Source                string  `json:"source"`
-		Name                  string  `json:"name"`
-		Status                string  `json:"status"`
-		AutoManaged           bool    `json:"auto_managed"`
-		PollHealth            string  `json:"poll_health"`
-		ConsecutiveFailures   int     `json:"consecutive_poll_failures"`
-		LastReadingAt         *string `json:"last_reading_at"`
-		LastPollSuccessAt     *string `json:"last_poll_success_at"`
-		LastPollFailureAt     *string `json:"last_poll_failure_at"`
-		SeasonalStartMMDD     *string `json:"seasonal_start_mmdd"`
-		SeasonalEndMMDD       *string `json:"seasonal_end_mmdd"`
-		StateAbbr             *string `json:"state_abbr"`
-		ReachCount            int     `json:"reach_count"`
+		ID                    string     `json:"id"`
+		ExternalID            string     `json:"external_id"`
+		Source                string     `json:"source"`
+		Name                  string     `json:"name"`
+		Status                string     `json:"status"`
+		AutoManaged           bool       `json:"auto_managed"`
+		PollHealth            string     `json:"poll_health"`
+		ConsecutiveFailures   int        `json:"consecutive_poll_failures"`
+		LastReadingAt         *time.Time `json:"last_reading_at"`
+		LastPollSuccessAt     *time.Time `json:"last_poll_success_at"`
+		LastPollFailureAt     *time.Time `json:"last_poll_failure_at"`
+		SeasonalStartMMDD     *string    `json:"seasonal_start_mmdd"`
+		SeasonalEndMMDD       *string    `json:"seasonal_end_mmdd"`
+		StateAbbr             *string    `json:"state_abbr"`
+		ReachCount            int        `json:"reach_count"`
 	}
 
 	gauges := make([]gaugeRow, 0)
