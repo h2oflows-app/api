@@ -11,14 +11,14 @@ import (
 )
 
 // readingRetention is how long gauge readings are kept in the DB.
-// 7 days gives the graph enough history for the 12/24/48h windows plus context.
-const readingRetention = 7 * 24 * time.Hour
+// 30 days supports the 12h/24h/30d graph windows.
+const readingRetention = 30 * 24 * time.Hour
 
 // backfillWindow is how far back to seed readings for a gauge that has none.
-const backfillWindow = 7 * 24 * time.Hour
+const backfillWindow = 30 * 24 * time.Hour
 
 // backfillInterval is how often the backfiller re-scans for gauges with missing
-// or gappy history. Same as the poll cadence so newly-watched gauges get 7-day
+// or gappy history. Same as the poll cadence so newly-watched gauges get 30-day
 // history within one cycle instead of waiting for a server restart.
 const backfillInterval = 15 * time.Minute
 
@@ -68,7 +68,7 @@ func (p *Poller) Run(ctx context.Context) {
 	// Runs in background — doesn't block the first poll cycle.
 	go p.syncAllMetadata(ctx)
 
-	// Backfill 7 days of history for any gauges with no recent readings.
+	// Backfill 30 days of history for any gauges with no recent readings.
 	// Also runs periodically so gauges added after startup get history promptly.
 	go p.backfillAll(ctx)
 	go p.runBackfiller(ctx)
@@ -422,15 +422,15 @@ func (p *Poller) backfillSource(ctx context.Context, sc sourceConfig) {
 	sourceType := string(sc.source.SourceType())
 
 	// Find gauges that either:
-	//   (a) have no readings in the last 7 days, OR
-	//   (b) have a gap > 2 hours anywhere in the last 7 days
+	//   (a) have no readings in the last 30 days, OR
+	//   (b) have a gap > 2 hours anywhere in the last 30 days
 	// For (b) we fetch from just before the earliest gap so we only pull what's missing.
 	rows, err := p.db.Query(ctx, `
 		WITH window_readings AS (
 		    SELECT gauge_id, timestamp,
 		           LEAD(timestamp) OVER (PARTITION BY gauge_id ORDER BY timestamp) AS next_ts
 		    FROM   gauge_readings
-		    WHERE  timestamp > NOW() - INTERVAL '7 days'
+		    WHERE  timestamp > NOW() - INTERVAL '30 days'
 		),
 		earliest_gaps AS (
 		    -- Mid-stream gap: two consecutive readings more than 2 h apart
@@ -444,7 +444,7 @@ func (p *Poller) backfillSource(ctx context.Context, sc sourceConfig) {
 		    -- LEAD returns NULL for the last row so the earliest_gaps CTE misses this case.
 		    SELECT gauge_id, MAX(timestamp) - INTERVAL '5 minutes' AS since
 		    FROM   gauge_readings
-		    WHERE  timestamp > NOW() - INTERVAL '7 days'
+		    WHERE  timestamp > NOW() - INTERVAL '30 days'
 		    GROUP  BY gauge_id
 		    HAVING MAX(timestamp) < NOW() - INTERVAL '2 hours'
 		)
@@ -453,7 +453,7 @@ func (p *Poller) backfillSource(ctx context.Context, sc sourceConfig) {
 		           LEAST(eg.since, tg.since),
 		           eg.since,
 		           tg.since,
-		           NOW() - INTERVAL '7 days'
+		           NOW() - INTERVAL '30 days'
 		       ) AS fetch_since
 		FROM   gauges g
 		LEFT   JOIN earliest_gaps eg ON eg.gauge_id = g.id
@@ -468,7 +468,7 @@ func (p *Poller) backfillSource(ctx context.Context, sc sourceConfig) {
 		           NOT EXISTS (
 		               SELECT 1 FROM gauge_readings gr
 		               WHERE  gr.gauge_id = g.id
-		                 AND  gr.timestamp > NOW() - INTERVAL '7 days'
+		                 AND  gr.timestamp > NOW() - INTERVAL '30 days'
 		               LIMIT 1
 		           )
 		           OR eg.gauge_id IS NOT NULL

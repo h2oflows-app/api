@@ -2,16 +2,18 @@
 
 Current state as of May 2026. Phase 1 (gauge dashboard + reach pages + AI assistant) is complete. Backend routes exist for trip reports, trips, contributions, and proximity events — the frontend for those is stub. Everything below is unbuilt or incomplete.
 
-**Status snapshot (2026-05-20):**
+**Status snapshot (2026-05-21):**
 - ✅ Phase 2 (2.1–2.6) — shipped 2026-05-06
 - ✅ Phase 2b (2b.1–2b.7) — shipped 2026-05-07
 - ✅ Repository restructure — completed 2026-05-13; live at `h2oflows-app/{api,web,docs}`
 - ✅ Phase 2c — Pilot polish — shipped 2026-05-17 (v0.2.1–v0.2.17)
 - ✅ Demo Pack (0.3.0) — shipped 2026-05-18, tagged v0.3.3
-- ✅ Pre-pilot polish (PR #35) — merged 2026-05-18; all web GH issues closed except #16 (deferred to Phase 3+)
+- ✅ Pre-pilot polish (PR #35) — merged 2026-05-18; all web GH issues closed except #16 (active, see 2c.4)
 - ✅ **Phase 2d — Post-pre-pilot iteration (web#48 + api#11) — merged 2026-05-20.** Reach author parity (admin = user flow), per-dashboard prefs, gauge-map toggle, basin loading banner, user reach difficulty fields, reach-only watchlist path, theme-aware user reach line color.
+- ✅ **Dashboard UX polish — web#67/#68 — merged 2026-05-21.** Full view mode, sparkline full-width in comfortable/full, 12h/24h selector top-left, card consistency, mobile hides full-mode button.
+- 🔧 **[web#16] 2c.4 — Gauge polling reliability + 30d history** (api#14 + web#69 open; PRs B/C/D/E follow)
 - ⏳ Pilot rollout (0.x) — on hold per user
-- 🔧 **Phase 3 — SEO infra** (active; build behind noindex wall, flip robots.txt at 1.0 launch)
+- ⏳ Phase 3 — SEO infra (build behind noindex wall, flip robots.txt at 1.0 launch)
 - ⏳ Phase 4 — Public API + PATs + data export (expanded 2026-05-18; depends on pilot signal)
 - ⏳ Phase 5 — American Whitewater interop (`reach-ingest-v1` schema drafted 2026-05-18)
 - ⏳ Phase 6+ — deferred
@@ -687,17 +689,57 @@ Ship as one PR — toolbar component lands once, both surfaces consume it.
 
 *Caveat:* this is a deliberate reversal of a prior product call. Confirm intent with at least one pilot tester before shipping if pilot is imminent. If shipped, `feedback_user_content_private.md` still holds — these are private rows, just rendered inline.
 
-### 2c.4 — Polling polish (extends shipped 2.5)
+### 2c.4 — Polling polish + gauge health (extends shipped 2.5) 🔧 IN PROGRESS
 
-**[web#16] Offline gauge surfacing + cold-start UX.** 2.5 shipped `poll_health` columns and the `polled_gauge_ids` view; this is the missing user-visible layer.
+**[web#16] Gauge reliability, 30d history, admin tooling, and user-facing health indicators.**
 
-- Admin Rivers tab "offline" summary lists the specific reaches whose gauge is unhealthy, not just a count
-- When a gauge is added to a dashboard (watchlist) for the first time, fetch an instant value synchronously and start regular polling
-- If a gauge has no readings yet, the dashboard card shows a "waiting to collect data" placeholder near the sparkline (keeps the sparkline slot, doesn't collapse it)
-- Same "waiting" message on reach detail when the associated gauge has never been polled
-- Gauges that are polled but not associated with any reach or dashboard fall back to a 1× / week tick — keeps the row warm without paying the 15-minute cost
+Full architecture decision logged in memory (project_issue16_pr_plan, project_gauge_scale_analysis). PRs ship in order A → B → D → C → E.
 
-No schema change required — extends `polled_gauge_ids` view union + adds a `last_polled_at IS NULL` UI branch. If a poll-cadence column is needed, add as migration `000084`.
+#### PR A — 30d retention + sparkline window ✅ open (api#14, web#69)
+
+- `readingRetention` + `backfillWindow`: 7d → 30d
+- Backfill gap-detection SQL window: 7d → 30d
+- `GetReadings` limit ceiling: 500 → 5000
+- Sparklines: `12h / 24h / 30d` button group; compact label shows `30d`; localStorage persists all three
+- On first deploy: backfiller seeds 30d history for all polled gauges (~5-10 min background, non-blocking)
+
+#### PR B — Gauge status UI (user-facing)
+
+- New `app/components/gauge/GaugePollStatus.vue` — shared badge + refresh button
+- States: `Updated Xm ago` / `Stale 1h+` / `Offline` / `History loading…` / `Decommissioned` / `Seasonal — off-season`
+- New `POST /api/v1/gauges/:id/refresh` → calls `FetchNowIfStale(ctx, gaugeID, 0)`; rate-limited ~1 req/30s per gauge
+- Gauge endpoint exposes `poll_health`, `last_reading_at`, `last_poll_success_at`, `status` in payload
+- Surfaces in: GaugeSparkline header, reach detail gauge card, dashboard gauge rows, gauge modal
+
+#### PR C — Admin gauges page
+
+- `GET /admin/gauges` — paginated, filterable (status, poll_health, source, orphaned, q); includes `reach_count`
+- `POST /admin/gauges/:id/poll` — force poll (bypasses maxAge)
+- `POST /admin/gauges/:id/retire` → `status='retired'`
+- `POST /admin/gauges/:id/reactivate` → `status='active'`, clear failures
+- `PATCH /admin/gauges/:id/seasonal` → set `status='seasonal'` + `seasonal_start_mmdd` / `seasonal_end_mmdd`
+- New page `app/pages/admin/gauges.vue`: sortable table, summary counts, "Show decommissioned" toggle (default off)
+
+#### PR D — Seasonal heartbeat + retire flow
+
+- `loadGauges` SQL: `seasonal` gauges poll 1×/day outside season window (heartbeat — detects gauge coming back before paddle season)
+- Explore + reach lists default filter: `status != 'retired'`
+- Admin-only "Show decommissioned" filter toggle on explore page
+
+#### PR E — 1y daily-mean graph (deferred — ship after A-D, measure usage)
+
+- `FetchDailyMeans(ctx, externalID, since)` on GaugeSource interface
+- USGS adapter: hits `/nwis/dv` (daily values service)
+- DWR adapter: daily endpoint
+- `GET /api/v1/gauges/:id/history?window=1y` → ~365 daily-mean points; `Cache-Control: max-age=3600`; no DB write
+- 1y option on reach detail graph (separate from sparkline 30d)
+- Scale note: ~3,200 gauges × 30d × 96 readings ≈ 9M rows at steady state — well within single-instance PG. Revisit caching with Prometheus metrics post-deployment.
+
+**Status/health model (already in schema, no new migration for A-D):**
+- `poll_health`: `healthy` | `degraded` (~30m) | `stale` (~1h) | `unreachable` (~12h)
+- `status`: `active` | `inactive` (auto after 14d no success) | `seasonal` | `maintenance` | `retired`
+- `auto_managed`: auto-recovers on next success; manual `retired` = stops polling permanently
+- Unreachable gauges back off to 1×/hr automatically (already in `loadGauges`)
 
 ### 2c.6 — River identity ownership
 

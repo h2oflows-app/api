@@ -143,12 +143,12 @@ func (h *GaugeHandler) Search(w http.ResponseWriter, r *http.Request) {
 
 // GetReadings handles GET /api/v1/gauges/{id}/readings
 //
-// Returns up to `limit` readings from the 48-hour rolling cache, newest first.
+// Returns up to `limit` readings from the 30-day rolling cache, newest first.
 // The frontend uses this to populate the gauge graph (uPlot).
 //
 // Query params:
 //
-//	limit=96   max rows (1–500, default 96 — 48h at 30min intervals)
+//	limit=96   max rows (1–5000, default 96 — 48h at 30min intervals)
 //	since=     ISO 8601 timestamp — only return readings after this time
 func (h *GaugeHandler) GetReadings(w http.ResponseWriter, r *http.Request) {
 	gaugeID := chi.URLParam(r, "id")
@@ -158,7 +158,7 @@ func (h *GaugeHandler) GetReadings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	q := r.URL.Query()
-	limit := clampInt(parseIntOr(q.Get("limit"), 96), 1, 500)
+	limit := clampInt(parseIntOr(q.Get("limit"), 96), 1, 5000)
 
 	var since *time.Time
 	if raw := q.Get("since"); raw != "" {
