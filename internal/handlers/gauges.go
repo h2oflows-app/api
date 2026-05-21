@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,21 +10,67 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/h2oflow/h2oflow/apps/api/internal/ai"
+	"github.com/h2oflow/h2oflow/apps/api/internal/poller"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// gaugePoller is the subset of poller.Poller used by GaugeHandler.
+type gaugePoller interface {
+	FetchNowIfStale(ctx context.Context, gaugeID string, maxAge time.Duration) bool
+}
+
 // GaugeHandler handles gauge-related HTTP routes.
 type GaugeHandler struct {
-	db       *pgxpool.Pool
-	enricher *ai.SearchEnricher // nil = AI enrichment disabled
+	db           *pgxpool.Pool
+	enricher     *ai.SearchEnricher // nil = AI enrichment disabled
+	poller       gaugePoller        // nil = refresh endpoint unavailable
+	refreshMu    sync.Mutex
+	refreshTimes map[string]time.Time // gaugeID → last refresh timestamp
 }
 
 func NewGaugeHandler(db *pgxpool.Pool, enricher *ai.SearchEnricher) *GaugeHandler {
-	return &GaugeHandler{db: db, enricher: enricher}
+	return &GaugeHandler{db: db, enricher: enricher, refreshTimes: make(map[string]time.Time)}
+}
+
+func (h *GaugeHandler) WithPoller(p *poller.Poller) *GaugeHandler {
+	h.poller = p
+	return h
+}
+
+const refreshRateLimit = 30 * time.Second
+
+// Refresh handles POST /api/v1/gauges/{id}/refresh.
+// Triggers an immediate upstream fetch for the gauge regardless of poll schedule.
+// Rate-limited to one request per gauge per 30 seconds.
+func (h *GaugeHandler) Refresh(w http.ResponseWriter, r *http.Request) {
+	if h.poller == nil {
+		errorResponse(w, http.StatusServiceUnavailable, "refresh unavailable")
+		return
+	}
+	gaugeID := chi.URLParam(r, "id")
+	if gaugeID == "" {
+		errorResponse(w, http.StatusBadRequest, "gauge id is required")
+		return
+	}
+
+	h.refreshMu.Lock()
+	last := h.refreshTimes[gaugeID]
+	if time.Since(last) < refreshRateLimit {
+		h.refreshMu.Unlock()
+		w.Header().Set("Retry-After", "30")
+		errorResponse(w, http.StatusTooManyRequests, "refresh rate limited — try again in 30s")
+		return
+	}
+	h.refreshTimes[gaugeID] = time.Now()
+	h.refreshMu.Unlock()
+
+	fetched := h.poller.FetchNowIfStale(r.Context(), gaugeID, 0)
+	jsonResponse(w, http.StatusOK, map[string]any{"fetched": fetched})
 }
 
 // Search handles GET /api/v1/gauges/search
