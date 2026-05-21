@@ -885,7 +885,7 @@ func (h *AdminHandler) ListAdminGauges(w http.ResponseWriter, r *http.Request) {
 			g.seasonal_start_mmdd, g.seasonal_end_mmdd,
 			g.river_name, g.state_abbr,
 			(SELECT COUNT(*) FROM reaches r2
-			 WHERE r2.primary_gauge_id = g.id OR r2.secondary_gauge_id = g.id
+			 WHERE r2.primary_gauge_id = g.id
 			) AS reach_count
 		FROM gauges g
 		%s
