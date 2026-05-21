@@ -102,7 +102,7 @@ func main() {
 		devFallbackID = "dev-user"
 	}
 
-	gauges      := handlers.NewGaugeHandler(pool, enricher)
+	gauges      := handlers.NewGaugeHandler(pool, enricher).WithPoller(p)
 	reaches     := handlers.NewReachHandler(pool, asker).WithPoller(p)
 	watchlist   := handlers.NewWatchlistHandler(pool)
 	admin       := handlers.NewAdminHandler(pool)
@@ -162,6 +162,7 @@ func main() {
 		r.Get("/gauges/{id}/readings", gauges.GetReadings)
 		r.Get("/gauges/{id}/flow-ranges", gauges.GetFlowRanges)
 		r.Get("/gauges/{id}/seasonal", gauges.GetSeasonalStats)
+		r.Post("/gauges/{id}/refresh", gauges.Refresh)
 
 		r.Get("/reaches/map/all", reaches.MapAll)
 		r.Get("/reaches/map", reaches.Map)
