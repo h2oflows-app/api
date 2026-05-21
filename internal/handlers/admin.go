@@ -17,12 +17,23 @@ import (
 	gauge "github.com/h2oflow/h2oflow/apps/api/internal/gaugecore"
 )
 
+// adminPoller is the subset of poller.Poller used by admin gauge actions.
+type adminPoller interface {
+	FetchNowIfStale(ctx context.Context, gaugeID string, maxAge time.Duration) bool
+}
+
 type AdminHandler struct {
-	db *pgxpool.Pool
+	db     *pgxpool.Pool
+	poller adminPoller
 }
 
 func NewAdminHandler(db *pgxpool.Pool) *AdminHandler {
 	return &AdminHandler{db: db}
+}
+
+func (h *AdminHandler) WithPoller(p adminPoller) *AdminHandler {
+	h.poller = p
+	return h
 }
 
 // SlugCheck reports whether a reach slug is available (not already taken).
@@ -788,4 +799,264 @@ func (h *AdminHandler) ReorderReachesForRiver(w http.ResponseWriter, r *http.Req
 	}
 
 	jsonResponse(w, http.StatusOK, map[string]any{"updated": len(ids)})
+}
+
+// ── Admin gauge management ────────────────────────────────────────────────────
+
+// ListAdminGauges handles GET /admin/gauges
+//
+// Query params:
+//
+//	q=           text search on name or external_id
+//	source=      filter by source (usgs, dwr, …)
+//	poll_health= filter by poll_health (healthy, degraded, stale, unreachable)
+//	status=      filter by status (active, inactive, seasonal, retired, …)
+//	orphaned=    true = only gauges with no associated reaches
+//	show_retired=true  include retired gauges (default excluded)
+//	limit=       max rows (1–200, default 50)
+//	offset=      pagination offset
+func (h *AdminHandler) ListAdminGauges(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	search     := q.Get("q")
+	source     := q.Get("source")
+	pollHealth := q.Get("poll_health")
+	status     := q.Get("status")
+	orphaned   := q.Get("orphaned") == "true"
+	showRetired := q.Get("show_retired") == "true"
+	limit  := clampInt(parseIntOr(q.Get("limit"), 50), 1, 200)
+	offset := max(parseIntOr(q.Get("offset"), 0), 0)
+
+	args := []any{}
+	wheres := []string{}
+	idx := 1
+
+	if !showRetired && status == "" {
+		wheres = append(wheres, fmt.Sprintf("g.status != $%d", idx))
+		args = append(args, "retired")
+		idx++
+	}
+	if status != "" {
+		wheres = append(wheres, fmt.Sprintf("g.status = $%d", idx))
+		args = append(args, status)
+		idx++
+	}
+	if source != "" {
+		wheres = append(wheres, fmt.Sprintf("g.source = $%d", idx))
+		args = append(args, source)
+		idx++
+	}
+	if pollHealth != "" {
+		wheres = append(wheres, fmt.Sprintf("g.poll_health = $%d", idx))
+		args = append(args, pollHealth)
+		idx++
+	}
+	if search != "" {
+		wheres = append(wheres, fmt.Sprintf("(g.name ILIKE $%d OR g.external_id ILIKE $%d)", idx, idx+1))
+		pat := "%" + search + "%"
+		args = append(args, pat, pat)
+		idx += 2
+	}
+	if orphaned {
+		wheres = append(wheres, `NOT EXISTS (
+			SELECT 1 FROM reaches r2
+			WHERE r2.primary_gauge_id = g.id OR r2.secondary_gauge_id = g.id
+		)`)
+	}
+
+	where := ""
+	if len(wheres) > 0 {
+		where = "WHERE " + strings.Join(wheres, " AND ")
+	}
+
+	countSQL := fmt.Sprintf(`SELECT COUNT(*) FROM gauges g %s`, where)
+	var total int
+	if err := h.db.QueryRow(r.Context(), countSQL, args...).Scan(&total); err != nil {
+		errorResponse(w, http.StatusInternalServerError, "count failed")
+		return
+	}
+
+	args = append(args, limit, offset)
+	rows, err := h.db.Query(r.Context(), fmt.Sprintf(`
+		SELECT
+			g.id, g.external_id, g.source, g.name,
+			g.status, g.auto_managed,
+			g.poll_health, g.consecutive_poll_failures,
+			g.last_reading_at, g.last_poll_success_at, g.last_poll_failure_at,
+			g.seasonal_start_mmdd, g.seasonal_end_mmdd,
+			g.river_name, g.state_abbr,
+			(SELECT COUNT(*) FROM reaches r2
+			 WHERE r2.primary_gauge_id = g.id OR r2.secondary_gauge_id = g.id
+			) AS reach_count
+		FROM gauges g
+		%s
+		ORDER BY
+			CASE g.poll_health
+				WHEN 'unreachable' THEN 0
+				WHEN 'stale'       THEN 1
+				WHEN 'degraded'    THEN 2
+				ELSE 3
+			END,
+			g.name
+		LIMIT $%d OFFSET $%d
+	`, where, idx, idx+1), args...)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "query failed")
+		return
+	}
+	defer rows.Close()
+
+	type gaugeRow struct {
+		ID                    string  `json:"id"`
+		ExternalID            string  `json:"external_id"`
+		Source                string  `json:"source"`
+		Name                  string  `json:"name"`
+		Status                string  `json:"status"`
+		AutoManaged           bool    `json:"auto_managed"`
+		PollHealth            string  `json:"poll_health"`
+		ConsecutiveFailures   int     `json:"consecutive_poll_failures"`
+		LastReadingAt         *string `json:"last_reading_at"`
+		LastPollSuccessAt     *string `json:"last_poll_success_at"`
+		LastPollFailureAt     *string `json:"last_poll_failure_at"`
+		SeasonalStartMMDD     *string `json:"seasonal_start_mmdd"`
+		SeasonalEndMMDD       *string `json:"seasonal_end_mmdd"`
+		RiverName             *string `json:"river_name"`
+		StateAbbr             *string `json:"state_abbr"`
+		ReachCount            int     `json:"reach_count"`
+	}
+
+	gauges := make([]gaugeRow, 0)
+	for rows.Next() {
+		var g gaugeRow
+		if err := rows.Scan(
+			&g.ID, &g.ExternalID, &g.Source, &g.Name,
+			&g.Status, &g.AutoManaged,
+			&g.PollHealth, &g.ConsecutiveFailures,
+			&g.LastReadingAt, &g.LastPollSuccessAt, &g.LastPollFailureAt,
+			&g.SeasonalStartMMDD, &g.SeasonalEndMMDD,
+			&g.RiverName, &g.StateAbbr,
+			&g.ReachCount,
+		); err != nil {
+			continue
+		}
+		gauges = append(gauges, g)
+	}
+
+	// Health summary counts (unfiltered except for show_retired)
+	type healthCounts struct {
+		Healthy     int `json:"healthy"`
+		Degraded    int `json:"degraded"`
+		Stale       int `json:"stale"`
+		Unreachable int `json:"unreachable"`
+		Total       int `json:"total"`
+	}
+	var summary healthCounts
+	summaryWhere := ""
+	summaryArgs := []any{}
+	if !showRetired {
+		summaryWhere = "WHERE status != $1"
+		summaryArgs = append(summaryArgs, "retired")
+	}
+	_ = h.db.QueryRow(r.Context(), fmt.Sprintf(`
+		SELECT
+			COUNT(*) FILTER (WHERE poll_health = 'healthy'),
+			COUNT(*) FILTER (WHERE poll_health = 'degraded'),
+			COUNT(*) FILTER (WHERE poll_health = 'stale'),
+			COUNT(*) FILTER (WHERE poll_health = 'unreachable'),
+			COUNT(*)
+		FROM gauges %s
+	`, summaryWhere), summaryArgs...).Scan(
+		&summary.Healthy, &summary.Degraded, &summary.Stale, &summary.Unreachable, &summary.Total,
+	)
+
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"gauges":  gauges,
+		"total":   total,
+		"limit":   limit,
+		"offset":  offset,
+		"summary": summary,
+	})
+}
+
+// PollAdminGauge handles POST /admin/gauges/:id/poll — force immediate fetch.
+func (h *AdminHandler) PollAdminGauge(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if h.poller == nil {
+		errorResponse(w, http.StatusServiceUnavailable, "poller unavailable")
+		return
+	}
+	fetched := h.poller.FetchNowIfStale(r.Context(), id, 0)
+	jsonResponse(w, http.StatusOK, map[string]any{"fetched": fetched})
+}
+
+// RetireAdminGauge handles POST /admin/gauges/:id/retire.
+func (h *AdminHandler) RetireAdminGauge(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	_, err := h.db.Exec(r.Context(), `
+		UPDATE gauges SET status = 'retired', auto_managed = FALSE WHERE id = $1
+	`, id)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "update failed")
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"status": "retired"})
+}
+
+// ReactivateAdminGauge handles POST /admin/gauges/:id/reactivate.
+func (h *AdminHandler) ReactivateAdminGauge(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	_, err := h.db.Exec(r.Context(), `
+		UPDATE gauges SET
+			status = 'active',
+			consecutive_poll_failures = 0,
+			poll_health = 'healthy',
+			auto_managed = TRUE
+		WHERE id = $1
+	`, id)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "update failed")
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"status": "active"})
+}
+
+// SetAdminGaugeSeasonal handles PATCH /admin/gauges/:id/seasonal.
+// Body: { "start_mmdd": "04-01", "end_mmdd": "10-31" } or {} to clear.
+func (h *AdminHandler) SetAdminGaugeSeasonal(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var body struct {
+		StartMMDD *string `json:"start_mmdd"`
+		EndMMDD   *string `json:"end_mmdd"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		errorResponse(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if body.StartMMDD != nil && body.EndMMDD != nil {
+		_, err := h.db.Exec(r.Context(), `
+			UPDATE gauges SET
+				status = 'seasonal',
+				seasonal_start_mmdd = $2,
+				seasonal_end_mmdd   = $3
+			WHERE id = $1
+		`, id, *body.StartMMDD, *body.EndMMDD)
+		if err != nil {
+			errorResponse(w, http.StatusInternalServerError, "update failed")
+			return
+		}
+		jsonResponse(w, http.StatusOK, map[string]any{"status": "seasonal"})
+	} else {
+		// Clear seasonal — revert to active
+		_, err := h.db.Exec(r.Context(), `
+			UPDATE gauges SET
+				status = 'active',
+				seasonal_start_mmdd = NULL,
+				seasonal_end_mmdd   = NULL
+			WHERE id = $1
+		`, id)
+		if err != nil {
+			errorResponse(w, http.StatusInternalServerError, "update failed")
+			return
+		}
+		jsonResponse(w, http.StatusOK, map[string]any{"status": "active"})
+	}
 }
