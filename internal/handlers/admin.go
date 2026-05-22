@@ -245,26 +245,35 @@ func (h *AdminHandler) DeleteRiver(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// UpdateRiver updates a river's basin. Only basin is mutable by admin.
-// Name, state, GNIS ID, and HUC8 are GNIS-canonical and not modifiable here.
+// UpdateRiver updates a river's basin and/or state_abbr. These are the two
+// fields an admin can override when GNIS-derived values are wrong or missing.
+// Name, GNIS ID, and HUC8 remain GNIS-canonical and are not modifiable here.
 // PUT /api/v1/admin/rivers/{riverSlug}
 func (h *AdminHandler) UpdateRiver(w http.ResponseWriter, r *http.Request) {
 	slug := chi.URLParam(r, "riverSlug")
 	var body struct {
-		Basin *string `json:"basin"`
+		Basin     *string `json:"basin"`
+		StateAbbr *string `json:"state_abbr"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	if body.Basin == nil {
-		errorResponse(w, http.StatusBadRequest, "basin is required")
+	if body.Basin == nil && body.StateAbbr == nil {
+		errorResponse(w, http.StatusBadRequest, "at least one of basin or state_abbr is required")
 		return
+	}
+	if body.StateAbbr != nil {
+		s := strings.ToUpper(strings.TrimSpace(*body.StateAbbr))
+		body.StateAbbr = &s
 	}
 
 	tag, err := h.db.Exec(r.Context(), `
-		UPDATE rivers SET basin = $2 WHERE slug = $1
-	`, slug, body.Basin)
+		UPDATE rivers
+		SET basin      = COALESCE($2, basin),
+		    state_abbr = COALESCE($3, state_abbr)
+		WHERE slug = $1
+	`, slug, body.Basin, body.StateAbbr)
 	if err != nil || tag.RowsAffected() == 0 {
 		errorResponse(w, http.StatusNotFound, "river not found")
 		return
