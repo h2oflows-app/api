@@ -780,10 +780,15 @@ func (p *Poller) loadGauges(ctx context.Context, sourceName string) ([]dbGauge, 
 		WHERE  g.source = $1
 		  AND  g.status IN ('active', 'seasonal', 'maintenance')
 		  AND  (
-		      -- seasonal: only poll when within the season window
+		      -- seasonal: poll within window; heartbeat 1×/day outside window to
+		      -- detect gauges coming back before paddle season starts
 		      g.status != 'seasonal'
 		      OR g.seasonal_start_mmdd IS NULL
 		      OR TO_CHAR(NOW(), 'MM-DD') BETWEEN g.seasonal_start_mmdd AND g.seasonal_end_mmdd
+		      OR COALESCE(
+		             GREATEST(g.last_poll_success_at, g.last_poll_failure_at),
+		             '-infinity'::timestamptz
+		         ) < NOW() - INTERVAL '24 hours'
 		  )
 		  AND  EXISTS (
 		      SELECT 1 FROM polled_gauge_ids p WHERE p.gauge_id = g.id

@@ -540,6 +540,7 @@ type reachListItem struct {
 	GaugeExternalID *string  `json:"gauge_external_id"`
 	GaugeSource     *string  `json:"gauge_source"`
 	GaugeName       *string  `json:"gauge_name"`
+	GaugeStatus     *string  `json:"gauge_status"`
 }
 
 // queryAllListItems returns a lightweight slice of all reaches with current
@@ -573,6 +574,7 @@ func (h *ReachHandler) queryAllListItems(ctx context.Context) ([]reachListItem, 
 			g.external_id  AS gauge_external_id,
 			g.source       AS gauge_source,
 			g.name         AS gauge_name,
+			g.status       AS gauge_status,
 			CASE
 				WHEN lr.value IS NULL OR fr.label IS NULL THEN 'unknown'
 				WHEN fr.label = 'running'                 THEN 'runnable'
@@ -612,7 +614,7 @@ func (h *ReachHandler) queryAllListItems(ctx context.Context) ([]reachListItem, 
 			&item.ClassMin, &item.ClassMax,
 			&item.CurrentCFS, &item.FlowLabel, &item.GaugeID,
 			&item.GaugeExternalID, &item.GaugeSource, &item.GaugeName,
-			&item.FlowStatus,
+			&item.GaugeStatus, &item.FlowStatus,
 		); err != nil {
 			continue
 		}
