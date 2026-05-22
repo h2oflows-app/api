@@ -11,7 +11,8 @@ Current state as of May 2026. Phase 1 (gauge dashboard + reach pages + AI assist
 - ✅ Pre-pilot polish (PR #35) — merged 2026-05-18; all web GH issues closed except #16 (active, see 2c.4)
 - ✅ **Phase 2d — Post-pre-pilot iteration (web#48 + api#11) — merged 2026-05-20.** Reach author parity (admin = user flow), per-dashboard prefs, gauge-map toggle, basin loading banner, user reach difficulty fields, reach-only watchlist path, theme-aware user reach line color.
 - ✅ **Dashboard UX polish — web#67/#68 — merged 2026-05-21.** Full view mode, sparkline full-width in comfortable/full, 12h/24h selector top-left, card consistency, mobile hides full-mode button.
-- 🔧 **[web#16] 2c.4 — Gauge polling reliability + 30d history** (api#14 + web#69 open; PRs B/C/D/E follow)
+- ✅ **[web#16] 2c.4 PRs A/B/C — 30d retention, poll status UI, admin gauges page — shipped 2026-05-22** (api#14–19, web#69–71)
+- 🔧 **[web#16] 2c.4 PR D — Seasonal heartbeat + retire flow** (next)
 - ⏳ Pilot rollout (0.x) — on hold per user
 - ⏳ Phase 3 — SEO infra (build behind noindex wall, flip robots.txt at 1.0 launch)
 - ⏳ Phase 4 — Public API + PATs + data export (expanded 2026-05-18; depends on pilot signal)
@@ -695,7 +696,7 @@ Ship as one PR — toolbar component lands once, both surfaces consume it.
 
 Full architecture decision logged in memory (project_issue16_pr_plan, project_gauge_scale_analysis). PRs ship in order A → B → D → C → E.
 
-#### PR A — 30d retention + sparkline window ✅ open (api#14, web#69)
+#### PR A — 30d retention + sparkline window ✅ merged (api#14, web#69)
 
 - `readingRetention` + `backfillWindow`: 7d → 30d
 - Backfill gap-detection SQL window: 7d → 30d
@@ -703,7 +704,7 @@ Full architecture decision logged in memory (project_issue16_pr_plan, project_ga
 - Sparklines: `12h / 24h / 30d` button group; compact label shows `30d`; localStorage persists all three
 - On first deploy: backfiller seeds 30d history for all polled gauges (~5-10 min background, non-blocking)
 
-#### PR B — Gauge status UI (user-facing)
+#### PR B — Gauge status UI (user-facing) ✅ merged (api#15, web#70)
 
 - New `app/components/gauge/GaugePollStatus.vue` — shared badge + refresh button
 - States: `Updated Xm ago` / `Stale 1h+` / `Offline` / `History loading…` / `Decommissioned` / `Seasonal — off-season`
@@ -711,7 +712,7 @@ Full architecture decision logged in memory (project_issue16_pr_plan, project_ga
 - Gauge endpoint exposes `poll_health`, `last_reading_at`, `last_poll_success_at`, `status` in payload
 - Surfaces in: GaugeSparkline header, reach detail gauge card, dashboard gauge rows, gauge modal
 
-#### PR C — Admin gauges page
+#### PR C — Admin gauges page ✅ merged (api#16–19, web#71)
 
 - `GET /admin/gauges` — paginated, filterable (status, poll_health, source, orphaned, q); includes `reach_count`
 - `POST /admin/gauges/:id/poll` — force poll (bypasses maxAge)
