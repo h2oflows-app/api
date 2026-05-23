@@ -166,9 +166,11 @@ type userReachDetail struct {
 	CustomGaugeName       *string              `json:"custom_gauge_name"`
 	ForkedFromSlug  *string              `json:"forked_from_slug"`
 	ForkedFromName  *string              `json:"forked_from_name"`
-	FlowRanges            []userReachFlowRange  `json:"flow_ranges"`
-	Rapids                []userReachRapid      `json:"rapids"`
+	FlowRanges            []userReachFlowRange   `json:"flow_ranges"`
+	Rapids                []userReachRapid       `json:"rapids"`
 	AccessPoints          []userReachAccessPoint `json:"access_points"`
+	UpvoteCount           int                    `json:"upvote_count"`
+	UserUpvoted           bool                   `json:"user_upvoted"`
 }
 
 // ── MapAll ────────────────────────────────────────────────────────────────────
@@ -551,6 +553,10 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+
+	// Upvotes
+	_ = h.db.QueryRow(r.Context(), `SELECT COUNT(*) FROM run_upvotes WHERE user_reach_id = $1`, d.ID).Scan(&d.UpvoteCount)
+	_ = h.db.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM run_upvotes WHERE user_reach_id = $1 AND user_id = $2)`, d.ID, ownerID).Scan(&d.UserUpvoted)
 
 	jsonResponse(w, http.StatusOK, d)
 }

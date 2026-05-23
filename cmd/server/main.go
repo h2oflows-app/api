@@ -118,6 +118,7 @@ func main() {
 	reports        := handlers.NewReportHandler(pool, devFallbackID)
 	flowProposals  := handlers.NewFlowProposalHandler(pool, devFallbackID)
 	cluster        := handlers.NewClusterHandler(pool, devFallbackID)
+	upvote         := handlers.NewUpvoteHandler(pool, devFallbackID)
 	preferences   := handlers.NewPreferencesHandler(pool, devFallbackID)
 	profile       := handlers.NewProfileHandler(pool, devFallbackID)
 	dashboards    := handlers.NewDashboardHandler(pool, devFallbackID)
@@ -219,6 +220,7 @@ func main() {
 		r.Post("/user-runs/{runId}/flow-proposals", flowProposals.UpsertByRunID)
 		r.Post("/user-runs/dupe-check", cluster.DupeCheck)
 		r.Get("/user-runs/{runId}/cluster", cluster.ClusterForRun)
+		r.Post("/user-runs/{runId}/upvote", upvote.Toggle)
 		r.Post("/me/river-corrections", corrections.CreateRiverCorrection)
 
 		// Custom gauges — private to owner, auth gated via ownerID() + devFallbackID.
