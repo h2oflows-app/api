@@ -541,6 +541,8 @@ type reachListItem struct {
 	GaugeSource     *string  `json:"gauge_source"`
 	GaugeName       *string  `json:"gauge_name"`
 	GaugeStatus     *string  `json:"gauge_status"`
+	IsOfficial      bool     `json:"is_official"`
+	AuthorHandle    *string  `json:"author_handle"`
 }
 
 // queryAllListItems returns a lightweight slice of all reaches with current
@@ -581,10 +583,13 @@ func (h *ReachHandler) queryAllListItems(ctx context.Context) ([]reachListItem, 
 				WHEN fr.label = 'low'                     THEN 'caution'
 				WHEN fr.label = 'high'                    THEN 'flood'
 				ELSE                                           'unknown'
-			END AS flow_status
+			END AS flow_status,
+			r.author_id,
+			up.handle AS author_handle
 		FROM reaches r
 		LEFT JOIN rivers rv ON rv.id = r.river_id
 		LEFT JOIN gauges g ON g.id = r.primary_gauge_id
+		LEFT JOIN user_profiles up ON up.owner_id = r.author_id
 		LEFT JOIN latest_reading lr ON lr.gauge_id = g.id
 		LEFT JOIN LATERAL (
 			SELECT label FROM flow_ranges
@@ -607,6 +612,7 @@ func (h *ReachHandler) queryAllListItems(ctx context.Context) ([]reachListItem, 
 	items := make([]reachListItem, 0)
 	for rows.Next() {
 		var item reachListItem
+		var authorID *string
 		if err := rows.Scan(
 			&item.Slug, &item.Name,
 			&item.RiverName, &item.CommonName, &item.PutInName, &item.TakeOutName,
@@ -615,9 +621,11 @@ func (h *ReachHandler) queryAllListItems(ctx context.Context) ([]reachListItem, 
 			&item.CurrentCFS, &item.FlowLabel, &item.GaugeID,
 			&item.GaugeExternalID, &item.GaugeSource, &item.GaugeName,
 			&item.GaugeStatus, &item.FlowStatus,
+			&authorID, &item.AuthorHandle,
 		); err != nil {
 			continue
 		}
+		item.IsOfficial = (authorID == nil)
 		items = append(items, item)
 	}
 	return items, rows.Err()
@@ -650,6 +658,7 @@ func (h *ReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 
 	// ---- Reach + gauge info -------------------------------------------------
 	var reach reachDetail
+	var reachAuthorID *string
 	err := h.db.QueryRow(r.Context(), `
 		SELECT
 			r.id,
@@ -700,10 +709,13 @@ func (h *ReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 				WHEN fr.label = 'high'                    THEN 'flood'
 				ELSE 'unknown'
 			END AS flow_status,
-			fr.label AS flow_band_label
+			fr.label AS flow_band_label,
+			r.author_id,
+			up.handle AS author_handle
 		FROM reaches r
 		LEFT JOIN rivers rv ON rv.id = r.river_id
 		LEFT JOIN gauges g ON g.id = r.primary_gauge_id
+		LEFT JOIN user_profiles up ON up.owner_id = r.author_id
 		LEFT JOIN LATERAL (
 			SELECT value, timestamp FROM gauge_readings
 			WHERE gauge_id = g.id
@@ -735,11 +747,13 @@ func (h *ReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 		&reach.Gauge.CurrentCFS, &reach.Gauge.LastReadingAt,
 		&reach.Gauge.Lng, &reach.Gauge.Lat,
 		&reach.Gauge.FlowStatus, &reach.Gauge.FlowBandLabel,
+		&reachAuthorID, &reach.AuthorHandle,
 	)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "reach not found")
 		return
 	}
+	reach.IsOfficial = (reachAuthorID == nil)
 
 	// Ensure arrays serialize as [] not null when empty
 	reach.Rapids   = make([]rapidRow, 0)
@@ -1001,6 +1015,8 @@ type reachDetail struct {
 	Rapids                  []rapidRow      `json:"rapids"`
 	Access                  []accessRow     `json:"access"`
 	Related                 []relatedReach  `json:"related"`
+	IsOfficial              bool            `json:"is_official"`
+	AuthorHandle            *string         `json:"author_handle"`
 }
 
 type gaugeSnippet struct {

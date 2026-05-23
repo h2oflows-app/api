@@ -421,16 +421,62 @@ func (h *ReportHandler) ListByReach(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ── GET /reports/{handle}/{slug} ──────────────────────────────────────────────
+// ── GET /me/reaches/{slug}/reports ───────────────────────────────────────────
 
-func (h *ReportHandler) Get(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
+func (h *ReportHandler) ListByUserReach(w http.ResponseWriter, r *http.Request) {
+	userReachSlug := chi.URLParam(r, "slug")
 	ctx := r.Context()
 
-	type detail struct {
+	var userReachID string
+	if err := h.db.QueryRow(ctx,
+		`SELECT id FROM user_reaches WHERE slug = $1`, userReachSlug,
+	).Scan(&userReachID); err != nil {
+		errorResponse(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	const limit = 25
+	cursor := r.URL.Query().Get("cursor")
+
+	var (
+		query string
+		args  []any
+	)
+	if cursor != "" {
+		query = `
+			SELECT rp.id, rp.slug, rp.name, rp.report_date::TEXT, rp.report_time::TEXT,
+			       rp.content, rp.paddled,
+			       rp.flow_cfs, rp.flow_band, rp.created_at, up.handle
+			FROM reports rp
+			LEFT JOIN user_profiles up ON up.owner_id = rp.owner_id
+			WHERE rp.user_reach_id = $1 AND rp.report_date < $2::DATE
+			  AND rp.deleted_at IS NULL
+			ORDER BY rp.report_date DESC, rp.created_at DESC
+			LIMIT $3`
+		args = []any{userReachID, cursor, limit + 1}
+	} else {
+		query = `
+			SELECT rp.id, rp.slug, rp.name, rp.report_date::TEXT, rp.report_time::TEXT,
+			       rp.content, rp.paddled,
+			       rp.flow_cfs, rp.flow_band, rp.created_at, up.handle
+			FROM reports rp
+			LEFT JOIN user_profiles up ON up.owner_id = rp.owner_id
+			WHERE rp.user_reach_id = $1 AND rp.deleted_at IS NULL
+			ORDER BY rp.report_date DESC, rp.created_at DESC
+			LIMIT $2`
+		args = []any{userReachID, limit + 1}
+	}
+
+	rows, err := h.db.Query(ctx, query, args...)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "query failed")
+		return
+	}
+	defer rows.Close()
+
+	type reportRow struct {
 		ID         string   `json:"id"`
 		Slug       string   `json:"slug"`
-		Handle     string   `json:"handle"`
 		Name       string   `json:"name"`
 		ReportDate string   `json:"report_date"`
 		ReportTime *string  `json:"report_time,omitempty"`
@@ -438,10 +484,171 @@ func (h *ReportHandler) Get(w http.ResponseWriter, r *http.Request) {
 		Paddled    bool     `json:"paddled"`
 		FlowCFS    *float64 `json:"flow_cfs,omitempty"`
 		FlowBand   *string  `json:"flow_band,omitempty"`
-		AWsyncedAt *string  `json:"aw_synced_at,omitempty"`
 		CreatedAt  string   `json:"created_at"`
-		ReachName  string   `json:"reach_name"`
-		ReachSlug  string   `json:"reach_slug"`
+		Handle     *string  `json:"handle,omitempty"`
+		URL        string   `json:"url,omitempty"`
+	}
+
+	var reports []reportRow
+	for rows.Next() {
+		var rep reportRow
+		var createdAt time.Time
+		if err := rows.Scan(
+			&rep.ID, &rep.Slug, &rep.Name,
+			&rep.ReportDate, &rep.ReportTime,
+			&rep.Content, &rep.Paddled,
+			&rep.FlowCFS, &rep.FlowBand, &createdAt,
+			&rep.Handle,
+		); err != nil {
+			errorResponse(w, http.StatusInternalServerError, "scan failed")
+			return
+		}
+		rep.CreatedAt = createdAt.Format(time.RFC3339)
+		rep.URL = fmt.Sprintf("/reports/%s", rep.ID)
+		reports = append(reports, rep)
+	}
+	if reports == nil {
+		reports = []reportRow{}
+	}
+
+	var nextCursor *string
+	if len(reports) > limit {
+		reports = reports[:limit]
+		last := reports[len(reports)-1].ReportDate
+		nextCursor = &last
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"reports":     reports,
+		"next_cursor": nextCursor,
+	})
+}
+
+// ── GET /user-runs/{runId}/reports ───────────────────────────────────────────
+
+func (h *ReportHandler) ListByRunID(w http.ResponseWriter, r *http.Request) {
+	runID := chi.URLParam(r, "runId")
+	ctx := r.Context()
+
+	var userReachID string
+	if err := h.db.QueryRow(ctx,
+		`SELECT id FROM user_reaches WHERE id = $1 AND is_private = FALSE`, runID,
+	).Scan(&userReachID); err != nil {
+		errorResponse(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	const limit = 25
+	cursor := r.URL.Query().Get("cursor")
+
+	var (
+		query string
+		args  []any
+	)
+	if cursor != "" {
+		query = `
+			SELECT rp.id, rp.slug, rp.name, rp.report_date::TEXT, rp.report_time::TEXT,
+			       rp.content, rp.paddled,
+			       rp.flow_cfs, rp.flow_band, rp.created_at, up.handle
+			FROM reports rp
+			LEFT JOIN user_profiles up ON up.owner_id = rp.owner_id
+			WHERE rp.user_reach_id = $1 AND rp.report_date < $2::DATE
+			  AND rp.deleted_at IS NULL
+			ORDER BY rp.report_date DESC, rp.created_at DESC
+			LIMIT $3`
+		args = []any{userReachID, cursor, limit + 1}
+	} else {
+		query = `
+			SELECT rp.id, rp.slug, rp.name, rp.report_date::TEXT, rp.report_time::TEXT,
+			       rp.content, rp.paddled,
+			       rp.flow_cfs, rp.flow_band, rp.created_at, up.handle
+			FROM reports rp
+			LEFT JOIN user_profiles up ON up.owner_id = rp.owner_id
+			WHERE rp.user_reach_id = $1 AND rp.deleted_at IS NULL
+			ORDER BY rp.report_date DESC, rp.created_at DESC
+			LIMIT $2`
+		args = []any{userReachID, limit + 1}
+	}
+
+	rows, err := h.db.Query(ctx, query, args...)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "query failed")
+		return
+	}
+	defer rows.Close()
+
+	type reportRow struct {
+		ID         string   `json:"id"`
+		Slug       string   `json:"slug"`
+		Name       string   `json:"name"`
+		ReportDate string   `json:"report_date"`
+		ReportTime *string  `json:"report_time,omitempty"`
+		Content    string   `json:"content"`
+		Paddled    bool     `json:"paddled"`
+		FlowCFS    *float64 `json:"flow_cfs,omitempty"`
+		FlowBand   *string  `json:"flow_band,omitempty"`
+		CreatedAt  string   `json:"created_at"`
+		Handle     *string  `json:"handle,omitempty"`
+		URL        string   `json:"url,omitempty"`
+	}
+
+	var reports []reportRow
+	for rows.Next() {
+		var rep reportRow
+		var createdAt time.Time
+		if err := rows.Scan(
+			&rep.ID, &rep.Slug, &rep.Name,
+			&rep.ReportDate, &rep.ReportTime,
+			&rep.Content, &rep.Paddled,
+			&rep.FlowCFS, &rep.FlowBand, &createdAt,
+			&rep.Handle,
+		); err != nil {
+			errorResponse(w, http.StatusInternalServerError, "scan failed")
+			return
+		}
+		rep.CreatedAt = createdAt.Format(time.RFC3339)
+		rep.URL = fmt.Sprintf("/reports/%s", rep.ID)
+		reports = append(reports, rep)
+	}
+	if reports == nil {
+		reports = []reportRow{}
+	}
+
+	var nextCursor *string
+	if len(reports) > limit {
+		reports = reports[:limit]
+		last := reports[len(reports)-1].ReportDate
+		nextCursor = &last
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"reports":     reports,
+		"next_cursor": nextCursor,
+	})
+}
+
+// ── GET /reports/{handle}/{slug} ──────────────────────────────────────────────
+
+func (h *ReportHandler) Get(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	ctx := r.Context()
+
+	type detail struct {
+		ID             string   `json:"id"`
+		Slug           string   `json:"slug"`
+		Handle         string   `json:"handle"`
+		Name           string   `json:"name"`
+		ReportDate     string   `json:"report_date"`
+		ReportTime     *string  `json:"report_time,omitempty"`
+		Content        string   `json:"content"`
+		Paddled        bool     `json:"paddled"`
+		FlowCFS        *float64 `json:"flow_cfs,omitempty"`
+		FlowBand       *string  `json:"flow_band,omitempty"`
+		AWsyncedAt     *string  `json:"aw_synced_at,omitempty"`
+		CreatedAt      string   `json:"created_at"`
+		ReachName      string   `json:"reach_name"`
+		ReachSlug      string   `json:"reach_slug"`
+		IsUserRun      bool     `json:"is_user_run"`
 	}
 
 	var d detail
@@ -453,18 +660,20 @@ func (h *ReportHandler) Get(w http.ResponseWriter, r *http.Request) {
 			rp.name, rp.report_date::TEXT, rp.report_time::TEXT,
 			rp.content, rp.paddled,
 			rp.flow_cfs, rp.flow_band, rp.aw_synced_at, rp.created_at,
-			COALESCE(re.name, '') AS reach_name,
-			COALESCE(re.slug, '') AS reach_slug
+			COALESCE(re.name, ur.name, '')   AS reach_name,
+			COALESCE(re.slug, ur.slug, '')   AS reach_slug,
+			(rp.user_reach_id IS NOT NULL)   AS is_user_run
 		FROM reports rp
 		LEFT JOIN user_profiles up ON up.owner_id = rp.owner_id
-		JOIN reaches re ON re.id = rp.reach_id
-		WHERE rp.id = $1
+		LEFT JOIN reaches re ON re.id = rp.reach_id
+		LEFT JOIN user_reaches ur ON ur.id = rp.user_reach_id
+		WHERE rp.id = $1 AND rp.deleted_at IS NULL
 	`, id).Scan(
 		&d.ID, &d.Slug, &d.Handle,
 		&d.Name, &d.ReportDate, &d.ReportTime,
 		&d.Content, &d.Paddled,
 		&d.FlowCFS, &d.FlowBand, &awSyncedAt, &createdAt,
-		&d.ReachName, &d.ReachSlug,
+		&d.ReachName, &d.ReachSlug, &d.IsUserRun,
 	)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "report not found")
@@ -613,13 +822,14 @@ func (h *ReportHandler) ListMine(w http.ResponseWriter, r *http.Request) {
 			rp.name, rp.report_date::TEXT, rp.report_time::TEXT,
 			rp.content, rp.paddled,
 			rp.flow_cfs, rp.flow_band, rp.created_at,
-			COALESCE(re.name, '') AS reach_name,
-			COALESCE(re.slug, '') AS reach_slug,
+			COALESCE(re.name, ur.name, '') AS reach_name,
+			COALESCE(re.slug, ur.slug, '') AS reach_slug,
 			up.handle
 		FROM reports rp
-		JOIN reaches re ON re.id = rp.reach_id
+		LEFT JOIN reaches re ON re.id = rp.reach_id
+		LEFT JOIN user_reaches ur ON ur.id = rp.user_reach_id
 		LEFT JOIN user_profiles up ON up.owner_id = rp.owner_id
-		WHERE rp.owner_id = $1
+		WHERE rp.owner_id = $1 AND rp.deleted_at IS NULL
 		ORDER BY rp.report_date DESC, rp.created_at DESC
 		LIMIT 200
 	`, ownerID)
@@ -669,5 +879,98 @@ func (h *ReportHandler) ListMine(w http.ResponseWriter, r *http.Request) {
 		reports = []myReport{}
 	}
 	jsonResponse(w, http.StatusOK, reports)
+}
+
+// ── POST /api/v1/me/reaches/{slug}/reports ────────────────────────────────────
+// Creates a report against a user-created run (user_reaches table).
+// Any authenticated user may report on any user_reach.
+
+func (h *ReportHandler) CreateForUserReach(w http.ResponseWriter, r *http.Request) {
+	userReachSlug := chi.URLParam(r, "slug")
+
+	ownerID, ok := h.ownerID(r)
+	if !ok {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.rl.allow(ownerID, 5, time.Hour) {
+		errorResponse(w, http.StatusTooManyRequests, "rate limit: 5 reports per hour")
+		return
+	}
+
+	var body struct {
+		Name       string `json:"name"`
+		ReportDate string `json:"report_date"`
+		ReportTime string `json:"report_time"`
+		Content    string `json:"content"`
+		Paddled    bool   `json:"paddled"`
+		Slug       string `json:"slug"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		errorResponse(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if body.Name == "" {
+		errorResponse(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	if body.ReportDate == "" {
+		errorResponse(w, http.StatusBadRequest, "report_date is required")
+		return
+	}
+	if body.Content == "" {
+		errorResponse(w, http.StatusBadRequest, "content is required")
+		return
+	}
+
+	ctx := r.Context()
+
+	var userReachID string
+	if err := h.db.QueryRow(ctx,
+		`SELECT id FROM user_reaches WHERE slug = $1`, userReachSlug,
+	).Scan(&userReachID); err != nil {
+		errorResponse(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	email, _ := auth.EmailFromContext(ctx)
+	handle, err := h.ensureProfile(ctx, ownerID, email)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "could not assign user profile")
+		return
+	}
+
+	reportSlug := body.Slug
+	if reportSlug == "" {
+		reportSlug = userReachSlug + "-" + body.ReportDate
+	}
+	reportSlug = h.uniqueSlug(ctx, ownerID, reportSlug)
+
+	var reportTimeVal *string
+	if body.ReportTime != "" {
+		reportTimeVal = &body.ReportTime
+	}
+
+	var id string
+	err = h.db.QueryRow(ctx, `
+		INSERT INTO reports
+			(owner_id, slug, user_reach_id, name, report_date, report_time,
+			 content, paddled)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		RETURNING id
+	`,
+		ownerID, reportSlug, userReachID, body.Name, body.ReportDate, reportTimeVal,
+		body.Content, body.Paddled,
+	).Scan(&id)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("create failed: %v", err))
+		return
+	}
+
+	jsonResponse(w, http.StatusCreated, map[string]string{
+		"id":     id,
+		"slug":   reportSlug,
+		"handle": handle,
+	})
 }
 
