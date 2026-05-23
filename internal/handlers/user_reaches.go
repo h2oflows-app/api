@@ -124,6 +124,7 @@ type userReachSummary struct {
 	CustomGaugeName  *string    `json:"custom_gauge_name"`
 	LastReadAt       *time.Time `json:"last_reading_at"`
 	CreatedAt        time.Time  `json:"created_at"`
+	IsPrivate        bool       `json:"is_private"`
 }
 
 type userReachRapid struct {
@@ -340,7 +341,8 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			ur.primary_gauge_id::text AS gauge_id,
 			ur.custom_gauge_id::text AS custom_gauge_id,
 			cg.slug AS custom_gauge_slug,
-			cg.name AS custom_gauge_name
+			cg.name AS custom_gauge_name,
+			ur.is_private
 		FROM user_reaches ur
 		LEFT JOIN rivers rv ON rv.id = ur.river_id
 		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
@@ -379,6 +381,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			&s.CurrentCFS, &s.LastReadAt,
 			&s.FlowStatus, &s.FlowBand, &s.GaugeID,
 			&s.CustomGaugeID, &s.CustomGaugeSlug, &s.CustomGaugeName,
+			&s.IsPrivate,
 		); err == nil {
 			items = append(items, s)
 		}
@@ -433,7 +436,8 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 			fr.label AS flow_band,
 			rv.slug AS river_slug,
 			rv.state_abbr AS river_state_abbr,
-			rv.basin AS river_basin
+			rv.basin AS river_basin,
+			ur.is_private
 		FROM user_reaches ur
 		LEFT JOIN rivers rv ON rv.id = ur.river_id
 		LEFT JOIN gauges g ON g.id = ur.primary_gauge_id
@@ -466,6 +470,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 		&d.CurrentCFS, &d.LastReadAt,
 		&d.FlowStatus, &d.FlowBand,
 		&d.RiverSlug, &d.RiverStateAbbr, &d.RiverBasin,
+		&d.IsPrivate,
 	)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
@@ -569,6 +574,7 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Note      *string  `json:"note"`
 		ClassMin  *float64 `json:"class_min"`
 		ClassMax  *float64 `json:"class_max"`
+		IsPrivate bool     `json:"is_private"`
 		FlowRanges *struct {
 			Low     *bandRange `json:"low"`
 			Running *bandRange `json:"running"`
@@ -623,18 +629,18 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var reachID string
 	err := h.db.QueryRow(ctx, `
 		INSERT INTO user_reaches
-			(owner_id, slug, name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, class_min, class_max)
+			(owner_id, slug, name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, class_min, class_max, is_private)
 		VALUES
 			($1, $2, $3, $4, $5,
 			 ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography,
 			 ST_SetSRID(ST_MakePoint($8, $9), 4326)::geography,
-			 NULLIF($10,''), NULLIF($11,''), $12, $13, $14)
+			 NULLIF($10,''), NULLIF($11,''), $12, $13, $14, $15)
 		RETURNING id
 	`, ownerID, slug, body.Name, riverID, finalRiverName,
 		body.PutIn.Lng, body.PutIn.Lat,
 		body.TakeOut.Lng, body.TakeOut.Lat,
 		body.UpComID, body.DownComID, body.Note,
-		body.ClassMin, body.ClassMax,
+		body.ClassMin, body.ClassMax, body.IsPrivate,
 	).Scan(&reachID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("create failed: %v", err))
@@ -830,6 +836,7 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		DownComID *string  `json:"down_comid"`
 		ClassMin  *float64 `json:"class_min"`
 		ClassMax  *float64 `json:"class_max"`
+		IsPrivate *bool    `json:"is_private"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid JSON")
@@ -854,11 +861,13 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 			river_name = CASE WHEN $5 THEN $6 ELSE river_name END,
 			class_min  = CASE WHEN $7 THEN $8::numeric ELSE class_min END,
 			class_max  = CASE WHEN $9 THEN $10::numeric ELSE class_max END,
+			is_private = CASE WHEN $11 THEN $12 ELSE is_private END,
 			updated_at = NOW()
 		WHERE owner_id = $1 AND slug = $2
 	`, ownerID, slug, body.Name, body.Note, body.RiverName != nil, riverName,
 		body.ClassMin != nil, body.ClassMin,
-		body.ClassMax != nil, body.ClassMax)
+		body.ClassMax != nil, body.ClassMax,
+		body.IsPrivate != nil, body.IsPrivate)
 	if err != nil || tag.RowsAffected() == 0 {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
 		return
