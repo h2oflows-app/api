@@ -2,7 +2,7 @@
 
 Current state as of May 2026. Phase 1 (gauge dashboard + reach pages + AI assistant) is complete. Backend routes exist for trip reports, trips, contributions, and proximity events — the frontend for those is stub. Everything below is unbuilt or incomplete.
 
-**Status snapshot (2026-05-21):**
+**Status snapshot (2026-05-23):**
 - ✅ Phase 2 (2.1–2.6) — shipped 2026-05-06
 - ✅ Phase 2b (2b.1–2b.7) — shipped 2026-05-07
 - ✅ Repository restructure — completed 2026-05-13; live at `h2oflows-app/{api,web,docs}`
@@ -12,10 +12,12 @@ Current state as of May 2026. Phase 1 (gauge dashboard + reach pages + AI assist
 - ✅ **Phase 2d — Post-pre-pilot iteration (web#48 + api#11) — merged 2026-05-20.** Reach author parity (admin = user flow), per-dashboard prefs, gauge-map toggle, basin loading banner, user reach difficulty fields, reach-only watchlist path, theme-aware user reach line color.
 - ✅ **Dashboard UX polish — web#67/#68 — merged 2026-05-21.** Full view mode, sparkline full-width in comfortable/full, 12h/24h selector top-left, card consistency, mobile hides full-mode button.
 - ✅ **[web#16] 2c.4 PRs A/B/C — 30d retention, poll status UI, admin gauges page — shipped 2026-05-22** (api#14–19, web#69–71)
-- 🔧 **[web#16] 2c.4 PR D — Seasonal heartbeat + retire flow** (next)
+- ✅ **Umbrella A: UGC shift — merged 2026-05-23, tagged v0.4.0.** Runs rename, author model, fork, reports on user runs, features + KML import, community flow proposals + voting, clustering + dupe prevention, upvotes, anon read-only at `/runs/u/:id`, moderation primitives (abuse flags + admin queue).
+- ⏳ **LLM audit (PR 9 deferred)** — nightly Haiku scan of new UGC, auto-flags outliers into abuse queue. Add when UGC volume warrants it. See "Post-v0.4 backlog" below.
 - ⏳ Pilot rollout (0.x) — on hold per user
 - ⏳ Phase 3 — SEO infra (build behind noindex wall, flip robots.txt at 1.0 launch)
 - ⏳ Phase 4 — Public API + PATs + data export (expanded 2026-05-18; depends on pilot signal)
+- ⏳ Umbrella B — API v1 route split (`/public` + `/me` + `/internal`); target v0.5.0 post-UGC
 - ⏳ Phase 5 — American Whitewater interop (`reach-ingest-v1` schema drafted 2026-05-18)
 - ⏳ Phase 6+ — deferred
 
@@ -1179,6 +1181,24 @@ Repos can ship patches independently (`api@v0.2.1` for a poller fix without touc
 - **Netlify rebuild churn** during cutover — set up the new web repo's Netlify project with a placeholder before DNS flip, then move the domain once builds verify green
 - **Auth env drift** — check Supabase keys identical across web + docs + API (single source: a 1Password vault entry referenced by all three CI configs)
 - **Out-of-sync deploys** during a coordinated bump — release checklist in `RELEASES.md` enforces order: API first, web second, docs last (frontend can degrade gracefully behind a stale API; reverse is messier)
+
+---
+
+## Post-v0.4 backlog (deferred from UGC shift)
+
+### PR 9 — LLM nightly audit
+
+Scheduled Go job using Claude Haiku to auto-flag UGC outliers into the existing `abuse_flags` queue.
+
+**What it checks:** new `user_reaches` + `reports` from the past 24h that haven't been audited (`llm_audited_at IS NULL`). Prompt asks: profanity, seriously dangerous misinformation, off-topic content. Structured JSON response `{flag: bool, reason: string}`.
+
+**Implementation:**
+- Migration: add `llm_audited_at TIMESTAMPTZ` to `user_reaches` and `reports`
+- New `audit` package or handler with `RunAudit(ctx)` — called by cron scheduler in main.go
+- On flag: insert into `abuse_flags` with `reporter_id = 'system'`, feeds existing admin queue
+- Cost guard: cap 500 items/day at Haiku pricing (~$0.05/day ceiling)
+
+**When to add:** once daily active UGC exceeds ~20 new items/day and the manual queue becomes burdensome.
 
 ---
 
