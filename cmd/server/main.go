@@ -119,6 +119,7 @@ func main() {
 	flowProposals  := handlers.NewFlowProposalHandler(pool, devFallbackID)
 	cluster        := handlers.NewClusterHandler(pool, devFallbackID)
 	upvote         := handlers.NewUpvoteHandler(pool, devFallbackID)
+	moderation     := handlers.NewModerationHandler(pool, devFallbackID)
 	preferences   := handlers.NewPreferencesHandler(pool, devFallbackID)
 	profile       := handlers.NewProfileHandler(pool, devFallbackID)
 	dashboards    := handlers.NewDashboardHandler(pool, devFallbackID)
@@ -223,6 +224,8 @@ func main() {
 		r.Post("/user-runs/dupe-check", cluster.DupeCheck)
 		r.Get("/user-runs/{runId}/cluster", cluster.ClusterForRun)
 		r.Post("/user-runs/{runId}/upvote", upvote.Toggle)
+		r.Post("/user-runs/{runId}/flag", moderation.FlagRun)
+		r.Post("/reports/{reportId}/flag", moderation.FlagReport)
 		r.Post("/me/river-corrections", corrections.CreateRiverCorrection)
 
 		// Custom gauges — private to owner, auth gated via ownerID() + devFallbackID.
@@ -255,6 +258,9 @@ func main() {
 			r.Post("/admin/rivers/{riverSlug}/reorder-reaches", admin.ReorderReachesForRiver)
 			r.Get("/admin/river-corrections", corrections.ListRiverCorrections)
 			r.Patch("/admin/river-corrections/{id}", corrections.ReviewRiverCorrection)
+			r.Get("/admin/moderation/queue", moderation.Queue)
+			r.Post("/admin/moderation/flags/{flagId}/dismiss", moderation.Dismiss)
+			r.Post("/admin/moderation/flags/{flagId}/action", moderation.Action)
 			r.Get("/admin/gauges", admin.ListAdminGauges)
 			r.Post("/admin/gauges/{id}/poll", admin.PollAdminGauge)
 			r.Post("/admin/gauges/{id}/retire", admin.RetireAdminGauge)
