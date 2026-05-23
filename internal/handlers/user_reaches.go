@@ -164,6 +164,8 @@ type userReachDetail struct {
 	GaugeLastPollSuccess  *time.Time           `json:"gauge_last_poll_success_at"`
 	CustomGaugeID         *string              `json:"custom_gauge_id"`
 	CustomGaugeName       *string              `json:"custom_gauge_name"`
+	ForkedFromSlug  *string              `json:"forked_from_slug"`
+	ForkedFromName  *string              `json:"forked_from_name"`
 	FlowRanges            []userReachFlowRange  `json:"flow_ranges"`
 	Rapids                []userReachRapid      `json:"rapids"`
 	AccessPoints          []userReachAccessPoint `json:"access_points"`
@@ -437,11 +439,18 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 			rv.slug AS river_slug,
 			rv.state_abbr AS river_state_abbr,
 			rv.basin AS river_basin,
-			ur.is_private
+			ur.is_private,
+			COALESCE(fr_reach.slug, fr_ur.slug) AS forked_from_slug,
+			COALESCE(
+				COALESCE(fr_reach.common_name, fr_reach.name),
+				fr_ur.name
+			) AS forked_from_name
 		FROM user_reaches ur
 		LEFT JOIN rivers rv ON rv.id = ur.river_id
 		LEFT JOIN gauges g ON g.id = ur.primary_gauge_id
 		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
+		LEFT JOIN reaches fr_reach ON fr_reach.id = ur.forked_from_reach_id
+		LEFT JOIN user_reaches fr_ur ON fr_ur.id = ur.forked_from_user_reach_id
 		LEFT JOIN LATERAL (
 			SELECT value, timestamp FROM gauge_readings
 			WHERE gauge_id = ur.primary_gauge_id
@@ -471,6 +480,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 		&d.FlowStatus, &d.FlowBand,
 		&d.RiverSlug, &d.RiverStateAbbr, &d.RiverBasin,
 		&d.IsPrivate,
+		&d.ForkedFromSlug, &d.ForkedFromName,
 	)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
@@ -1214,4 +1224,122 @@ func (h *UserReachHandler) ImportKML(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResponse(w, http.StatusOK, res)
+}
+
+// ── Fork ─────────────────────────────────────────────────────────────────────
+
+// POST /api/v1/me/reaches/fork-reach/{slug}
+// Clones a curated reach (reaches table) into a new user_reaches row owned by
+// the authenticated user. Copies name, geometry, centerline, class, and gauge.
+func (h *UserReachHandler) ForkReach(w http.ResponseWriter, r *http.Request) {
+	ownerID, ok := h.ownerID(r)
+	if !ok {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	sourceSlug := chi.URLParam(r, "slug")
+	ctx := r.Context()
+
+	// Load the source curated reach.
+	type srcRow struct {
+		ID          string
+		Name        string
+		CommonName  *string
+		RiverID     *string
+		RiverName   *string
+		ClassMin    *float64
+		ClassMax    *float64
+		GaugeID     *string
+		PutInLng    float64
+		PutInLat    float64
+		TakeOutLng  float64
+		TakeOutLat  float64
+		Centerline  []byte
+	}
+	var src srcRow
+	err := h.db.QueryRow(ctx, `
+		SELECT
+			r.id,
+			r.name,
+			r.common_name,
+			r.river_id::text,
+			COALESCE(r.river_name, rv.name),
+			r.class_min,
+			r.class_max,
+			r.primary_gauge_id::text,
+			ST_X(r.start_point::geometry),
+			ST_Y(r.start_point::geometry),
+			ST_X(r.end_point::geometry),
+			ST_Y(r.end_point::geometry),
+			ST_AsGeoJSON(r.centerline::geometry)
+		FROM reaches r
+		LEFT JOIN rivers rv ON rv.id = r.river_id
+		WHERE r.slug = $1
+	`, sourceSlug).Scan(
+		&src.ID, &src.Name, &src.CommonName,
+		&src.RiverID, &src.RiverName,
+		&src.ClassMin, &src.ClassMax,
+		&src.GaugeID,
+		&src.PutInLng, &src.PutInLat,
+		&src.TakeOutLng, &src.TakeOutLat,
+		&src.Centerline,
+	)
+	if err != nil {
+		errorResponse(w, http.StatusNotFound, "reach not found")
+		return
+	}
+
+	// Use common_name as the fork's display name if available.
+	forkName := src.Name
+	if src.CommonName != nil && *src.CommonName != "" {
+		forkName = *src.CommonName
+	}
+
+	// Unique slug for the fork (append owner suffix then counter).
+	baseSlug := kmlimport.Slugify(forkName)
+	slug := baseSlug
+	for i := 2; i <= 20; i++ {
+		var existing string
+		if e := h.db.QueryRow(ctx,
+			`SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2`, ownerID, slug,
+		).Scan(&existing); e != nil {
+			break
+		}
+		slug = fmt.Sprintf("%s-%d", baseSlug, i)
+	}
+
+	var newID string
+	if err = h.db.QueryRow(ctx, `
+		INSERT INTO user_reaches
+			(owner_id, slug, name, river_id, river_name,
+			 put_in, take_out,
+			 class_min, class_max, primary_gauge_id,
+			 forked_from_reach_id)
+		VALUES
+			($1, $2, $3, $4::uuid, $5,
+			 ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography,
+			 ST_SetSRID(ST_MakePoint($8, $9), 4326)::geography,
+			 $10, $11, $12::uuid,
+			 $13::uuid)
+		RETURNING id
+	`, ownerID, slug, forkName, src.RiverID, src.RiverName,
+		src.PutInLng, src.PutInLat,
+		src.TakeOutLng, src.TakeOutLat,
+		src.ClassMin, src.ClassMax, src.GaugeID,
+		src.ID,
+	).Scan(&newID); err != nil {
+		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("fork failed: %v", err))
+		return
+	}
+
+	// Copy centerline if source has one.
+	if len(src.Centerline) > 0 {
+		_, _ = h.db.Exec(ctx, `
+			UPDATE user_reaches
+			SET centerline = ST_GeomFromGeoJSON($2)::geography
+			WHERE id = $1
+		`, newID, string(src.Centerline))
+	}
+
+	jsonResponse(w, http.StatusCreated, map[string]string{"id": newID, "slug": slug})
 }
