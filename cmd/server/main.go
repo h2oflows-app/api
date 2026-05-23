@@ -207,6 +207,7 @@ func main() {
 		r.Put("/me/reaches/{slug}/gauge", userReaches.SetGauge)
 		r.Delete("/me/reaches/{slug}/gauge", userReaches.ClearGauge)
 		r.Post("/me/reaches/{slug}/kml", userReaches.ImportKML)
+		r.Post("/me/reaches/fork-reach/{slug}", userReaches.ForkReach)
 		r.Post("/me/river-corrections", corrections.CreateRiverCorrection)
 
 		// Custom gauges — private to owner, auth gated via ownerID() + devFallbackID.
