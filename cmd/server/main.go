@@ -115,7 +115,8 @@ func main() {
 	reaches.StartCacheRefresh(pollerCtx, pollInterval.USGS)
 	trips         := handlers.NewTripHandler(pool, describer)
 	contributions := handlers.NewContributionHandler(pool)
-	reports       := handlers.NewReportHandler(pool, devFallbackID)
+	reports        := handlers.NewReportHandler(pool, devFallbackID)
+	flowProposals  := handlers.NewFlowProposalHandler(pool, devFallbackID)
 	preferences   := handlers.NewPreferencesHandler(pool, devFallbackID)
 	profile       := handlers.NewProfileHandler(pool, devFallbackID)
 	dashboards    := handlers.NewDashboardHandler(pool, devFallbackID)
@@ -210,6 +211,11 @@ func main() {
 		r.Post("/me/reaches/fork-reach/{slug}", userReaches.ForkReach)
 		r.Post("/me/reaches/{slug}/reports", reports.CreateForUserReach)
 		r.Get("/me/reaches/{slug}/reports", reports.ListByUserReach)
+		r.Get("/me/reaches/{slug}/flow-proposals", flowProposals.ListForOwnRun)
+		r.Post("/me/reaches/{slug}/flow-proposals", flowProposals.UpsertForOwnRun)
+		r.Post("/flow-proposals/{proposalId}/vote", flowProposals.ToggleVote)
+		r.Get("/user-runs/{runId}/flow-proposals", flowProposals.ListByRunID)
+		r.Post("/user-runs/{runId}/flow-proposals", flowProposals.UpsertByRunID)
 		r.Post("/me/river-corrections", corrections.CreateRiverCorrection)
 
 		// Custom gauges — private to owner, auth gated via ownerID() + devFallbackID.
