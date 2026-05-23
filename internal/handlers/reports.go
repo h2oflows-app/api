@@ -524,6 +524,109 @@ func (h *ReportHandler) ListByUserReach(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+// ── GET /user-runs/{runId}/reports ───────────────────────────────────────────
+
+func (h *ReportHandler) ListByRunID(w http.ResponseWriter, r *http.Request) {
+	runID := chi.URLParam(r, "runId")
+	ctx := r.Context()
+
+	var userReachID string
+	if err := h.db.QueryRow(ctx,
+		`SELECT id FROM user_reaches WHERE id = $1 AND is_private = FALSE`, runID,
+	).Scan(&userReachID); err != nil {
+		errorResponse(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	const limit = 25
+	cursor := r.URL.Query().Get("cursor")
+
+	var (
+		query string
+		args  []any
+	)
+	if cursor != "" {
+		query = `
+			SELECT rp.id, rp.slug, rp.name, rp.report_date::TEXT, rp.report_time::TEXT,
+			       rp.content, rp.paddled,
+			       rp.flow_cfs, rp.flow_band, rp.created_at, up.handle
+			FROM reports rp
+			LEFT JOIN user_profiles up ON up.owner_id = rp.owner_id
+			WHERE rp.user_reach_id = $1 AND rp.report_date < $2::DATE
+			  AND rp.deleted_at IS NULL
+			ORDER BY rp.report_date DESC, rp.created_at DESC
+			LIMIT $3`
+		args = []any{userReachID, cursor, limit + 1}
+	} else {
+		query = `
+			SELECT rp.id, rp.slug, rp.name, rp.report_date::TEXT, rp.report_time::TEXT,
+			       rp.content, rp.paddled,
+			       rp.flow_cfs, rp.flow_band, rp.created_at, up.handle
+			FROM reports rp
+			LEFT JOIN user_profiles up ON up.owner_id = rp.owner_id
+			WHERE rp.user_reach_id = $1 AND rp.deleted_at IS NULL
+			ORDER BY rp.report_date DESC, rp.created_at DESC
+			LIMIT $2`
+		args = []any{userReachID, limit + 1}
+	}
+
+	rows, err := h.db.Query(ctx, query, args...)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "query failed")
+		return
+	}
+	defer rows.Close()
+
+	type reportRow struct {
+		ID         string   `json:"id"`
+		Slug       string   `json:"slug"`
+		Name       string   `json:"name"`
+		ReportDate string   `json:"report_date"`
+		ReportTime *string  `json:"report_time,omitempty"`
+		Content    string   `json:"content"`
+		Paddled    bool     `json:"paddled"`
+		FlowCFS    *float64 `json:"flow_cfs,omitempty"`
+		FlowBand   *string  `json:"flow_band,omitempty"`
+		CreatedAt  string   `json:"created_at"`
+		Handle     *string  `json:"handle,omitempty"`
+		URL        string   `json:"url,omitempty"`
+	}
+
+	var reports []reportRow
+	for rows.Next() {
+		var rep reportRow
+		var createdAt time.Time
+		if err := rows.Scan(
+			&rep.ID, &rep.Slug, &rep.Name,
+			&rep.ReportDate, &rep.ReportTime,
+			&rep.Content, &rep.Paddled,
+			&rep.FlowCFS, &rep.FlowBand, &createdAt,
+			&rep.Handle,
+		); err != nil {
+			errorResponse(w, http.StatusInternalServerError, "scan failed")
+			return
+		}
+		rep.CreatedAt = createdAt.Format(time.RFC3339)
+		rep.URL = fmt.Sprintf("/reports/%s", rep.ID)
+		reports = append(reports, rep)
+	}
+	if reports == nil {
+		reports = []reportRow{}
+	}
+
+	var nextCursor *string
+	if len(reports) > limit {
+		reports = reports[:limit]
+		last := reports[len(reports)-1].ReportDate
+		nextCursor = &last
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"reports":     reports,
+		"next_cursor": nextCursor,
+	})
+}
+
 // ── GET /reports/{handle}/{slug} ──────────────────────────────────────────────
 
 func (h *ReportHandler) Get(w http.ResponseWriter, r *http.Request) {

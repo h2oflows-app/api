@@ -125,6 +125,8 @@ type userReachSummary struct {
 	LastReadAt       *time.Time `json:"last_reading_at"`
 	CreatedAt        time.Time  `json:"created_at"`
 	IsPrivate        bool       `json:"is_private"`
+	AuthorHandle     *string    `json:"author_handle"`
+	IsOfficial       bool       `json:"is_official"`
 }
 
 type userReachRapid struct {
@@ -557,6 +559,177 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 	// Upvotes
 	_ = h.db.QueryRow(r.Context(), `SELECT COUNT(*) FROM run_upvotes WHERE user_reach_id = $1`, d.ID).Scan(&d.UpvoteCount)
 	_ = h.db.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM run_upvotes WHERE user_reach_id = $1 AND user_id = $2)`, d.ID, ownerID).Scan(&d.UserUpvoted)
+
+	jsonResponse(w, http.StatusOK, d)
+}
+
+// ── GetPublic ─────────────────────────────────────────────────────────────────
+
+// GET /api/v1/user-runs/{runId}
+// Public: returns detail for any non-private user reach by UUID.
+// Auth optional — when present, populates user_upvoted.
+func (h *UserReachHandler) GetPublic(w http.ResponseWriter, r *http.Request) {
+	runID := chi.URLParam(r, "runId")
+	callerID, _ := h.ownerID(r) // optional
+
+	var d userReachDetail
+	var geojsonBytes []byte
+	var authorID string
+
+	err := h.db.QueryRow(r.Context(), `
+		SELECT
+			ur.id, ur.slug, ur.name, ur.river_name,
+			ST_X(ur.put_in::geometry)    AS put_in_lng,
+			ST_Y(ur.put_in::geometry)    AS put_in_lat,
+			ST_X(ur.take_out::geometry)  AS take_out_lng,
+			ST_Y(ur.take_out::geometry)  AS take_out_lat,
+			ur.note, ur.created_at,
+			ur.class_min, ur.class_max,
+			ur.up_comid, ur.down_comid,
+			CASE WHEN ur.centerline IS NOT NULL
+			     THEN ST_AsGeoJSON(ur.centerline::geometry)
+			     ELSE NULL END,
+			ur.primary_gauge_id::text,
+			g.name AS gauge_name,
+			g.source AS gauge_source,
+			g.external_id AS gauge_external_id,
+			g.poll_health AS gauge_poll_health,
+			g.last_poll_success_at,
+			ur.custom_gauge_id::text,
+			cg.name AS custom_gauge_name,
+			COALESCE(lr.value, cg.last_value_cfs) AS current_cfs,
+			COALESCE(lr.timestamp, cg.last_value_at) AS last_reading_at,
+			CASE
+				WHEN COALESCE(lr.value, cg.last_value_cfs) IS NULL OR fr.label IS NULL THEN 'unknown'
+				WHEN fr.label = 'running' THEN 'runnable'
+				WHEN fr.label = 'low'     THEN 'caution'
+				WHEN fr.label = 'high'    THEN 'flood'
+				ELSE 'unknown'
+			END AS flow_status,
+			fr.label AS flow_band,
+			rv.slug AS river_slug,
+			rv.state_abbr AS river_state_abbr,
+			rv.basin AS river_basin,
+			ur.is_private,
+			COALESCE(fr_reach.slug, fr_ur.slug) AS forked_from_slug,
+			COALESCE(
+				COALESCE(fr_reach.common_name, fr_reach.name),
+				fr_ur.name
+			) AS forked_from_name,
+			ur.owner_id,
+			up.handle AS author_handle
+		FROM user_reaches ur
+		LEFT JOIN rivers rv ON rv.id = ur.river_id
+		LEFT JOIN gauges g ON g.id = ur.primary_gauge_id
+		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
+		LEFT JOIN reaches fr_reach ON fr_reach.id = ur.forked_from_reach_id
+		LEFT JOIN user_reaches fr_ur ON fr_ur.id = ur.forked_from_user_reach_id
+		LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
+		LEFT JOIN LATERAL (
+			SELECT value, timestamp FROM gauge_readings
+			WHERE gauge_id = ur.primary_gauge_id
+			  AND timestamp > NOW() - INTERVAL '48 hours'
+			ORDER BY timestamp DESC LIMIT 1
+		) lr ON TRUE
+		LEFT JOIN LATERAL (
+			SELECT label FROM user_reach_flow_ranges
+			WHERE user_reach_id = ur.id
+			  AND (min_value IS NULL OR COALESCE(lr.value, cg.last_value_cfs) >= min_value)
+			  AND (max_value IS NULL OR COALESCE(lr.value, cg.last_value_cfs) <  max_value)
+			ORDER BY min_value ASC NULLS FIRST
+			LIMIT 1
+		) fr ON TRUE
+		WHERE ur.id = $1 AND ur.is_private = FALSE
+	`, runID).Scan(
+		&d.ID, &d.Slug, &d.Name, &d.RiverName,
+		&d.PutInLng, &d.PutInLat, &d.TakeOutLng, &d.TakeOutLat,
+		&d.Note, &d.CreatedAt,
+		&d.ClassMin, &d.ClassMax,
+		&d.UpComID, &d.DownComID,
+		&geojsonBytes,
+		&d.GaugeID, &d.GaugeName, &d.GaugeSource, &d.GaugeExternalID,
+		&d.GaugePollHealth, &d.GaugeLastPollSuccess,
+		&d.CustomGaugeID, &d.CustomGaugeName,
+		&d.CurrentCFS, &d.LastReadAt,
+		&d.FlowStatus, &d.FlowBand,
+		&d.RiverSlug, &d.RiverStateAbbr, &d.RiverBasin,
+		&d.IsPrivate,
+		&d.ForkedFromSlug, &d.ForkedFromName,
+		&authorID, &d.AuthorHandle,
+	)
+	if err != nil {
+		errorResponse(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	d.IsOfficial = (d.AuthorHandle == nil)
+
+	if geojsonBytes != nil {
+		raw := json.RawMessage(geojsonBytes)
+		d.Centerline = &raw
+	}
+
+	// Flow ranges
+	frRows, _ := h.db.Query(r.Context(), `
+		SELECT label, min_value, max_value
+		FROM user_reach_flow_ranges
+		WHERE user_reach_id = $1
+		ORDER BY min_value ASC NULLS FIRST
+	`, d.ID)
+	if frRows != nil {
+		defer frRows.Close()
+		d.FlowRanges = make([]userReachFlowRange, 0)
+		for frRows.Next() {
+			var fr userReachFlowRange
+			if frRows.Scan(&fr.Label, &fr.MinValue, &fr.MaxValue) == nil {
+				d.FlowRanges = append(d.FlowRanges, fr)
+			}
+		}
+	}
+
+	// Rapids
+	d.Rapids = make([]userReachRapid, 0)
+	rapRows, _ := h.db.Query(r.Context(), `
+		SELECT id, name, description, class_rating,
+		       is_surf_wave, is_permanent_hazard, hazard_type,
+		       ST_X(location::geometry), ST_Y(location::geometry)
+		FROM rapids WHERE user_reach_id = $1 ORDER BY name
+	`, d.ID)
+	if rapRows != nil {
+		defer rapRows.Close()
+		for rapRows.Next() {
+			var rr userReachRapid
+			if rapRows.Scan(&rr.ID, &rr.Name, &rr.Description, &rr.ClassRating,
+				&rr.IsSurfWave, &rr.IsPermanentHazard, &rr.HazardType,
+				&rr.Lng, &rr.Lat) == nil {
+				d.Rapids = append(d.Rapids, rr)
+			}
+		}
+	}
+
+	// Access points
+	d.AccessPoints = make([]userReachAccessPoint, 0)
+	apRows, _ := h.db.Query(r.Context(), `
+		SELECT id, access_type, name, notes,
+		       ST_X(location::geometry), ST_Y(location::geometry)
+		FROM reach_access WHERE user_reach_id = $1 ORDER BY access_type, name
+	`, d.ID)
+	if apRows != nil {
+		defer apRows.Close()
+		for apRows.Next() {
+			var ap userReachAccessPoint
+			if apRows.Scan(&ap.ID, &ap.AccessType, &ap.Name, &ap.Notes,
+				&ap.Lng, &ap.Lat) == nil {
+				d.AccessPoints = append(d.AccessPoints, ap)
+			}
+		}
+	}
+
+	// Upvotes
+	_ = h.db.QueryRow(r.Context(), `SELECT COUNT(*) FROM run_upvotes WHERE user_reach_id = $1`, d.ID).Scan(&d.UpvoteCount)
+	if callerID != "" {
+		_ = h.db.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM run_upvotes WHERE user_reach_id = $1 AND user_id = $2)`, d.ID, callerID).Scan(&d.UserUpvoted)
+	}
 
 	jsonResponse(w, http.StatusOK, d)
 }
