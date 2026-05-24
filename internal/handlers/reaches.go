@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
 	"github.com/h2oflow/h2oflow/apps/api/internal/ai"
 	"github.com/h2oflow/h2oflow/apps/api/internal/elevation"
 	"github.com/h2oflow/h2oflow/apps/api/internal/kmlimport"
@@ -657,6 +658,8 @@ func (h *ReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ---- Reach + gauge info -------------------------------------------------
+	userID, _ := auth.UserIDFromContext(r.Context())
+
 	var reach reachDetail
 	var reachAuthorID *string
 	err := h.db.QueryRow(r.Context(), `
@@ -723,15 +726,34 @@ func (h *ReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 			ORDER BY timestamp DESC LIMIT 1
 		) lr ON TRUE
 		LEFT JOIN LATERAL (
-			SELECT label FROM flow_ranges
-			WHERE reach_id = r.id
-			  AND (min_value IS NULL OR lr.value >= min_value)
+			WITH eff AS (
+				SELECT label, min_value, max_value
+				FROM flow_ranges
+				WHERE reach_id = r.id
+				  AND NOT EXISTS (
+				      SELECT 1 FROM reach_flow_band_overrides
+				      WHERE reach_id = r.id AND user_id = $2)
+				UNION ALL
+				SELECT 'low'::text, NULL::numeric, o.low_max
+				  FROM reach_flow_band_overrides o
+				  WHERE o.reach_id = r.id AND o.user_id = $2 AND o.low_max IS NOT NULL
+				UNION ALL
+				SELECT 'running'::text, o.running_min, o.running_max
+				  FROM reach_flow_band_overrides o
+				  WHERE o.reach_id = r.id AND o.user_id = $2
+				UNION ALL
+				SELECT 'high'::text, o.high_min, NULL::numeric
+				  FROM reach_flow_band_overrides o
+				  WHERE o.reach_id = r.id AND o.user_id = $2 AND o.high_min IS NOT NULL
+			)
+			SELECT label FROM eff
+			WHERE (min_value IS NULL OR lr.value >= min_value)
 			  AND (max_value IS NULL OR lr.value <  max_value)
 			ORDER BY min_value ASC NULLS FIRST
 			LIMIT 1
 		) fr ON TRUE
 		WHERE r.slug = $1
-	`, slug).Scan(
+	`, slug, userID).Scan(
 		&reach.ID, &reach.Slug, &reach.Name, &reach.Region,
 		&reach.ClassMin, &reach.ClassMax, &reach.ClassHardest, &reach.Character, &reach.LengthMi,
 		&reach.GradientFPM, &reach.Description, &reach.DescriptionSource,

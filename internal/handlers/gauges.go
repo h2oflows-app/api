@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
 	"github.com/h2oflow/h2oflow/apps/api/internal/ai"
 	"github.com/h2oflow/h2oflow/apps/api/internal/poller"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -712,6 +713,8 @@ func (h *GaugeHandler) BatchPost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaugeIDs, reachSlugs []string) {
+	userID, _ := auth.UserIDFromContext(r.Context())
+
 	// ctx CTE: one row per requested (gauge_id, reach_slug) pair.
 	// NULLIF converts "" back to NULL so SQL COALESCE logic works correctly.
 	rows, err := h.db.Query(r.Context(), `
@@ -796,26 +799,69 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			LIMIT 1
 		) ctx_reach ON TRUE
 		LEFT JOIN LATERAL (
-			SELECT fr.label,
+			SELECT eff.label,
 			       CASE
-			           WHEN fr.label = 'running' THEN 'runnable'
-			           WHEN fr.label = 'low'     THEN 'caution'
-			           WHEN fr.label = 'high'    THEN 'flood'
+			           WHEN eff.label = 'running' THEN 'runnable'
+			           WHEN eff.label = 'low'     THEN 'caution'
+			           WHEN eff.label = 'high'    THEN 'flood'
 			           ELSE 'unknown'
 			       END AS flow_status
-			FROM flow_ranges fr
-			JOIN reaches rch ON rch.id = fr.reach_id
-			WHERE rch.primary_gauge_id = g.id
-			  AND rch.slug = COALESCE(
-			      ctx.reach_slug,
-			      (SELECT slug FROM reaches WHERE primary_gauge_id = g.id ORDER BY slug LIMIT 1)
-			  )
-			  AND (fr.min_value IS NULL OR g.current_cfs >= fr.min_value)
-			  AND (fr.max_value IS NULL OR g.current_cfs < fr.max_value)
-			ORDER BY fr.min_value ASC NULLS FIRST, fr.max_value ASC NULLS LAST
+			FROM (
+				SELECT fr.label, fr.min_value, fr.max_value
+				FROM flow_ranges fr
+				JOIN reaches rch ON rch.id = fr.reach_id
+				WHERE rch.primary_gauge_id = g.id
+				  AND rch.slug = COALESCE(
+				      ctx.reach_slug,
+				      (SELECT slug FROM reaches WHERE primary_gauge_id = g.id ORDER BY slug LIMIT 1)
+				  )
+				  AND NOT EXISTS (
+				      SELECT 1 FROM reach_flow_band_overrides o2
+				      JOIN reaches rch2 ON rch2.id = o2.reach_id
+				      WHERE rch2.primary_gauge_id = g.id
+				        AND rch2.slug = COALESCE(
+				            ctx.reach_slug,
+				            (SELECT slug FROM reaches WHERE primary_gauge_id = g.id ORDER BY slug LIMIT 1)
+				        )
+				        AND o2.user_id = $3
+				  )
+				UNION ALL
+				SELECT 'low'::text, NULL::numeric, o.low_max
+				  FROM reach_flow_band_overrides o
+				  JOIN reaches rch ON rch.id = o.reach_id
+				  WHERE rch.primary_gauge_id = g.id
+				    AND rch.slug = COALESCE(
+				        ctx.reach_slug,
+				        (SELECT slug FROM reaches WHERE primary_gauge_id = g.id ORDER BY slug LIMIT 1)
+				    )
+				    AND o.user_id = $3 AND o.low_max IS NOT NULL
+				UNION ALL
+				SELECT 'running'::text, o.running_min, o.running_max
+				  FROM reach_flow_band_overrides o
+				  JOIN reaches rch ON rch.id = o.reach_id
+				  WHERE rch.primary_gauge_id = g.id
+				    AND rch.slug = COALESCE(
+				        ctx.reach_slug,
+				        (SELECT slug FROM reaches WHERE primary_gauge_id = g.id ORDER BY slug LIMIT 1)
+				    )
+				    AND o.user_id = $3
+				UNION ALL
+				SELECT 'high'::text, o.high_min, NULL::numeric
+				  FROM reach_flow_band_overrides o
+				  JOIN reaches rch ON rch.id = o.reach_id
+				  WHERE rch.primary_gauge_id = g.id
+				    AND rch.slug = COALESCE(
+				        ctx.reach_slug,
+				        (SELECT slug FROM reaches WHERE primary_gauge_id = g.id ORDER BY slug LIMIT 1)
+				    )
+				    AND o.user_id = $3 AND o.high_min IS NOT NULL
+			) eff
+			WHERE (eff.min_value IS NULL OR g.current_cfs >= eff.min_value)
+			  AND (eff.max_value IS NULL OR g.current_cfs <  eff.max_value)
+			ORDER BY eff.min_value ASC NULLS FIRST, eff.max_value ASC NULLS LAST
 			LIMIT 1
 		) fr_band ON TRUE
-	`, gaugeIDs, reachSlugs)
+	`, gaugeIDs, reachSlugs, userID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
 		return
