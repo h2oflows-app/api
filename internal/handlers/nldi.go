@@ -413,6 +413,7 @@ func (h *NLDIHandler) NearbyGauges(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		stations, err := nldi.DWRNearby(ctx, lat, lng, distanceKm)
 		if err != nil {
+			log.Printf("NearbyGauges: DWR error lat=%.4f lng=%.4f: %v", lat, lng, err)
 			dwrCh <- result{err: err}
 			return
 		}
