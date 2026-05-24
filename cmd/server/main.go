@@ -116,7 +116,8 @@ func main() {
 	trips         := handlers.NewTripHandler(pool, describer)
 	contributions := handlers.NewContributionHandler(pool)
 	reports        := handlers.NewReportHandler(pool, devFallbackID)
-	flowProposals  := handlers.NewFlowProposalHandler(pool, devFallbackID)
+	flowProposals      := handlers.NewFlowProposalHandler(pool, devFallbackID)
+	flowBandOverrides  := handlers.NewFlowBandOverrideHandler(pool, devFallbackID)
 	cluster        := handlers.NewClusterHandler(pool, devFallbackID)
 	upvote         := handlers.NewUpvoteHandler(pool, devFallbackID)
 	moderation     := handlers.NewModerationHandler(pool, devFallbackID)
@@ -216,6 +217,9 @@ func main() {
 		r.Get("/me/reaches/{slug}/reports", reports.ListByUserReach)
 		r.Get("/me/reaches/{slug}/flow-proposals", flowProposals.ListForOwnRun)
 		r.Post("/me/reaches/{slug}/flow-proposals", flowProposals.UpsertForOwnRun)
+		r.Get("/me/reaches/{slug}/flow-band-override",    flowBandOverrides.GetOwn)
+		r.Put("/me/reaches/{slug}/flow-band-override",    flowBandOverrides.UpsertOwn)
+		r.Delete("/me/reaches/{slug}/flow-band-override", flowBandOverrides.DeleteOwn)
 
 		// /me/runs/{slug} — user-facing aliases for /me/reaches/{slug}
 		r.Get("/me/runs", userReaches.List)
@@ -237,7 +241,6 @@ func main() {
 		r.Get("/me/runs/{slug}/reports", reports.ListByUserReach)
 		r.Get("/me/runs/{slug}/flow-proposals", flowProposals.ListForOwnRun)
 		r.Post("/me/runs/{slug}/flow-proposals", flowProposals.UpsertForOwnRun)
-
 		r.Post("/flow-proposals/{proposalId}/vote", flowProposals.ToggleVote)
 		r.Get("/user-runs/{runId}/flow-proposals", flowProposals.ListByRunID)
 		r.Post("/user-runs/{runId}/flow-proposals", flowProposals.UpsertByRunID)
@@ -304,6 +307,9 @@ func main() {
 			r.Put("/admin/reaches/{slug}/meta", nldiH.UpdateReachMeta)
 			r.Post("/admin/reaches/{slug}/nldi-centerline", nldiH.UpdateReachCenterline)
 			r.Post("/admin/reaches/{slug}/nldi-centerline-by-comid", nldiH.UpdateReachCenterlineByComID)
+			r.Get("/admin/reaches/flow-band-override-queue",      flowBandOverrides.AdminQueue)
+			r.Get("/admin/reaches/{slug}/flow-band-overrides",    flowBandOverrides.AdminListForReach)
+			r.Post("/admin/reaches/{slug}/apply-override-median", flowBandOverrides.AdminApplyMedian)
 		})
 
 		// Site admin only — role management.
