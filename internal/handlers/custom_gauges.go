@@ -703,7 +703,7 @@ func (h *CustomGaugeHandler) Readings(w http.ResponseWriter, r *http.Request) {
 		GROUP BY bucket
 		HAVING COUNT(DISTINCT gauge_id) = (SELECT COUNT(*) FROM inputs)
 		ORDER BY bucket DESC
-		LIMIT 500
+		LIMIT 750
 	`, slug, ownerID, fmt.Sprintf("%d seconds", int(window.Seconds())))
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
