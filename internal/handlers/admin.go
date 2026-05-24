@@ -352,12 +352,42 @@ func (h *AdminHandler) AutoAssignRiver(w http.ResponseWriter, r *http.Request) {
 			`SELECT id, name, slug, gnis_id FROM rivers WHERE lower(name) = lower($1) LIMIT 1`,
 			body.RiverName).Scan(&riverID, &riverName, &riverSlugOut, &riverGnisID)
 	}
+	// When no GNIS ID from client, try a name-based NHD lookup as fallback.
+	// A unique match (exactly 1 result) is safe to use; ambiguous = skip.
+	if body.GnisID == "" {
+		if results, err := nldi.NHDLookupByName(ctx, body.RiverName); err == nil && len(results) == 1 {
+			body.GnisID = results[0].GnisID
+		}
+	}
+
 	if riverID != "" {
-		// River exists — backfill gnis_id if we now have one and it was missing.
-		if body.GnisID != "" && riverGnisID == nil {
-			_, _ = h.db.Exec(ctx, `UPDATE rivers SET gnis_id = $1 WHERE id = $2`, body.GnisID, riverID)
-			g := body.GnisID
-			riverGnisID = &g
+		// River exists — backfill gnis_id and geo metadata when missing.
+		gnisForMeta := body.GnisID
+		if gnisForMeta == "" && riverGnisID != nil {
+			gnisForMeta = *riverGnisID
+		}
+		if gnisForMeta != "" {
+			var existingState *string
+			_ = h.db.QueryRow(ctx, `SELECT state_abbr FROM rivers WHERE id = $1`, riverID).Scan(&existingState)
+			if existingState == nil {
+				stateAbbr, basin, huc8 := riverMetaFromGNIS(ctx, gnisForMeta)
+				_, _ = h.db.Exec(ctx, `
+					UPDATE rivers SET
+						gnis_id    = COALESCE(gnis_id,    $2),
+						state_abbr = COALESCE(state_abbr, NULLIF($3,'')),
+						basin      = COALESCE(basin,      NULLIF($4,'')),
+						huc8       = COALESCE(huc8,       NULLIF($5,''))
+					WHERE id = $1
+				`, riverID, gnisForMeta, stateAbbr, basin, huc8)
+				if riverGnisID == nil {
+					g := gnisForMeta
+					riverGnisID = &g
+				}
+			} else if riverGnisID == nil && body.GnisID != "" {
+				_, _ = h.db.Exec(ctx, `UPDATE rivers SET gnis_id = $1 WHERE id = $2`, body.GnisID, riverID)
+				g := body.GnisID
+				riverGnisID = &g
+			}
 		}
 	} else {
 		// Insert a new river, auto-filling geo meta from GNIS ID when present.
