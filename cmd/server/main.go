@@ -245,6 +245,8 @@ func main() {
 		r.Get("/user-runs/{runId}/flow-proposals", flowProposals.ListByRunID)
 		r.Post("/user-runs/{runId}/flow-proposals", flowProposals.UpsertByRunID)
 		r.Get("/user-runs/{runId}/reports", reports.ListByRunID)
+		r.Get("/user-runs/community", userReaches.ListCommunity)
+		r.Post("/user-runs/{runId}/fork", userReaches.ForkUserRun)
 		r.Get("/user-runs/{runId}", userReaches.GetPublic)
 		r.Post("/user-runs/dupe-check", cluster.DupeCheck)
 		r.Get("/user-runs/{runId}/cluster", cluster.ClusterForRun)
