@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1405,6 +1406,111 @@ func (h *UserReachHandler) ImportKML(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, res)
 }
 
+// ── ForkUserRun ───────────────────────────────────────────────────────────────
+
+// POST /api/v1/user-runs/{runId}/fork
+// Clones a public user_reach into a new user_reach owned by the caller.
+func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
+	ownerID, ok := h.ownerID(r)
+	if !ok {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	runID := chi.URLParam(r, "runId")
+	ctx := r.Context()
+
+	type srcRow struct {
+		ID         string
+		Name       string
+		RiverID    *string
+		RiverName  *string
+		ClassMin   *float64
+		ClassMax   *float64
+		GaugeID    *string
+		PutInLng   float64
+		PutInLat   float64
+		TakeOutLng float64
+		TakeOutLat float64
+		Centerline []byte
+	}
+	var src srcRow
+	err := h.db.QueryRow(ctx, `
+		SELECT
+			ur.id::text, ur.name,
+			ur.river_id::text, ur.river_name,
+			ur.class_min, ur.class_max,
+			ur.primary_gauge_id::text,
+			ST_X(ur.put_in::geometry),  ST_Y(ur.put_in::geometry),
+			ST_X(ur.take_out::geometry), ST_Y(ur.take_out::geometry),
+			ST_AsGeoJSON(ur.centerline::geometry)
+		FROM user_reaches ur
+		WHERE ur.id = $1 AND ur.is_private = FALSE
+	`, runID).Scan(
+		&src.ID, &src.Name,
+		&src.RiverID, &src.RiverName,
+		&src.ClassMin, &src.ClassMax,
+		&src.GaugeID,
+		&src.PutInLng, &src.PutInLat,
+		&src.TakeOutLng, &src.TakeOutLat,
+		&src.Centerline,
+	)
+	if err != nil {
+		errorResponse(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	baseSlug := kmlimport.Slugify(src.Name)
+	slug := baseSlug
+	for i := 2; i <= 20; i++ {
+		var existing string
+		if e := h.db.QueryRow(ctx,
+			`SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2`, ownerID, slug,
+		).Scan(&existing); e != nil {
+			break
+		}
+		slug = fmt.Sprintf("%s-%d", baseSlug, i)
+	}
+
+	var newID string
+	if err = h.db.QueryRow(ctx, `
+		INSERT INTO user_reaches
+			(owner_id, slug, name, river_id, river_name,
+			 put_in, take_out,
+			 class_min, class_max, primary_gauge_id,
+			 forked_from_user_reach_id)
+		VALUES
+			($1, $2, $3, $4::uuid, $5,
+			 ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography,
+			 ST_SetSRID(ST_MakePoint($8, $9), 4326)::geography,
+			 $10, $11, $12::uuid,
+			 $13::uuid)
+		RETURNING id
+	`, ownerID, slug, src.Name, src.RiverID, src.RiverName,
+		src.PutInLng, src.PutInLat,
+		src.TakeOutLng, src.TakeOutLat,
+		src.ClassMin, src.ClassMax, src.GaugeID,
+		src.ID,
+	).Scan(&newID); err != nil {
+		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("fork failed: %v", err))
+		return
+	}
+
+	if len(src.Centerline) > 0 {
+		_, _ = h.db.Exec(ctx, `
+			UPDATE user_reaches
+			SET centerline = ST_GeomFromGeoJSON($2)::geography
+			WHERE id = $1
+		`, newID, string(src.Centerline))
+	}
+
+	jsonResponse(w, http.StatusCreated, map[string]string{"id": newID, "slug": slug, "gauge_id": func() string {
+		if src.GaugeID != nil {
+			return *src.GaugeID
+		}
+		return ""
+	}()})
+}
+
 // ── Fork ─────────────────────────────────────────────────────────────────────
 
 // POST /api/v1/me/reaches/fork-reach/{slug}
@@ -1521,4 +1627,110 @@ func (h *UserReachHandler) ForkReach(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonResponse(w, http.StatusCreated, map[string]string{"id": newID, "slug": slug})
+}
+
+// ── ListCommunity ─────────────────────────────────────────────────────────────
+
+type communityRunsResponse struct {
+	Items      []userReachSummary `json:"items"`
+	HasMore    bool               `json:"has_more"`
+	NextOffset int                `json:"next_offset,omitempty"`
+}
+
+// GET /api/v1/user-runs/community
+func (h *UserReachHandler) ListCommunity(w http.ResponseWriter, r *http.Request) {
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	limit := 20
+	if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && l > 0 && l <= 50 {
+		limit = l
+	}
+	offset := 0
+	if o, err := strconv.Atoi(r.URL.Query().Get("offset")); err == nil && o > 0 {
+		offset = o
+	}
+
+	search := "%" + q + "%"
+	rows, err := h.db.Query(r.Context(), `
+		SELECT
+			ur.id, ur.slug, ur.name, ur.river_name,
+			rv.state_abbr, rv.basin AS basin_group,
+			ST_X(ur.put_in::geometry)   AS put_in_lng,
+			ST_Y(ur.put_in::geometry)   AS put_in_lat,
+			ST_X(ur.take_out::geometry) AS take_out_lng,
+			ST_Y(ur.take_out::geometry) AS take_out_lat,
+			ur.note, ur.created_at,
+			ur.class_min, ur.class_max,
+			COALESCE(lr.value, cg.last_value_cfs)       AS current_cfs,
+			COALESCE(lr.timestamp, cg.last_value_at)    AS last_reading_at,
+			CASE
+				WHEN COALESCE(lr.value, cg.last_value_cfs) IS NULL OR fr.label IS NULL THEN 'unknown'
+				WHEN fr.label = 'running' THEN 'runnable'
+				WHEN fr.label = 'low'     THEN 'caution'
+				WHEN fr.label = 'high'    THEN 'flood'
+				ELSE 'unknown'
+			END AS flow_status,
+			fr.label AS flow_band,
+			ur.primary_gauge_id::text,
+			ur.custom_gauge_id::text,
+			cg.slug AS custom_gauge_slug,
+			cg.name AS custom_gauge_name,
+			ur.is_private,
+			up.handle AS author_handle,
+			(up.owner_id IS NULL) AS is_official
+		FROM user_reaches ur
+		LEFT JOIN rivers rv ON rv.id = ur.river_id
+		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
+		LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
+		LEFT JOIN LATERAL (
+			SELECT value, timestamp FROM gauge_readings
+			WHERE gauge_id = ur.primary_gauge_id
+			  AND timestamp > NOW() - INTERVAL '48 hours'
+			ORDER BY timestamp DESC LIMIT 1
+		) lr ON TRUE
+		LEFT JOIN LATERAL (
+			SELECT label FROM user_reach_flow_ranges
+			WHERE user_reach_id = ur.id
+			  AND (min_value IS NULL OR COALESCE(lr.value, cg.last_value_cfs) >= min_value)
+			  AND (max_value IS NULL OR COALESCE(lr.value, cg.last_value_cfs) <  max_value)
+			ORDER BY min_value ASC NULLS FIRST
+			LIMIT 1
+		) fr ON TRUE
+		WHERE ur.is_private = FALSE
+		  AND ($1 = '%%' OR ur.name ILIKE $1 OR ur.river_name ILIKE $1)
+		ORDER BY ur.created_at DESC, ur.id
+		LIMIT $2 OFFSET $3
+	`, search, limit+1, offset)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "query failed")
+		return
+	}
+	defer rows.Close()
+
+	items := make([]userReachSummary, 0)
+	for rows.Next() {
+		var s userReachSummary
+		if err := rows.Scan(
+			&s.ID, &s.Slug, &s.Name, &s.RiverName,
+			&s.StateAbbr, &s.BasinGroup,
+			&s.PutInLng, &s.PutInLat, &s.TakeOutLng, &s.TakeOutLat,
+			&s.Note, &s.CreatedAt,
+			&s.ClassMin, &s.ClassMax,
+			&s.CurrentCFS, &s.LastReadAt,
+			&s.FlowStatus, &s.FlowBand,
+			&s.GaugeID, &s.CustomGaugeID, &s.CustomGaugeSlug, &s.CustomGaugeName,
+			&s.IsPrivate, &s.AuthorHandle, &s.IsOfficial,
+		); err == nil {
+			items = append(items, s)
+		}
+	}
+
+	hasMore := len(items) > limit
+	if hasMore {
+		items = items[:limit]
+	}
+	jsonResponse(w, http.StatusOK, communityRunsResponse{
+		Items:      items,
+		HasMore:    hasMore,
+		NextOffset: offset + len(items),
+	})
 }
