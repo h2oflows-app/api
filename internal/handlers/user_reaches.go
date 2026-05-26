@@ -340,7 +340,8 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 			END AS flow_status,
 			ur.primary_gauge_id::text AS gauge_id,
 			ur.class_max,
-			up.handle AS author_handle
+			up.handle AS author_handle,
+			(up.owner_id IS NULL) AS is_official
 		FROM user_reaches ur
 		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
 		LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
@@ -378,6 +379,7 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 		GaugeID      *string  `json:"gauge_id"`
 		IsUserReach  bool     `json:"is_user_reach"`
 		AuthorHandle *string  `json:"author_handle"`
+		IsOfficial   bool     `json:"is_official"`
 	}
 	type feature struct {
 		Type       string          `json:"type"`
@@ -398,13 +400,14 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 			gaugeID                *string
 			classMax               *float64
 			authorHandle           *string
+			isOfficial             bool
 		)
 		if err := rows.Scan(
 			&id, &slug, &name, &riverName,
 			&centerlineJSON,
 			&putInLng, &putInLat, &takeOutLng, &takeOutLat,
 			&currentCFS, &flowStatus, &gaugeID, &classMax,
-			&authorHandle,
+			&authorHandle, &isOfficial,
 		); err != nil {
 			continue
 		}
@@ -439,6 +442,7 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 				GaugeID:      gaugeID,
 				IsUserReach:  true,
 				AuthorHandle: authorHandle,
+				IsOfficial:   isOfficial,
 			},
 		})
 	}
