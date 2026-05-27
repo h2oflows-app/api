@@ -378,6 +378,7 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 		CurrentCFS   *float64 `json:"current_cfs"`
 		GaugeID      *string  `json:"gauge_id"`
 		IsUserReach  bool     `json:"is_user_reach"`
+		IsCommunity  bool     `json:"is_community"`
 		AuthorHandle *string  `json:"author_handle"`
 		IsOfficial   bool     `json:"is_official"`
 	}
@@ -441,6 +442,7 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 				CurrentCFS:   currentCFS,
 				GaugeID:      gaugeID,
 				IsUserReach:  true,
+				IsCommunity:  true,
 				AuthorHandle: authorHandle,
 				IsOfficial:   isOfficial,
 			},
