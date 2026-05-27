@@ -167,8 +167,11 @@ type userReachDetail struct {
 	GaugeLastPollSuccess  *time.Time           `json:"gauge_last_poll_success_at"`
 	CustomGaugeID         *string              `json:"custom_gauge_id"`
 	CustomGaugeName       *string              `json:"custom_gauge_name"`
-	ForkedFromSlug  *string              `json:"forked_from_slug"`
-	ForkedFromName  *string              `json:"forked_from_name"`
+	ForkedFromSlug          *string    `json:"forked_from_slug"`
+	ForkedFromName          *string    `json:"forked_from_name"`
+	OriginalAuthorHandle    *string    `json:"original_author_handle"`
+	OriginalForkedAt        *time.Time `json:"original_forked_at"`
+	LastModifiedAfterForkAt *time.Time `json:"last_modified_after_fork_at"`
 	FlowRanges            []userReachFlowRange   `json:"flow_ranges"`
 	Rapids                []userReachRapid       `json:"rapids"`
 	AccessPoints          []userReachAccessPoint `json:"access_points"`
@@ -592,7 +595,10 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 			COALESCE(
 				COALESCE(fr_reach.common_name, fr_reach.name),
 				fr_ur.name
-			) AS forked_from_name
+			) AS forked_from_name,
+			ur.original_author_handle,
+			ur.original_forked_at,
+			ur.last_modified_after_fork_at
 		FROM user_reaches ur
 		LEFT JOIN rivers rv ON rv.id = ur.river_id
 		LEFT JOIN gauges g ON g.id = ur.primary_gauge_id
@@ -629,6 +635,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 		&d.RiverSlug, &d.RiverStateAbbr, &d.RiverBasin,
 		&d.IsPrivate,
 		&d.ForkedFromSlug, &d.ForkedFromName,
+		&d.OriginalAuthorHandle, &d.OriginalForkedAt, &d.LastModifiedAfterForkAt,
 	)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
@@ -761,7 +768,10 @@ func (h *UserReachHandler) GetPublic(w http.ResponseWriter, r *http.Request) {
 				fr_ur.name
 			) AS forked_from_name,
 			ur.owner_id,
-			up.handle AS author_handle
+			up.handle AS author_handle,
+			ur.original_author_handle,
+			ur.original_forked_at,
+			ur.last_modified_after_fork_at
 		FROM user_reaches ur
 		LEFT JOIN rivers rv ON rv.id = ur.river_id
 		LEFT JOIN gauges g ON g.id = ur.primary_gauge_id
@@ -800,6 +810,7 @@ func (h *UserReachHandler) GetPublic(w http.ResponseWriter, r *http.Request) {
 		&d.IsPrivate,
 		&d.ForkedFromSlug, &d.ForkedFromName,
 		&authorID, &d.AuthorHandle,
+		&d.OriginalAuthorHandle, &d.OriginalForkedAt, &d.LastModifiedAfterForkAt,
 	)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "run not found")
@@ -1185,7 +1196,7 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	// Core fields update.
+	// Core fields update. Set last_modified_after_fork_at when run is a fork (V4).
 	tag, err := h.db.Exec(ctx, `
 		UPDATE user_reaches
 		SET
@@ -1195,7 +1206,11 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 			class_min  = CASE WHEN $7 THEN $8::numeric ELSE class_min END,
 			class_max  = CASE WHEN $9 THEN $10::numeric ELSE class_max END,
 			is_private = CASE WHEN $11 THEN $12 ELSE is_private END,
-			updated_at = NOW()
+			updated_at = NOW(),
+			last_modified_after_fork_at = CASE
+				WHEN original_forked_at IS NOT NULL THEN NOW()
+				ELSE last_modified_after_fork_at
+			END
 		WHERE owner_id = $1 AND slug = $2
 	`, ownerID, slug, body.Name, body.Note, body.RiverName != nil, riverName,
 		body.ClassMin != nil, body.ClassMin,
@@ -1563,23 +1578,26 @@ func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	type srcRow struct {
-		ID         string
-		Name       string
-		RiverID    *string
-		RiverName  *string
-		ClassMin   *float64
-		ClassMax   *float64
-		GaugeID    *string
-		PutInLng   float64
-		PutInLat   float64
-		TakeOutLng float64
-		TakeOutLat float64
-		Centerline []byte
+		ID           string
+		Name         string
+		OwnerID      string
+		AuthorHandle *string
+		RiverID      *string
+		RiverName    *string
+		ClassMin     *float64
+		ClassMax     *float64
+		GaugeID      *string
+		PutInLng     float64
+		PutInLat     float64
+		TakeOutLng   float64
+		TakeOutLat   float64
+		Centerline   []byte
 	}
 	var src srcRow
 	err := h.db.QueryRow(ctx, `
 		SELECT
-			ur.id::text, ur.name,
+			ur.id::text, ur.name, ur.owner_id::text,
+			up.handle,
 			ur.river_id::text, ur.river_name,
 			ur.class_min, ur.class_max,
 			ur.primary_gauge_id::text,
@@ -1587,9 +1605,10 @@ func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 			ST_X(ur.take_out::geometry), ST_Y(ur.take_out::geometry),
 			ST_AsGeoJSON(ur.centerline::geometry)
 		FROM user_reaches ur
+		LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
 		WHERE ur.id = $1 AND ur.is_private = FALSE
 	`, runID).Scan(
-		&src.ID, &src.Name,
+		&src.ID, &src.Name, &src.OwnerID, &src.AuthorHandle,
 		&src.RiverID, &src.RiverName,
 		&src.ClassMin, &src.ClassMax,
 		&src.GaugeID,
@@ -1620,19 +1639,22 @@ func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 			(owner_id, slug, name, river_id, river_name,
 			 put_in, take_out,
 			 class_min, class_max, primary_gauge_id,
-			 forked_from_user_reach_id)
+			 forked_from_user_reach_id,
+			 original_author_handle, original_author_owner_id, original_forked_at)
 		VALUES
 			($1, $2, $3, $4::uuid, $5,
 			 ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography,
 			 ST_SetSRID(ST_MakePoint($8, $9), 4326)::geography,
 			 $10, $11, $12::uuid,
-			 $13::uuid)
+			 $13::uuid,
+			 $14, $15::uuid, NOW())
 		RETURNING id
 	`, ownerID, slug, src.Name, src.RiverID, src.RiverName,
 		src.PutInLng, src.PutInLat,
 		src.TakeOutLng, src.TakeOutLat,
 		src.ClassMin, src.ClassMax, src.GaugeID,
 		src.ID,
+		src.AuthorHandle, src.OwnerID,
 	).Scan(&newID); err != nil {
 		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("fork failed: %v", err))
 		return
@@ -1742,13 +1764,13 @@ func (h *UserReachHandler) ForkReach(w http.ResponseWriter, r *http.Request) {
 			(owner_id, slug, name, river_id, river_name,
 			 put_in, take_out,
 			 class_min, class_max, primary_gauge_id,
-			 forked_from_reach_id)
+			 forked_from_reach_id, original_forked_at)
 		VALUES
 			($1, $2, $3, $4::uuid, $5,
 			 ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography,
 			 ST_SetSRID(ST_MakePoint($8, $9), 4326)::geography,
 			 $10, $11, $12::uuid,
-			 $13::uuid)
+			 $13::uuid, NOW())
 		RETURNING id
 	`, ownerID, slug, forkName, src.RiverID, src.RiverName,
 		src.PutInLng, src.PutInLat,
