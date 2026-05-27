@@ -327,7 +327,7 @@ func (h *UserReachHandler) MapAll(w http.ResponseWriter, r *http.Request) {
 func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.db.Query(r.Context(), `
 		WITH cluster_groups AS (
-			SELECT a.id AS run_id, MIN(b.id)::text AS cluster_id
+			SELECT a.id AS run_id, MIN(b.id::text) AS cluster_id
 			FROM user_reaches a
 			JOIN user_reaches b ON (
 				b.is_private = FALSE
