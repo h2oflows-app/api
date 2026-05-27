@@ -125,6 +125,7 @@ func main() {
 	profile       := handlers.NewProfileHandler(pool, devFallbackID)
 	dashboards    := handlers.NewDashboardHandler(pool, devFallbackID)
 	ogh           := handlers.NewOGHandler(pool)
+	userProfile   := handlers.NewUserProfileHandler(pool)
 	var importEmbedder *ai.Embedder
 	if cfg.VoyageAPIKey != "" {
 		importEmbedder = ai.NewEmbedder(cfg.VoyageAPIKey)
@@ -247,8 +248,10 @@ func main() {
 		r.Get("/user-runs/{runId}/reports", reports.ListByRunID)
 		r.Get("/user-runs/community", userReaches.ListCommunity)
 		r.Get("/user-runs/map/community", userReaches.MapCommunity)
+		r.Get("/user-runs/by-handle/{handle}/{slug}", userReaches.GetPublicByHandle)
 		r.Post("/user-runs/{runId}/fork", userReaches.ForkUserRun)
 		r.Get("/user-runs/{runId}", userReaches.GetPublic)
+		r.Get("/users/{handle}", userProfile.GetProfile)
 		r.Post("/user-runs/dupe-check", cluster.DupeCheck)
 		r.Get("/user-runs/{runId}/cluster", cluster.ClusterForRun)
 		r.Post("/user-runs/{runId}/upvote", upvote.Toggle)
