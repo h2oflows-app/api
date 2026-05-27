@@ -709,13 +709,36 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 
 // ── GetPublic ─────────────────────────────────────────────────────────────────
 
+// GET /api/v1/user-runs/by-handle/{handle}/{slug}
+// Canonical public lookup by author handle + run slug. Auth optional.
+func (h *UserReachHandler) GetPublicByHandle(w http.ResponseWriter, r *http.Request) {
+	handle := chi.URLParam(r, "handle")
+	slug   := chi.URLParam(r, "slug")
+	callerID, _ := h.ownerID(r)
+
+	var runID string
+	err := h.db.QueryRow(r.Context(), `
+		SELECT ur.id FROM user_reaches ur
+		JOIN user_profiles up ON up.owner_id = ur.owner_id
+		WHERE ur.slug = $1 AND LOWER(up.handle) = LOWER($2) AND ur.is_private = FALSE
+	`, slug, handle).Scan(&runID)
+	if err != nil {
+		errorResponse(w, http.StatusNotFound, "run not found")
+		return
+	}
+	h.getPublicByID(w, r, runID, callerID)
+}
+
 // GET /api/v1/user-runs/{runId}
 // Public: returns detail for any non-private user reach by UUID.
 // Auth optional — when present, populates user_upvoted.
 func (h *UserReachHandler) GetPublic(w http.ResponseWriter, r *http.Request) {
-	runID := chi.URLParam(r, "runId")
-	callerID, _ := h.ownerID(r) // optional
+	runID    := chi.URLParam(r, "runId")
+	callerID, _ := h.ownerID(r)
+	h.getPublicByID(w, r, runID, callerID)
+}
 
+func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request, runID string, callerID string) {
 	var d userReachDetail
 	var geojsonBytes []byte
 	var authorID string
