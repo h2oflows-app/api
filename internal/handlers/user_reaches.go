@@ -326,6 +326,19 @@ func (h *UserReachHandler) MapAll(w http.ResponseWriter, r *http.Request) {
 // Same shape as MapAll. Public endpoint — no auth required.
 func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.db.Query(r.Context(), `
+		WITH cluster_groups AS (
+			SELECT a.id AS run_id, MIN(b.id)::text AS cluster_id
+			FROM user_reaches a
+			JOIN user_reaches b ON (
+				b.is_private = FALSE
+				AND a.up_comid IS NOT NULL
+				AND b.up_comid = a.up_comid
+				AND ST_DWithin(a.put_in::geography,   b.put_in::geography,   1609.34)
+				AND ST_DWithin(a.take_out::geography, b.take_out::geography, 1609.34)
+			)
+			WHERE a.is_private = FALSE
+			GROUP BY a.id
+		)
 		SELECT
 			ur.id, ur.slug, ur.name, ur.river_name,
 			ST_AsGeoJSON(ur.centerline::geometry)  AS centerline_json,
@@ -344,10 +357,19 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 			ur.primary_gauge_id::text AS gauge_id,
 			ur.class_max,
 			up.handle AS author_handle,
-			(up.owner_id IS NULL) AS is_official
+			(up.owner_id IS NULL) AS is_official,
+			COALESCE(cgrp.cluster_id, ur.id::text) AS cluster_id,
+			(
+				COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0)
+				+ COALESCE((SELECT COUNT(*) FROM reports rp WHERE rp.user_reach_id = ur.id AND rp.deleted_at IS NULL), 0) * 2
+				+ (CASE WHEN ur.centerline IS NOT NULL THEN 1 ELSE 0 END
+				   + CASE WHEN EXISTS(SELECT 1 FROM user_reach_flow_ranges WHERE user_reach_id = ur.id) THEN 1 ELSE 0 END
+				   + CASE WHEN ur.note IS NOT NULL AND char_length(ur.note) >= 20 THEN 1 ELSE 0 END) * 5
+			)::int AS rank_score
 		FROM user_reaches ur
 		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
 		LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
+		LEFT JOIN cluster_groups cgrp ON cgrp.run_id = ur.id
 		LEFT JOIN LATERAL (
 			SELECT value FROM gauge_readings
 			WHERE gauge_id = ur.primary_gauge_id
@@ -384,6 +406,8 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 		IsCommunity  bool     `json:"is_community"`
 		AuthorHandle *string  `json:"author_handle"`
 		IsOfficial   bool     `json:"is_official"`
+		ClusterID    string   `json:"cluster_id"`
+		RankScore    int      `json:"rank_score"`
 	}
 	type feature struct {
 		Type       string          `json:"type"`
@@ -405,6 +429,8 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 			classMax               *float64
 			authorHandle           *string
 			isOfficial             bool
+			clusterID              string
+			rankScore              int
 		)
 		if err := rows.Scan(
 			&id, &slug, &name, &riverName,
@@ -412,6 +438,7 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 			&putInLng, &putInLat, &takeOutLng, &takeOutLat,
 			&currentCFS, &flowStatus, &gaugeID, &classMax,
 			&authorHandle, &isOfficial,
+			&clusterID, &rankScore,
 		); err != nil {
 			continue
 		}
@@ -448,6 +475,8 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 				IsCommunity:  true,
 				AuthorHandle: authorHandle,
 				IsOfficial:   isOfficial,
+				ClusterID:    clusterID,
+				RankScore:    rankScore,
 			},
 		})
 	}

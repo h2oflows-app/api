@@ -93,7 +93,6 @@ func (h *ClusterHandler) nearbyRuns(r *http.Request, putInLat, putInLng, takeOut
 		FROM user_reaches ur
 		LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
 		WHERE ur.is_private = FALSE
-		  AND (ur.deleted_at IS NULL OR ur.deleted_at IS NOT NULL)
 		  AND ($6 = '' OR ur.id::text <> $6)
 		  AND ST_DWithin(ur.put_in::geography,   ST_MakePoint($2, $1)::geography, $5)
 		  AND ST_DWithin(ur.take_out::geography, ST_MakePoint($4, $3)::geography, $5)
