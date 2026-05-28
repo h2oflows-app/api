@@ -193,6 +193,11 @@ func (h *UserReachHandler) MapAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var slugFilter []string
+	if sp := r.URL.Query().Get("slugs"); sp != "" {
+		slugFilter = strings.Split(sp, ",")
+	}
+
 	rows, err := h.db.Query(r.Context(), `
 		SELECT
 			ur.id, ur.slug, ur.name, ur.river_name,
@@ -228,7 +233,8 @@ func (h *UserReachHandler) MapAll(w http.ResponseWriter, r *http.Request) {
 			LIMIT 1
 		) fr ON TRUE
 		WHERE ur.owner_id = $1
-	`, ownerID)
+		  AND ($2::text[] IS NULL OR ur.slug = ANY($2))
+	`, ownerID, slugFilter)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
 		return
