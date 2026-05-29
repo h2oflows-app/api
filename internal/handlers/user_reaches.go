@@ -1533,6 +1533,8 @@ func (h *UserReachHandler) SetGauge(w http.ResponseWriter, r *http.Request) {
 			errorResponse(w, http.StatusBadRequest, "name, lat, lng required with external_id")
 			return
 		}
+		extID := normalizeExternalID(strings.TrimSpace(*body.ExternalID), *body.Source)
+		body.ExternalID = &extID
 		var gaugeID string
 		err := h.db.QueryRow(r.Context(), `
 			INSERT INTO gauges (external_id, source, name, location)
