@@ -121,11 +121,11 @@ func main() {
 	cluster        := handlers.NewClusterHandler(pool, devFallbackID)
 	upvote         := handlers.NewUpvoteHandler(pool, devFallbackID)
 	moderation     := handlers.NewModerationHandler(pool, devFallbackID)
+	discover       := handlers.NewDiscoverHandler(pool)
 	preferences   := handlers.NewPreferencesHandler(pool, devFallbackID)
 	profile       := handlers.NewProfileHandler(pool, devFallbackID)
 	dashboards    := handlers.NewDashboardHandler(pool, devFallbackID)
 	ogh           := handlers.NewOGHandler(pool)
-	userProfile   := handlers.NewUserProfileHandler(pool)
 	var importEmbedder *ai.Embedder
 	if cfg.VoyageAPIKey != "" {
 		importEmbedder = ai.NewEmbedder(cfg.VoyageAPIKey)
@@ -182,6 +182,7 @@ func main() {
 		r.Post("/reaches/{slug}/ask", reaches.Ask)
 		r.Post("/ask", reaches.GlobalAsk)
 		r.Get("/stats", reaches.Stats)
+		r.Get("/discover/runs", discover.ListRuns)
 		r.Get("/admin/slug-check", admin.SlugCheck)
 
 		// Authenticated user routes — require a valid Supabase JWT.
@@ -248,10 +249,8 @@ func main() {
 		r.Get("/user-runs/{runId}/reports", reports.ListByRunID)
 		r.Get("/user-runs/community", userReaches.ListCommunity)
 		r.Get("/user-runs/map/community", userReaches.MapCommunity)
-		r.Get("/user-runs/by-handle/{handle}/{slug}", userReaches.GetPublicByHandle)
 		r.Post("/user-runs/{runId}/fork", userReaches.ForkUserRun)
 		r.Get("/user-runs/{runId}", userReaches.GetPublic)
-		r.Get("/users/{handle}", userProfile.GetProfile)
 		r.Post("/user-runs/dupe-check", cluster.DupeCheck)
 		r.Get("/user-runs/{runId}/cluster", cluster.ClusterForRun)
 		r.Post("/user-runs/{runId}/upvote", upvote.Toggle)
