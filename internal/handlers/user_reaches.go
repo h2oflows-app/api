@@ -1726,6 +1726,13 @@ func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 		`, newID, string(src.Centerline))
 	}
 
+	_, _ = h.db.Exec(ctx, `
+		INSERT INTO user_reach_flow_ranges (user_reach_id, label, min_value, max_value)
+		SELECT $1, label, min_value, max_value
+		FROM user_reach_flow_ranges
+		WHERE user_reach_id = $2
+	`, newID, src.ID)
+
 	jsonResponse(w, http.StatusCreated, map[string]string{"id": newID, "slug": slug, "gauge_id": func() string {
 		if src.GaugeID != nil {
 			return *src.GaugeID
@@ -1848,6 +1855,22 @@ func (h *UserReachHandler) ForkReach(w http.ResponseWriter, r *http.Request) {
 			WHERE id = $1
 		`, newID, string(src.Centerline))
 	}
+
+	// Map curated 5-tier flow_ranges → user 3-tier bands.
+	_, _ = h.db.Exec(ctx, `
+		INSERT INTO user_reach_flow_ranges (user_reach_id, label, min_value, max_value)
+		SELECT $1,
+		       CASE label
+		           WHEN 'low_runnable'  THEN 'low'
+		           WHEN 'runnable'      THEN 'running'
+		           WHEN 'high_runnable' THEN 'high'
+		       END,
+		       min_cfs, max_cfs
+		FROM flow_ranges
+		WHERE reach_id = $2
+		  AND label IN ('low_runnable','runnable','high_runnable')
+		ON CONFLICT (user_reach_id, label) DO NOTHING
+	`, newID, src.ID)
 
 	jsonResponse(w, http.StatusCreated, map[string]string{"id": newID, "slug": slug})
 }
