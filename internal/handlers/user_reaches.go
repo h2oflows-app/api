@@ -215,7 +215,8 @@ func (h *UserReachHandler) MapAll(w http.ResponseWriter, r *http.Request) {
 				ELSE 'unknown'
 			END AS flow_status,
 			ur.primary_gauge_id::text AS gauge_id,
-			ur.class_max
+			ur.class_max,
+			COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0) AS upvote_count
 		FROM user_reaches ur
 		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
 		LEFT JOIN LATERAL (
@@ -252,6 +253,7 @@ func (h *UserReachHandler) MapAll(w http.ResponseWriter, r *http.Request) {
 		CurrentCFS  *float64 `json:"current_cfs"`
 		GaugeID     *string  `json:"gauge_id"`
 		IsUserReach bool     `json:"is_user_reach"`
+		UpvoteCount int64    `json:"upvote_count"`
 	}
 	type feature struct {
 		Type       string          `json:"type"`
@@ -271,12 +273,13 @@ func (h *UserReachHandler) MapAll(w http.ResponseWriter, r *http.Request) {
 			flowStatus      string
 			gaugeID         *string
 			classMax        *float64
+			upvoteCount     int64
 		)
 		if err := rows.Scan(
 			&id, &slug, &name, &riverName,
 			&centerlineJSON,
 			&putInLng, &putInLat, &takeOutLng, &takeOutLat,
-			&currentCFS, &flowStatus, &gaugeID, &classMax,
+			&currentCFS, &flowStatus, &gaugeID, &classMax, &upvoteCount,
 		); err != nil {
 			continue
 		}
@@ -311,6 +314,7 @@ func (h *UserReachHandler) MapAll(w http.ResponseWriter, r *http.Request) {
 				CurrentCFS:  currentCFS,
 				GaugeID:     gaugeID,
 				IsUserReach: true,
+				UpvoteCount: upvoteCount,
 			},
 		})
 	}
