@@ -121,6 +121,7 @@ func main() {
 	cluster        := handlers.NewClusterHandler(pool, devFallbackID)
 	upvote         := handlers.NewUpvoteHandler(pool, devFallbackID)
 	meGauges       := handlers.NewUserGaugesHandler(pool, devFallbackID).WithPoller(p)
+	userProfiles   := handlers.NewUserProfileHandler(pool)
 	moderation     := handlers.NewModerationHandler(pool, devFallbackID)
 	discover       := handlers.NewDiscoverHandler(pool)
 	preferences   := handlers.NewPreferencesHandler(pool, devFallbackID)
@@ -251,6 +252,9 @@ func main() {
 		r.Get("/user-runs/{runId}/flow-proposals", flowProposals.ListByRunID)
 		r.Post("/user-runs/{runId}/flow-proposals", flowProposals.UpsertByRunID)
 		r.Get("/user-runs/{runId}/reports", reports.ListByRunID)
+		r.Get("/users/{handle}", userProfiles.GetProfile)
+		r.Get("/users/{handle}/runs/map/all", userProfiles.MapAllByHandle)
+
 		r.Get("/user-runs/community", userReaches.ListCommunity)
 		r.Get("/user-runs/map/community", userReaches.MapCommunity)
 		r.Post("/user-runs/{runId}/fork", userReaches.ForkUserRun)

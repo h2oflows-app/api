@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+
 // UserProfileHandler serves public user profile endpoints.
 type UserProfileHandler struct {
 	db *pgxpool.Pool
@@ -102,4 +103,145 @@ func (h *UserProfileHandler) GetProfile(w http.ResponseWriter, r *http.Request) 
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(userProfileResponse{Handle: handle, Runs: runs})
+}
+
+// MapAllByHandle handles GET /api/v1/users/{handle}/runs/map/all.
+// Returns GeoJSON FeatureCollection of the user's public runs (is_private=FALSE).
+// Symmetric with /me/runs/map/all; no auth required.
+func (h *UserProfileHandler) MapAllByHandle(w http.ResponseWriter, r *http.Request) {
+	handle := chi.URLParam(r, "handle")
+
+	var ownerID string
+	if err := h.db.QueryRow(r.Context(),
+		`SELECT owner_id FROM user_profiles WHERE LOWER(handle) = LOWER($1)`,
+		handle,
+	).Scan(&ownerID); err != nil {
+		errorResponse(w, http.StatusNotFound, "user not found")
+		return
+	}
+
+	rows, err := h.db.Query(r.Context(), `
+		SELECT
+			ur.id, ur.slug, ur.name, ur.river_name,
+			ST_AsGeoJSON(ur.centerline::geometry)  AS centerline_json,
+			ST_X(ur.put_in::geometry)              AS put_in_lng,
+			ST_Y(ur.put_in::geometry)              AS put_in_lat,
+			ST_X(ur.take_out::geometry)            AS take_out_lng,
+			ST_Y(ur.take_out::geometry)            AS take_out_lat,
+			COALESCE(lr.value, cg.last_value_cfs)  AS current_cfs,
+			CASE
+				WHEN COALESCE(lr.value, cg.last_value_cfs) IS NULL OR fr.label IS NULL THEN 'unknown'
+				WHEN fr.label = 'running' THEN 'runnable'
+				WHEN fr.label = 'low'     THEN 'caution'
+				WHEN fr.label = 'high'    THEN 'flood'
+				ELSE 'unknown'
+			END AS flow_status,
+			ur.primary_gauge_id::text AS gauge_id,
+			ur.class_max,
+			COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0) AS upvote_count
+		FROM user_reaches ur
+		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
+		LEFT JOIN LATERAL (
+			SELECT value FROM gauge_readings
+			WHERE gauge_id = ur.primary_gauge_id
+			  AND timestamp > NOW() - INTERVAL '48 hours'
+			ORDER BY timestamp DESC LIMIT 1
+		) lr ON TRUE
+		LEFT JOIN LATERAL (
+			SELECT label FROM user_reach_flow_ranges
+			WHERE user_reach_id = ur.id
+			  AND (min_value IS NULL OR COALESCE(lr.value, cg.last_value_cfs) >= min_value)
+			  AND (max_value IS NULL OR COALESCE(lr.value, cg.last_value_cfs) <  max_value)
+			ORDER BY min_value ASC NULLS FIRST
+			LIMIT 1
+		) fr ON TRUE
+		WHERE ur.owner_id = $1 AND ur.is_private = FALSE
+	`, ownerID)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "query failed")
+		return
+	}
+	defer rows.Close()
+
+	type featureProps struct {
+		ID          string   `json:"id"`
+		Slug        string   `json:"slug"`
+		Name        string   `json:"name"`
+		RiverName   *string  `json:"river_name"`
+		ClassMax    *float64 `json:"class_max"`
+		FlowStatus  string   `json:"flow_status"`
+		CurrentCFS  *float64 `json:"current_cfs"`
+		GaugeID     *string  `json:"gauge_id"`
+		IsUserReach bool     `json:"is_user_reach"`
+		UpvoteCount int64    `json:"upvote_count"`
+	}
+	type feature struct {
+		Type       string          `json:"type"`
+		Geometry   json.RawMessage `json:"geometry"`
+		Properties featureProps    `json:"properties"`
+	}
+
+	features := make([]feature, 0)
+	for rows.Next() {
+		var (
+			id, slug, name       string
+			riverName            *string
+			centerlineJSON       *string
+			putInLng, putInLat   float64
+			takeOutLng, takeOutLat float64
+			currentCFS           *float64
+			flowStatus           string
+			gaugeID              *string
+			classMax             *float64
+			upvoteCount          int64
+		)
+		if err := rows.Scan(
+			&id, &slug, &name, &riverName,
+			&centerlineJSON,
+			&putInLng, &putInLat, &takeOutLng, &takeOutLat,
+			&currentCFS, &flowStatus, &gaugeID, &classMax, &upvoteCount,
+		); err != nil {
+			continue
+		}
+
+		var geom json.RawMessage
+		if centerlineJSON != nil && *centerlineJSON != "" {
+			geom = json.RawMessage(*centerlineJSON)
+		} else {
+			type lineString struct {
+				Type        string       `json:"type"`
+				Coordinates [][2]float64 `json:"coordinates"`
+			}
+			raw, _ := json.Marshal(lineString{
+				Type:        "LineString",
+				Coordinates: [][2]float64{{putInLng, putInLat}, {takeOutLng, takeOutLat}},
+			})
+			geom = json.RawMessage(raw)
+		}
+
+		features = append(features, feature{
+			Type:     "Feature",
+			Geometry: geom,
+			Properties: featureProps{
+				ID:          id,
+				Slug:        slug,
+				Name:        name,
+				RiverName:   riverName,
+				ClassMax:    classMax,
+				FlowStatus:  flowStatus,
+				CurrentCFS:  currentCFS,
+				GaugeID:     gaugeID,
+				IsUserReach: true,
+				UpvoteCount: upvoteCount,
+			},
+		})
+	}
+
+	type featureCollection struct {
+		Type     string    `json:"type"`
+		Features []feature `json:"features"`
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "public, max-age=30")
+	_ = json.NewEncoder(w).Encode(featureCollection{Type: "FeatureCollection", Features: features})
 }
