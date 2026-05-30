@@ -535,10 +535,12 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			ur.custom_gauge_id::text AS custom_gauge_id,
 			cg.slug AS custom_gauge_slug,
 			cg.name AS custom_gauge_name,
-			ur.is_private
+			ur.is_private,
+			up.handle AS author_handle
 		FROM user_reaches ur
 		LEFT JOIN rivers rv ON rv.id = ur.river_id
 		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
+		LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
 		LEFT JOIN LATERAL (
 			SELECT value, timestamp FROM gauge_readings
 			WHERE gauge_id = ur.primary_gauge_id
@@ -574,7 +576,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			&s.CurrentCFS, &s.LastReadAt,
 			&s.FlowStatus, &s.FlowBand, &s.GaugeID,
 			&s.CustomGaugeID, &s.CustomGaugeSlug, &s.CustomGaugeName,
-			&s.IsPrivate,
+			&s.IsPrivate, &s.AuthorHandle,
 		); err == nil {
 			items = append(items, s)
 		}
