@@ -923,6 +923,7 @@ func (h *AdminHandler) ListAdminGauges(w http.ResponseWriter, r *http.Request) {
 			g.last_reading_at, g.last_poll_success_at, g.last_poll_failure_at,
 			g.seasonal_start_mmdd, g.seasonal_end_mmdd,
 			g.state_abbr,
+			g.current_cfs,
 			(SELECT COUNT(*) FROM reaches r2
 			 WHERE r2.primary_gauge_id = g.id
 			) AS reach_count
@@ -959,6 +960,7 @@ func (h *AdminHandler) ListAdminGauges(w http.ResponseWriter, r *http.Request) {
 		SeasonalStartMMDD     *string    `json:"seasonal_start_mmdd"`
 		SeasonalEndMMDD       *string    `json:"seasonal_end_mmdd"`
 		StateAbbr             *string    `json:"state_abbr"`
+		LastReadingCfs        *float64   `json:"last_reading_cfs"`
 		ReachCount            int        `json:"reach_count"`
 	}
 
@@ -972,6 +974,7 @@ func (h *AdminHandler) ListAdminGauges(w http.ResponseWriter, r *http.Request) {
 			&g.LastReadingAt, &g.LastPollSuccessAt, &g.LastPollFailureAt,
 			&g.SeasonalStartMMDD, &g.SeasonalEndMMDD,
 			&g.StateAbbr,
+			&g.LastReadingCfs,
 			&g.ReachCount,
 		); err != nil {
 			continue
