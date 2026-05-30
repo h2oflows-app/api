@@ -10,7 +10,7 @@ import (
 
 // UpvoteHandler handles run upvotes.
 // Toggle semantics: POST inserts if not present, deletes if already voted.
-// No self-vote restriction — enforced at UI layer if desired.
+// Self-upvote rejected with 403.
 type UpvoteHandler struct {
 	db            *pgxpool.Pool
 	devFallbackID string
@@ -42,12 +42,19 @@ func (h *UpvoteHandler) Toggle(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	var isPrivate bool
-	if err := h.db.QueryRow(ctx, `SELECT is_private FROM user_reaches WHERE id = $1`, runID).Scan(&isPrivate); err != nil {
+	var ownerID string
+	if err := h.db.QueryRow(ctx,
+		`SELECT is_private, owner_id FROM user_reaches WHERE id = $1`, runID,
+	).Scan(&isPrivate, &ownerID); err != nil {
 		errorResponse(w, http.StatusNotFound, "run not found")
 		return
 	}
 	if isPrivate {
 		errorResponse(w, http.StatusForbidden, "run is private")
+		return
+	}
+	if ownerID == callerID {
+		errorResponse(w, http.StatusForbidden, "cannot upvote your own run")
 		return
 	}
 
