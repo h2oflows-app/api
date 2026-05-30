@@ -924,6 +924,8 @@ func (h *AdminHandler) ListAdminGauges(w http.ResponseWriter, r *http.Request) {
 			g.seasonal_start_mmdd, g.seasonal_end_mmdd,
 			g.state_abbr,
 			g.current_cfs,
+			g.poll_interval_seconds,
+			g.detected_interval_seconds,
 			(SELECT COUNT(*) FROM reaches r2
 			 WHERE r2.primary_gauge_id = g.id
 			) AS reach_count
@@ -959,9 +961,11 @@ func (h *AdminHandler) ListAdminGauges(w http.ResponseWriter, r *http.Request) {
 		LastPollFailureAt     *time.Time `json:"last_poll_failure_at"`
 		SeasonalStartMMDD     *string    `json:"seasonal_start_mmdd"`
 		SeasonalEndMMDD       *string    `json:"seasonal_end_mmdd"`
-		StateAbbr             *string    `json:"state_abbr"`
-		LastReadingCfs        *float64   `json:"last_reading_cfs"`
-		ReachCount            int        `json:"reach_count"`
+		StateAbbr                *string    `json:"state_abbr"`
+		LastReadingCfs           *float64   `json:"last_reading_cfs"`
+		PollIntervalSeconds      *int       `json:"poll_interval_seconds"`
+		DetectedIntervalSeconds  *int       `json:"detected_interval_seconds"`
+		ReachCount               int        `json:"reach_count"`
 	}
 
 	gauges := make([]gaugeRow, 0)
@@ -975,6 +979,8 @@ func (h *AdminHandler) ListAdminGauges(w http.ResponseWriter, r *http.Request) {
 			&g.SeasonalStartMMDD, &g.SeasonalEndMMDD,
 			&g.StateAbbr,
 			&g.LastReadingCfs,
+			&g.PollIntervalSeconds,
+			&g.DetectedIntervalSeconds,
 			&g.ReachCount,
 		); err != nil {
 			continue
