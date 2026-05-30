@@ -120,6 +120,7 @@ func main() {
 	flowBandOverrides  := handlers.NewFlowBandOverrideHandler(pool, devFallbackID)
 	cluster        := handlers.NewClusterHandler(pool, devFallbackID)
 	upvote         := handlers.NewUpvoteHandler(pool, devFallbackID)
+	meGauges       := handlers.NewUserGaugesHandler(pool, devFallbackID).WithPoller(p)
 	moderation     := handlers.NewModerationHandler(pool, devFallbackID)
 	discover       := handlers.NewDiscoverHandler(pool)
 	preferences   := handlers.NewPreferencesHandler(pool, devFallbackID)
@@ -222,6 +223,9 @@ func main() {
 		r.Get("/me/reaches/{slug}/flow-band-override",    flowBandOverrides.GetOwn)
 		r.Put("/me/reaches/{slug}/flow-band-override",    flowBandOverrides.UpsertOwn)
 		r.Delete("/me/reaches/{slug}/flow-band-override", flowBandOverrides.DeleteOwn)
+
+		r.Get("/me/gauges", meGauges.List)
+		r.Post("/me/gauges/{id}/refresh", meGauges.Refresh)
 
 		// /me/runs/{slug} — user-facing aliases for /me/reaches/{slug}
 		r.Get("/me/runs", userReaches.List)
