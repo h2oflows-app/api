@@ -186,6 +186,8 @@ func main() {
 		r.Get("/stats", reaches.Stats)
 		r.Get("/discover/runs", discover.ListRuns)
 		r.Get("/admin/slug-check", admin.SlugCheck)
+		// NLDI upstream-tributaries is public — run detail page needs it without auth.
+		r.Get("/nldi/upstream-tributaries", nldiH.UpstreamTributaries)
 
 		// Authenticated user routes — require a valid Supabase JWT.
 		r.Group(func(r chi.Router) {
@@ -193,8 +195,6 @@ func main() {
 			r.Get("/watchlist", watchlist.List)
 			r.Post("/watchlist", watchlist.Add)
 			r.Delete("/watchlist/{gaugeId}", watchlist.Remove)
-			// NLDI read-only endpoints — public NHD data, no admin role required.
-			r.Get("/nldi/upstream-tributaries", nldiH.UpstreamTributaries)
 			r.Get("/nldi/downstream", nldiH.DownstreamMainstem)
 			r.Get("/nldi/river-name", nldiH.RiverName)
 			r.Get("/nldi/preview-centerline", nldiH.PreviewCenterline)
