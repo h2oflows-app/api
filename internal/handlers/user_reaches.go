@@ -177,6 +177,7 @@ type userReachDetail struct {
 	AccessPoints          []userReachAccessPoint `json:"access_points"`
 	UpvoteCount           int                    `json:"upvote_count"`
 	UserUpvoted           bool                   `json:"user_upvoted"`
+	IsOwn                 bool                   `json:"is_own"`
 }
 
 // ── MapAll ────────────────────────────────────────────────────────────────────
@@ -880,6 +881,7 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 	}
 
 	d.IsOfficial = (d.AuthorHandle == nil)
+	d.IsOwn = callerID != "" && callerID == authorID
 
 	if geojsonBytes != nil {
 		raw := json.RawMessage(geojsonBytes)
