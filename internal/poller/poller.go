@@ -3,6 +3,7 @@ package poller
 import (
 	"context"
 	"log"
+	"math"
 	"sync"
 	"time"
 
@@ -119,6 +120,9 @@ func (p *Poller) pollSource(ctx context.Context, sc sourceConfig) {
 	var wg sync.WaitGroup
 
 	for _, g := range gauges {
+		if !g.shouldPollNow() {
+			continue
+		}
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(g dbGauge) {
@@ -180,6 +184,7 @@ func (p *Poller) fetchAndStore(ctx context.Context, src gauge.GaugeSource, g dbG
 		return
 	}
 	p.recordSuccess(ctx, g.id)
+	p.updateDetectedInterval(ctx, g.id)
 }
 
 // writeReading inserts a reading into gauge_readings and updates the
@@ -400,6 +405,54 @@ func (p *Poller) FetchNowIfStale(ctx context.Context, gaugeID string, maxAge tim
 	}
 	p.recordSuccess(ctx, gaugeID)
 	return true
+}
+
+// updateDetectedInterval recomputes detected_interval_seconds from the last 6
+// stored readings (giving 5 intervals). No-ops if fewer than 5 readings exist.
+func (p *Poller) updateDetectedInterval(ctx context.Context, gaugeID string) {
+	rows, err := p.db.Query(ctx, `
+		SELECT timestamp FROM gauge_readings
+		WHERE  gauge_id = $1
+		ORDER  BY timestamp DESC
+		LIMIT  6
+	`, gaugeID)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	var ts []time.Time
+	for rows.Next() {
+		var t time.Time
+		if err := rows.Scan(&t); err != nil {
+			return
+		}
+		ts = append(ts, t)
+	}
+	if len(ts) < 5 {
+		return
+	}
+
+	var totalSec float64
+	n := 0
+	for i := 0; i < len(ts)-1; i++ {
+		gap := ts[i].Sub(ts[i+1]).Seconds()
+		if gap > 0 {
+			totalSec += gap
+			n++
+		}
+	}
+	if n == 0 {
+		return
+	}
+	avgSec := int(math.Round(totalSec / float64(n)))
+	if avgSec < 60 {
+		avgSec = 60 // sanity floor: 1 minute
+	}
+	_, _ = p.db.Exec(ctx,
+		`UPDATE gauges SET detected_interval_seconds = $2 WHERE id = $1`,
+		gaugeID, avgSec,
+	)
 }
 
 // --- Historical backfill ----------------------------------------------------
@@ -765,9 +818,46 @@ func (p *Poller) applyMetadata(ctx context.Context, gaugeID string, site *gauge.
 
 // --- DB helpers -------------------------------------------------------------
 
+// adaptiveFloor is the minimum effective poll interval for any gauge.
+const adaptiveFloor = 5 * time.Minute
+
+// adaptiveCap is the maximum effective poll interval.
+const adaptiveCap = 24 * time.Hour
+
 type dbGauge struct {
-	id         string
-	externalID string
+	id                   string
+	externalID           string
+	pollIntervalSecs     *int
+	detectedIntervalSecs *int
+	lastReadingAt        *time.Time
+}
+
+// effectiveInterval returns how long to wait between polls for this gauge.
+// MAX(manual override, detected interval, 5 min floor), capped at 24 h.
+func effectiveInterval(poll, detected *int) time.Duration {
+	var maxSec int
+	if poll != nil && *poll > maxSec {
+		maxSec = *poll
+	}
+	if detected != nil && *detected > maxSec {
+		maxSec = *detected
+	}
+	d := time.Duration(maxSec) * time.Second
+	if d < adaptiveFloor {
+		d = adaptiveFloor
+	}
+	if d > adaptiveCap {
+		d = adaptiveCap
+	}
+	return d
+}
+
+// shouldPollNow reports whether enough time has elapsed since the last reading.
+func (g dbGauge) shouldPollNow() bool {
+	if g.lastReadingAt == nil {
+		return true
+	}
+	return time.Since(*g.lastReadingAt) >= effectiveInterval(g.pollIntervalSecs, g.detectedIntervalSecs)
 }
 
 // loadGauges returns gauges for the given source that should be polled this tick.
@@ -775,7 +865,9 @@ type dbGauge struct {
 // gauge input, or user reach primary gauge).
 func (p *Poller) loadGauges(ctx context.Context, sourceName string) ([]dbGauge, error) {
 	rows, err := p.db.Query(ctx, `
-		SELECT g.id, g.external_id
+		SELECT g.id, g.external_id,
+		       g.poll_interval_seconds, g.detected_interval_seconds,
+		       g.last_reading_at
 		FROM   gauges g
 		WHERE  g.source = $1
 		  AND  g.status IN ('active', 'seasonal', 'maintenance')
@@ -808,7 +900,11 @@ func (p *Poller) loadGauges(ctx context.Context, sourceName string) ([]dbGauge, 
 	var out []dbGauge
 	for rows.Next() {
 		var g dbGauge
-		if err := rows.Scan(&g.id, &g.externalID); err != nil {
+		if err := rows.Scan(
+			&g.id, &g.externalID,
+			&g.pollIntervalSecs, &g.detectedIntervalSecs,
+			&g.lastReadingAt,
+		); err != nil {
 			return nil, err
 		}
 		out = append(out, g)
