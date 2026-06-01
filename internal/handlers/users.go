@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -244,4 +245,33 @@ func (h *UserProfileHandler) MapAllByHandle(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "public, max-age=30")
 	_ = json.NewEncoder(w).Encode(featureCollection{Type: "FeatureCollection", Features: features})
+}
+
+// GET /api/v1/users/search?q= — handle prefix search, limit 10, public.
+func (h *UserProfileHandler) Search(w http.ResponseWriter, r *http.Request) {
+	q := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q"))), "@")
+	type result struct {
+		Handle string `json:"handle"`
+	}
+	out := make([]result, 0)
+	if len(q) < 2 {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out)
+		return
+	}
+	rows, err := h.db.Query(r.Context(),
+		`SELECT handle FROM user_profiles WHERE LOWER(handle) LIKE $1 ORDER BY handle LIMIT 10`,
+		q+"%",
+	)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var handle string
+			if rows.Scan(&handle) == nil {
+				out = append(out, result{Handle: handle})
+			}
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
 }
