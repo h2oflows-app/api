@@ -252,8 +252,10 @@ func main() {
 		r.Get("/user-runs/{runId}/flow-proposals", flowProposals.ListByRunID)
 		r.Post("/user-runs/{runId}/flow-proposals", flowProposals.UpsertByRunID)
 		r.Get("/user-runs/{runId}/reports", reports.ListByRunID)
+		r.Get("/users/search", userProfiles.Search)
 		r.Get("/users/{handle}", userProfiles.GetProfile)
 		r.Get("/users/{handle}/runs/map/all", userProfiles.MapAllByHandle)
+		r.Get("/users/{handle}/runs/{slug}", userReaches.GetPublicByHandle)
 
 		r.Get("/user-runs/community", userReaches.ListCommunity)
 		r.Get("/user-runs/map/community", userReaches.MapCommunity)

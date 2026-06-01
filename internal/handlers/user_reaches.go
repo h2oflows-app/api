@@ -12,15 +12,18 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
+	gauge "github.com/h2oflow/h2oflow/apps/api/internal/gaugecore"
 	"github.com/h2oflow/h2oflow/apps/api/internal/kmlimport"
+	"github.com/h2oflow/h2oflow/apps/api/internal/nldi"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // resolveOrCreateRiver finds a river by GNIS ID (preferred) or name, backfilling
 // gnis_id on existing legacy rows when a new GNIS match is now available. When
 // no match exists, INSERTs a new river — populating state_abbr/basin/huc8 via
-// NHD + WBD/TIGERweb when gnisID is present. Returns river ID, "" on failure.
-func resolveOrCreateRiver(ctx context.Context, db *pgxpool.Pool, riverName, gnisID string) string {
+// NHD + WBD/TIGERweb when gnisID is present, or via put-in coords when not.
+// Returns river ID, "" on failure.
+func resolveOrCreateRiver(ctx context.Context, db *pgxpool.Pool, riverName, gnisID string, putInLat, putInLng float64) string {
 	riverSlug := kmlimport.Slugify(riverName)
 	var rid string
 
@@ -55,6 +58,8 @@ func resolveOrCreateRiver(ctx context.Context, db *pgxpool.Pool, riverName, gnis
 		if gnisID != "" {
 			gnisParam = gnisID
 			stateAbbr, basin, huc8 = riverMetaFromGNIS(ctx, gnisID)
+		} else if putInLat != 0 && putInLng != 0 {
+			stateAbbr, basin, huc8 = riverMetaFromCoords(ctx, putInLat, putInLng)
 		}
 		_ = db.QueryRow(ctx, `
 			INSERT INTO rivers (slug, name, gnis_id, state_abbr, basin, huc8)
@@ -69,6 +74,24 @@ func resolveOrCreateRiver(ctx context.Context, db *pgxpool.Pool, riverName, gnis
 		`, riverSlug, riverName, gnisParam, stateAbbr, basin, huc8).Scan(&rid)
 	}
 	return rid
+}
+
+// riverMetaFromCoords resolves state/basin/huc8 from a lat/lng directly —
+// used when a stream has no GNIS ID (unnamed tributaries, custom routes).
+func riverMetaFromCoords(ctx context.Context, lat, lng float64) (stateAbbr, basin, huc8 string) {
+	stateCh := make(chan string, 1)
+	type basinResult struct{ info nldi.BasinInfo }
+	basinCh := make(chan basinResult, 1)
+	go func() { v, _ := nldi.StateAt(ctx, lat, lng); stateCh <- v }()
+	go func() { v, _ := nldi.BasinAt(ctx, lat, lng); basinCh <- basinResult{v} }()
+	stateAbbr = <-stateCh
+	basinRes := <-basinCh
+	if stateAbbr == "" && basinRes.info.States != "" {
+		stateAbbr = strings.SplitN(basinRes.info.States, ",", 2)[0]
+	}
+	basin = gauge.CanonicalBasin(basinRes.info.HUC8)
+	huc8 = basinRes.info.HUC8
+	return
 }
 
 // UserReachHandler handles /api/v1/me/reaches routes.
@@ -1016,7 +1039,7 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var finalRiverName *string
 	if rn := strings.TrimSpace(body.RiverName); rn != "" {
 		finalRiverName = &rn
-		rid := resolveOrCreateRiver(ctx, h.db, rn, body.GnisID)
+		rid := resolveOrCreateRiver(ctx, h.db, rn, body.GnisID, body.PutIn.Lat, body.PutIn.Lng)
 		if rid != "" {
 			riverID = &rid
 		}
@@ -1141,7 +1164,7 @@ func (h *UserReachHandler) Import(w http.ResponseWriter, r *http.Request) { //no
 	var finalRiverName *string
 	if rn := strings.TrimSpace(body.RiverName); rn != "" {
 		finalRiverName = &rn
-		rid := resolveOrCreateRiver(ctx, h.db, rn, body.GnisID)
+		rid := resolveOrCreateRiver(ctx, h.db, rn, body.GnisID, body.PutIn.Lat, body.PutIn.Lng)
 		if rid != "" {
 			riverID = &rid
 		}
@@ -1293,7 +1316,7 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		if body.GnisID != nil {
 			gnisID = strings.TrimSpace(*body.GnisID)
 		}
-		rid := resolveOrCreateRiver(ctx, h.db, *riverName, gnisID)
+		rid := resolveOrCreateRiver(ctx, h.db, *riverName, gnisID, 0, 0)
 		if rid != "" {
 			_, _ = h.db.Exec(ctx,
 				`UPDATE user_reaches SET river_id = $3 WHERE owner_id = $1 AND slug = $2`,
