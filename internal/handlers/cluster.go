@@ -42,7 +42,6 @@ type clusterRun struct {
 	ID          string   `json:"id"`
 	Slug        string   `json:"slug"`
 	Name        string   `json:"name"`
-	Source      string   `json:"source"` // "curated" | "community"
 	AuthorHandle *string `json:"author_handle"`
 	IsOfficial  bool     `json:"is_official"`
 	ClassMin    *float64 `json:"class_min"`
@@ -73,7 +72,6 @@ func (h *ClusterHandler) nearbyRuns(r *http.Request, putInLat, putInLng, takeOut
 			ur.id::text,
 			ur.slug,
 			ur.name,
-			'community' AS source,
 			up.handle AS author_handle,
 			FALSE AS is_official,
 			ur.class_min,
@@ -104,7 +102,6 @@ func (h *ClusterHandler) nearbyRuns(r *http.Request, putInLat, putInLng, takeOut
 			r.id::text,
 			r.slug,
 			COALESCE(r.common_name, r.name) AS name,
-			'curated' AS source,
 			NULL AS author_handle,
 			TRUE AS is_official,
 			r.class_min,
@@ -146,7 +143,7 @@ func (h *ClusterHandler) nearbyRuns(r *http.Request, putInLat, putInLng, takeOut
 	for rows.Next() {
 		var cr clusterRun
 		if err := rows.Scan(
-			&cr.ID, &cr.Slug, &cr.Name, &cr.Source,
+			&cr.ID, &cr.Slug, &cr.Name,
 			&cr.AuthorHandle, &cr.IsOfficial,
 			&cr.ClassMin, &cr.ClassMax,
 			&cr.PutInLng, &cr.PutInLat, &cr.TakeOutLng, &cr.TakeOutLat,
