@@ -84,7 +84,7 @@ BEGIN
                    WHEN 'runnable'      THEN 'running'
                    WHEN 'high_runnable' THEN 'high'
                END,
-               min_cfs, max_cfs
+               min_value, max_value
         FROM flow_ranges
         WHERE reach_id = src.id
           AND label IN ('low_runnable','runnable','high_runnable')
