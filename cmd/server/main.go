@@ -360,6 +360,7 @@ func main() {
 		r.Patch("/me/preferences", preferences.Update)
 		r.Get("/me/profile", profile.Get)
 		r.Patch("/me/profile", profile.Update)
+		r.Post("/me/profile/suggest", profile.Suggest)
 		r.Get("/me/dashboards", dashboards.List)
 		r.Post("/me/dashboards", dashboards.Create)
 		r.Get("/me/dashboards/{slug}", dashboards.Get)

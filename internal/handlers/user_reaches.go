@@ -15,6 +15,8 @@ import (
 	gauge "github.com/h2oflow/h2oflow/apps/api/internal/gaugecore"
 	"github.com/h2oflow/h2oflow/apps/api/internal/kmlimport"
 	"github.com/h2oflow/h2oflow/apps/api/internal/nldi"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -1776,36 +1778,34 @@ func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 
 // ── Fork ─────────────────────────────────────────────────────────────────────
 
-// POST /api/v1/me/reaches/fork-reach/{slug}
-// Clones a curated reach (reaches table) into a new user_reaches row owned by
-// the authenticated user. Copies name, geometry, centerline, class, and gauge.
-func (h *UserReachHandler) ForkReach(w http.ResponseWriter, r *http.Request) {
-	ownerID, ok := h.ownerID(r)
-	if !ok {
-		errorResponse(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-	sourceSlug := chi.URLParam(r, "slug")
-	ctx := r.Context()
+// pgxQueryer is satisfied by both *pgxpool.Pool and pgx.Tx — lets fork logic
+// run inside a transaction (watchlist auto-fork) or standalone (ForkReach).
+type pgxQueryer interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
 
-	// Load the source curated reach.
+// forkCuratedReachTx forks a curated reaches row into user_reaches for ownerID.
+// Returns (newID, newSlug, nil) on success. Returns ErrNotFound-style error if
+// the source slug doesn't exist. Callers handle the http status mapping.
+func forkCuratedReachTx(ctx context.Context, q pgxQueryer, ownerID, sourceSlug string) (newID, newSlug string, err error) {
 	type srcRow struct {
-		ID          string
-		Name        string
-		CommonName  *string
-		RiverID     *string
-		RiverName   *string
-		ClassMin    *float64
-		ClassMax    *float64
-		GaugeID     *string
-		PutInLng    float64
-		PutInLat    float64
-		TakeOutLng  float64
-		TakeOutLat  float64
-		Centerline  []byte
+		ID         string
+		Name       string
+		CommonName *string
+		RiverID    *string
+		RiverName  *string
+		ClassMin   *float64
+		ClassMax   *float64
+		GaugeID    *string
+		PutInLng   float64
+		PutInLat   float64
+		TakeOutLng float64
+		TakeOutLat float64
+		Centerline []byte
 	}
 	var src srcRow
-	err := h.db.QueryRow(ctx, `
+	err = q.QueryRow(ctx, `
 		SELECT
 			r.id,
 			r.name,
@@ -1833,31 +1833,27 @@ func (h *UserReachHandler) ForkReach(w http.ResponseWriter, r *http.Request) {
 		&src.Centerline,
 	)
 	if err != nil {
-		errorResponse(w, http.StatusNotFound, "reach not found")
-		return
+		return "", "", fmt.Errorf("reach not found: %w", err)
 	}
 
-	// Use common_name as the fork's display name if available.
 	forkName := src.Name
 	if src.CommonName != nil && *src.CommonName != "" {
 		forkName = *src.CommonName
 	}
 
-	// Unique slug for the fork (append owner suffix then counter).
 	baseSlug := kmlimport.Slugify(forkName)
-	slug := baseSlug
+	newSlug = baseSlug
 	for i := 2; i <= 20; i++ {
 		var existing string
-		if e := h.db.QueryRow(ctx,
-			`SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2`, ownerID, slug,
+		if e := q.QueryRow(ctx,
+			`SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2`, ownerID, newSlug,
 		).Scan(&existing); e != nil {
 			break
 		}
-		slug = fmt.Sprintf("%s-%d", baseSlug, i)
+		newSlug = fmt.Sprintf("%s-%d", baseSlug, i)
 	}
 
-	var newID string
-	if err = h.db.QueryRow(ctx, `
+	if err = q.QueryRow(ctx, `
 		INSERT INTO user_reaches
 			(owner_id, slug, name, river_id, river_name,
 			 put_in, take_out,
@@ -1870,27 +1866,24 @@ func (h *UserReachHandler) ForkReach(w http.ResponseWriter, r *http.Request) {
 			 $10, $11, $12::uuid,
 			 $13::uuid, NOW())
 		RETURNING id
-	`, ownerID, slug, forkName, src.RiverID, src.RiverName,
+	`, ownerID, newSlug, forkName, src.RiverID, src.RiverName,
 		src.PutInLng, src.PutInLat,
 		src.TakeOutLng, src.TakeOutLat,
 		src.ClassMin, src.ClassMax, src.GaugeID,
 		src.ID,
 	).Scan(&newID); err != nil {
-		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("fork failed: %v", err))
-		return
+		return "", "", fmt.Errorf("fork insert failed: %w", err)
 	}
 
-	// Copy centerline if source has one.
 	if len(src.Centerline) > 0 {
-		_, _ = h.db.Exec(ctx, `
+		_, _ = q.Exec(ctx, `
 			UPDATE user_reaches
 			SET centerline = ST_GeomFromGeoJSON($2)::geography
 			WHERE id = $1
 		`, newID, string(src.Centerline))
 	}
 
-	// Map curated 5-tier flow_ranges → user 3-tier bands.
-	_, _ = h.db.Exec(ctx, `
+	_, _ = q.Exec(ctx, `
 		INSERT INTO user_reach_flow_ranges (user_reach_id, label, min_value, max_value)
 		SELECT $1,
 		       CASE label
@@ -1905,7 +1898,29 @@ func (h *UserReachHandler) ForkReach(w http.ResponseWriter, r *http.Request) {
 		ON CONFLICT (user_reach_id, label) DO NOTHING
 	`, newID, src.ID)
 
-	jsonResponse(w, http.StatusCreated, map[string]string{"id": newID, "slug": slug})
+	return newID, newSlug, nil
+}
+
+// POST /api/v1/me/reaches/fork-reach/{slug}
+// Clones a curated reach (reaches table) into a new user_reaches row owned by
+// the authenticated user. Copies name, geometry, centerline, class, and gauge.
+func (h *UserReachHandler) ForkReach(w http.ResponseWriter, r *http.Request) {
+	ownerID, ok := h.ownerID(r)
+	if !ok {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	sourceSlug := chi.URLParam(r, "slug")
+	newID, newSlug, err := forkCuratedReachTx(r.Context(), h.db, ownerID, sourceSlug)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			errorResponse(w, http.StatusNotFound, "reach not found")
+			return
+		}
+		errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	jsonResponse(w, http.StatusCreated, map[string]string{"id": newID, "slug": newSlug})
 }
 
 // ── ListCommunity ─────────────────────────────────────────────────────────────

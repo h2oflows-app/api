@@ -139,27 +139,93 @@ func (h *WatchlistHandler) Add(w http.ResponseWriter, r *http.Request) {
 		dashboardID = &dbID
 	}
 
+	// Auto-fork: if reach_slug points to a curated reaches row (not owned by this
+	// user in user_reaches), fork it into the caller's namespace inside one tx
+	// and rewrite reach_slug to the new fork slug before inserting the watchlist.
+	finalReachSlug := body.ReachSlug
+	if body.ReachSlug != nil && *body.ReachSlug != "" {
+		tx, err := h.db.Begin(r.Context())
+		if err != nil {
+			errorResponse(w, http.StatusInternalServerError, "tx begin failed")
+			return
+		}
+		defer tx.Rollback(r.Context())
+
+		var ownedID string
+		ownErr := tx.QueryRow(r.Context(),
+			`SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2`,
+			userID, *body.ReachSlug,
+		).Scan(&ownedID)
+		if ownErr != nil {
+			// Not owned by caller — check if curated reach exists; if yes, fork.
+			var curatedID string
+			cErr := tx.QueryRow(r.Context(),
+				`SELECT id FROM reaches WHERE slug = $1`, *body.ReachSlug,
+			).Scan(&curatedID)
+			if cErr == nil {
+				_, newSlug, fErr := forkCuratedReachTx(r.Context(), tx, userID, *body.ReachSlug)
+				if fErr != nil {
+					errorResponse(w, http.StatusInternalServerError, "fork failed: "+fErr.Error())
+					return
+				}
+				finalReachSlug = &newSlug
+			}
+			// else: slug is for another user's user_reaches — leave as-is; insert will
+			// either fail FK or pin a reference. (No cross-user fork via watchlist yet.)
+		}
+
+		var insertErr error
+		switch {
+		case body.GaugeID != nil:
+			_, insertErr = tx.Exec(r.Context(), `
+				INSERT INTO user_watchlists (user_id, gauge_id, reach_slug, dashboard_id)
+				VALUES ($1, $2::uuid, $3, $4::uuid)
+				ON CONFLICT DO NOTHING
+			`, userID, body.GaugeID, finalReachSlug, dashboardID)
+		case body.CustomGaugeID != nil:
+			_, insertErr = tx.Exec(r.Context(), `
+				INSERT INTO user_watchlists (user_id, custom_gauge_id, reach_slug, dashboard_id)
+				VALUES ($1, $2::uuid, $3, $4::uuid)
+				ON CONFLICT DO NOTHING
+			`, userID, body.CustomGaugeID, finalReachSlug, dashboardID)
+		default:
+			_, insertErr = tx.Exec(r.Context(), `
+				INSERT INTO user_watchlists (user_id, reach_slug, dashboard_id)
+				VALUES ($1, $2, $3::uuid)
+				ON CONFLICT DO NOTHING
+			`, userID, finalReachSlug, dashboardID)
+		}
+		if insertErr != nil {
+			errorResponse(w, http.StatusInternalServerError, "insert failed")
+			return
+		}
+		if err := tx.Commit(r.Context()); err != nil {
+			errorResponse(w, http.StatusInternalServerError, "commit failed")
+			return
+		}
+
+		jsonResponse(w, http.StatusOK, map[string]any{
+			"reach_slug":   finalReachSlug,
+			"dashboard_id": dashboardID,
+		})
+		return
+	}
+
+	// No reach_slug: pure gauge/custom_gauge watchlist add — no fork path.
 	var err error
 	switch {
 	case body.GaugeID != nil:
 		_, err = h.db.Exec(r.Context(), `
-			INSERT INTO user_watchlists (user_id, gauge_id, reach_slug, dashboard_id)
-			VALUES ($1, $2::uuid, $3, $4::uuid)
+			INSERT INTO user_watchlists (user_id, gauge_id, dashboard_id)
+			VALUES ($1, $2::uuid, $3::uuid)
 			ON CONFLICT DO NOTHING
-		`, userID, body.GaugeID, body.ReachSlug, dashboardID)
+		`, userID, body.GaugeID, dashboardID)
 	case body.CustomGaugeID != nil:
 		_, err = h.db.Exec(r.Context(), `
-			INSERT INTO user_watchlists (user_id, custom_gauge_id, reach_slug, dashboard_id)
-			VALUES ($1, $2::uuid, $3, $4::uuid)
+			INSERT INTO user_watchlists (user_id, custom_gauge_id, dashboard_id)
+			VALUES ($1, $2::uuid, $3::uuid)
 			ON CONFLICT DO NOTHING
-		`, userID, body.CustomGaugeID, body.ReachSlug, dashboardID)
-	default:
-		// Reach-only entry: ungauged user reach pinned to a dashboard.
-		_, err = h.db.Exec(r.Context(), `
-			INSERT INTO user_watchlists (user_id, reach_slug, dashboard_id)
-			VALUES ($1, $2, $3::uuid)
-			ON CONFLICT DO NOTHING
-		`, userID, body.ReachSlug, dashboardID)
+		`, userID, body.CustomGaugeID, dashboardID)
 	}
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "insert failed")
