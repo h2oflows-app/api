@@ -646,9 +646,10 @@ func (h *ReportHandler) Get(w http.ResponseWriter, r *http.Request) {
 		FlowBand       *string  `json:"flow_band,omitempty"`
 		AWsyncedAt     *string  `json:"aw_synced_at,omitempty"`
 		CreatedAt      string   `json:"created_at"`
-		ReachName      string   `json:"reach_name"`
-		ReachSlug      string   `json:"reach_slug"`
-		IsUserRun      bool     `json:"is_user_run"`
+		ReachName        string  `json:"reach_name"`
+		ReachSlug        string  `json:"reach_slug"`
+		ReachAuthorHandle *string `json:"reach_author_handle"`
+		IsUserRun        bool    `json:"is_user_run"`
 	}
 
 	var d detail
@@ -660,20 +661,22 @@ func (h *ReportHandler) Get(w http.ResponseWriter, r *http.Request) {
 			rp.name, rp.report_date::TEXT, rp.report_time::TEXT,
 			rp.content, rp.paddled,
 			rp.flow_cfs, rp.flow_band, rp.aw_synced_at, rp.created_at,
-			COALESCE(re.name, ur.name, '')   AS reach_name,
-			COALESCE(re.slug, ur.slug, '')   AS reach_slug,
-			(rp.user_reach_id IS NOT NULL)   AS is_user_run
+			COALESCE(re.name, ur.name, '')    AS reach_name,
+			COALESCE(re.slug, ur.slug, '')    AS reach_slug,
+			rup.handle                        AS reach_author_handle,
+			(rp.user_reach_id IS NOT NULL)    AS is_user_run
 		FROM reports rp
 		LEFT JOIN user_profiles up ON up.owner_id = rp.owner_id
 		LEFT JOIN reaches re ON re.id = rp.reach_id
 		LEFT JOIN user_reaches ur ON ur.id = rp.user_reach_id
+		LEFT JOIN user_profiles rup ON rup.owner_id = ur.owner_id
 		WHERE rp.id = $1 AND rp.deleted_at IS NULL
 	`, id).Scan(
 		&d.ID, &d.Slug, &d.Handle,
 		&d.Name, &d.ReportDate, &d.ReportTime,
 		&d.Content, &d.Paddled,
 		&d.FlowCFS, &d.FlowBand, &awSyncedAt, &createdAt,
-		&d.ReachName, &d.ReachSlug, &d.IsUserRun,
+		&d.ReachName, &d.ReachSlug, &d.ReachAuthorHandle, &d.IsUserRun,
 	)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "report not found")
@@ -822,12 +825,14 @@ func (h *ReportHandler) ListMine(w http.ResponseWriter, r *http.Request) {
 			rp.name, rp.report_date::TEXT, rp.report_time::TEXT,
 			rp.content, rp.paddled,
 			rp.flow_cfs, rp.flow_band, rp.created_at,
-			COALESCE(re.name, ur.name, '') AS reach_name,
-			COALESCE(re.slug, ur.slug, '') AS reach_slug,
+			COALESCE(re.name, ur.name, '')    AS reach_name,
+			COALESCE(re.slug, ur.slug, '')    AS reach_slug,
+			rup.handle                        AS reach_author_handle,
 			up.handle
 		FROM reports rp
 		LEFT JOIN reaches re ON re.id = rp.reach_id
 		LEFT JOIN user_reaches ur ON ur.id = rp.user_reach_id
+		LEFT JOIN user_profiles rup ON rup.owner_id = ur.owner_id
 		LEFT JOIN user_profiles up ON up.owner_id = rp.owner_id
 		WHERE rp.owner_id = $1 AND rp.deleted_at IS NULL
 		ORDER BY rp.report_date DESC, rp.created_at DESC
@@ -840,19 +845,20 @@ func (h *ReportHandler) ListMine(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type myReport struct {
-		ID         string   `json:"id"`
-		Slug       string   `json:"slug"`
-		Name       string   `json:"name"`
-		ReportDate string   `json:"report_date"`
-		ReportTime *string  `json:"report_time,omitempty"`
-		Content    string   `json:"content"`
-		Paddled    bool     `json:"paddled"`
-		FlowCFS    *float64 `json:"flow_cfs,omitempty"`
-		FlowBand   *string  `json:"flow_band,omitempty"`
-		CreatedAt  string   `json:"created_at"`
-		ReachName  string   `json:"reach_name"`
-		ReachSlug  string   `json:"reach_slug"`
-		URL        string   `json:"url,omitempty"`
+		ID                string   `json:"id"`
+		Slug              string   `json:"slug"`
+		Name              string   `json:"name"`
+		ReportDate        string   `json:"report_date"`
+		ReportTime        *string  `json:"report_time,omitempty"`
+		Content           string   `json:"content"`
+		Paddled           bool     `json:"paddled"`
+		FlowCFS           *float64 `json:"flow_cfs,omitempty"`
+		FlowBand          *string  `json:"flow_band,omitempty"`
+		CreatedAt         string   `json:"created_at"`
+		ReachName         string   `json:"reach_name"`
+		ReachSlug         string   `json:"reach_slug"`
+		ReachAuthorHandle *string  `json:"reach_author_handle"`
+		URL               string   `json:"url,omitempty"`
 	}
 
 	var reports []myReport
@@ -866,6 +872,7 @@ func (h *ReportHandler) ListMine(w http.ResponseWriter, r *http.Request) {
 			&rep.Content, &rep.Paddled,
 			&rep.FlowCFS, &rep.FlowBand, &createdAt,
 			&rep.ReachName, &rep.ReachSlug,
+			&rep.ReachAuthorHandle,
 			&handle,
 		); err != nil {
 			errorResponse(w, http.StatusInternalServerError, "scan failed")
