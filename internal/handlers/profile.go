@@ -4,13 +4,16 @@ import (
 	"encoding/json"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-var handleRe = regexp.MustCompile(`^[\p{L}\p{N} ',.\-]{1,50}$`)
+// handleRe enforces URL-safe handles: 3-30 chars, lowercase a-z/0-9, hyphen/underscore
+// allowed inside, must start with letter/digit. Used for /runs/{handle}/{slug}.
+var handleRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{2,29}$`)
 
 // ProfileHandler handles /me/profile routes.
 type ProfileHandler struct {
@@ -74,12 +77,12 @@ func (h *ProfileHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if body.Handle != nil {
-		h := strings.TrimSpace(*body.Handle)
-		if !handleRe.MatchString(h) {
-			errorResponse(w, http.StatusBadRequest, "name must be 1–50 characters")
+		hv := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(*body.Handle, "@")))
+		if !handleRe.MatchString(hv) {
+			errorResponse(w, http.StatusBadRequest, "handle must be 3-30 chars: a-z, 0-9, hyphen, underscore; start with letter/digit")
 			return
 		}
-		*body.Handle = h
+		*body.Handle = hv
 	}
 
 	ctx := r.Context()
@@ -102,4 +105,56 @@ func (h *ProfileHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonResponse(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// POST /me/profile/suggest — returns up to 5 available handle suggestions derived
+// from a seed (email or partial handle). Body: {"seed": "user@example.com"}.
+// Used by the post-signup claim modal to propose defaults.
+func (h *ProfileHandler) Suggest(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.ownerID(r); !ok {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var body struct {
+		Seed string `json:"seed"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		errorResponse(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	seed := strings.ToLower(strings.TrimSpace(body.Seed))
+	if i := strings.Index(seed, "@"); i > 0 {
+		seed = seed[:i]
+	}
+	// Slug-ify: keep a-z 0-9; collapse runs of other chars to hyphen.
+	cleaned := nonAlnumRe.ReplaceAllString(seed, "-")
+	cleaned = strings.Trim(cleaned, "-")
+	if len(cleaned) < 3 {
+		cleaned = "paddler"
+	}
+	if len(cleaned) > 28 {
+		cleaned = cleaned[:28]
+	}
+
+	out := make([]string, 0, 5)
+	candidates := []string{cleaned}
+	for i := 2; i <= 9 && len(candidates) < 8; i++ {
+		candidates = append(candidates, cleaned+"-"+strconv.Itoa(i))
+	}
+	for _, c := range candidates {
+		if !handleRe.MatchString(c) {
+			continue
+		}
+		var taken string
+		err := h.db.QueryRow(r.Context(),
+			`SELECT handle FROM user_profiles WHERE LOWER(handle) = LOWER($1)`, c,
+		).Scan(&taken)
+		if err != nil { // not found = available
+			out = append(out, c)
+			if len(out) >= 5 {
+				break
+			}
+		}
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"suggestions": out})
 }
