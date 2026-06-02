@@ -760,6 +760,7 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			ctx_reach.basin_group            AS context_reach_basin_group,
 			ctx_reach.center_lng             AS context_reach_center_lng,
 			ctx_reach.river_order            AS context_reach_river_order,
+			ctx_reach.author_handle          AS context_reach_author_handle,
 			g.current_cfs,
 			COALESCE(fr_band.flow_status, 'unknown') AS flow_status,
 			fr_band.label                    AS flow_band_label,
@@ -768,34 +769,58 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 		FROM ctx
 		JOIN gauges g ON g.id = ctx.gauge_id
 		LEFT JOIN LATERAL (
-			-- Resolve the context reach: use the requested slug if provided,
-			-- otherwise fall back to the alphabetically-first associated reach.
-			SELECT
-				COALESCE(rctx.common_name, rctx.name) AS common_name,
-				CASE WHEN rctx.put_in_name IS NOT NULL AND rctx.take_out_name IS NOT NULL
-				     THEN rctx.put_in_name || ' to ' || rctx.take_out_name
-				     ELSE NULL END                     AS full_name,
-				rctx.river_name,
-				COALESCE(rctx_rv.basin, g.watershed_name) AS basin_group,
-				-- Sort key: westernmost put-in = most upstream for CO rivers (west→east).
-				-- Falls back to centerline centroid when no put-in access point exists.
-				COALESCE(
-				    (SELECT MIN(ST_X(ra.location::geometry))
-				     FROM reach_access ra
-				     WHERE ra.reach_id = rctx.id
-				       AND ra.access_type = 'put_in'
-				       AND ra.location IS NOT NULL),
-				    ST_X(ST_Centroid(rctx.centerline::geometry))
-				) AS center_lng,
-				COALESCE(rctx.state_abbr, rctx_rv.state_abbr) AS state_abbr,
-				rctx.river_order
-			FROM reaches rctx
-			LEFT JOIN rivers rctx_rv ON rctx_rv.id = rctx.river_id
-			WHERE rctx.primary_gauge_id = g.id
-			  AND rctx.slug = COALESCE(
-			      ctx.reach_slug,
-			      (SELECT slug FROM reaches WHERE primary_gauge_id = g.id ORDER BY slug LIMIT 1)
-			  )
+			-- Resolve the context reach: curated reaches first, user reaches as fallback.
+			-- Use the requested slug if provided; else first alphabetical match per table.
+			SELECT common_name, full_name, river_name, basin_group, center_lng,
+			       state_abbr, river_order, author_handle
+			FROM (
+				SELECT
+					COALESCE(rctx.common_name, rctx.name) AS common_name,
+					CASE WHEN rctx.put_in_name IS NOT NULL AND rctx.take_out_name IS NOT NULL
+					     THEN rctx.put_in_name || ' to ' || rctx.take_out_name
+					     ELSE NULL END AS full_name,
+					rctx.river_name,
+					COALESCE(rctx_rv.basin, g.watershed_name) AS basin_group,
+					COALESCE(
+					    (SELECT MIN(ST_X(ra.location::geometry))
+					     FROM reach_access ra
+					     WHERE ra.reach_id = rctx.id
+					       AND ra.access_type = 'put_in'
+					       AND ra.location IS NOT NULL),
+					    ST_X(ST_Centroid(rctx.centerline::geometry))
+					) AS center_lng,
+					COALESCE(rctx.state_abbr, rctx_rv.state_abbr) AS state_abbr,
+					rctx.river_order,
+					NULL::text AS author_handle,
+					0 AS _prio
+				FROM reaches rctx
+				LEFT JOIN rivers rctx_rv ON rctx_rv.id = rctx.river_id
+				WHERE rctx.primary_gauge_id = g.id
+				  AND rctx.slug = COALESCE(
+				      ctx.reach_slug,
+				      (SELECT slug FROM reaches WHERE primary_gauge_id = g.id ORDER BY slug LIMIT 1)
+				  )
+				UNION ALL
+				SELECT
+					ur.name AS common_name,
+					NULL    AS full_name,
+					ur.river_name,
+					COALESCE(ur_rv.basin, g.watershed_name) AS basin_group,
+					ST_X(ur.put_in::geometry) AS center_lng,
+					ur_rv.state_abbr,
+					NULL::smallint AS river_order,
+					up.handle AS author_handle,
+					1 AS _prio
+				FROM user_reaches ur
+				LEFT JOIN rivers ur_rv ON ur_rv.id = ur.river_id
+				JOIN user_profiles up ON up.owner_id = ur.owner_id
+				WHERE ur.primary_gauge_id = g.id
+				  AND ur.slug = COALESCE(
+				      ctx.reach_slug,
+				      (SELECT slug FROM user_reaches WHERE primary_gauge_id = g.id ORDER BY slug LIMIT 1)
+				  )
+			) _cr
+			ORDER BY _prio ASC
 			LIMIT 1
 		) ctx_reach ON TRUE
 		LEFT JOIN LATERAL (
@@ -894,9 +919,10 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			contextReachFullName    *string
 			contextReachRiverName   *string
 			contextReachBasinGroup  *string
-			contextReachCenterLng   *float64
-			contextReachRiverOrder  *int16
-			currentCFS              *float64
+			contextReachCenterLng      *float64
+			contextReachRiverOrder     *int16
+			contextReachAuthorHandle   *string
+			currentCFS                 *float64
 			flowStatus             string
 			flowBandLabel          *string
 			pollHealth             string
@@ -908,7 +934,7 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			&reachNamesRaw, &reachSlugsRaw, &reachCommonNamesRaw,
 			&reachRelationship, &lastReadingAt,
 			&lng, &lat, &stateAbbr, &basinName, &watershedName,
-			&contextReachCommonName, &contextReachFullName, &contextReachRiverName, &contextReachBasinGroup, &contextReachCenterLng, &contextReachRiverOrder,
+			&contextReachCommonName, &contextReachFullName, &contextReachRiverName, &contextReachBasinGroup, &contextReachCenterLng, &contextReachRiverOrder, &contextReachAuthorHandle,
 			&currentCFS, &flowStatus, &flowBandLabel,
 			&pollHealth, &lastPollSuccessAt,
 		); err != nil {
@@ -947,6 +973,7 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 				"context_reach_basin_group":   contextReachBasinGroup,
 				"context_reach_center_lng":    contextReachCenterLng,
 				"context_reach_river_order":   contextReachRiverOrder,
+				"context_reach_author_handle": contextReachAuthorHandle,
 				"current_cfs":                 currentCFS,
 				"flow_status":                 flowStatus,
 				"flow_band_label":             flowBandLabel,
