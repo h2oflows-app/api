@@ -1,8 +1,8 @@
 # H2OFlows Roadmap
 
-Current state as of May 2026. Phase 1 (gauge dashboard + reach pages + AI assistant) is complete. Backend routes exist for trip reports, trips, contributions, and proximity events — the frontend for those is stub. Everything below is unbuilt or incomplete.
+Current state as of June 2026. Phase 1 (gauge dashboard + reach pages + AI assistant) is complete. Backend routes exist for trip reports, trips, contributions, and proximity events — the frontend for those is stub. Everything below is unbuilt or incomplete.
 
-**Status snapshot (2026-05-23):**
+**Status snapshot (2026-06-03):**
 - ✅ Phase 2 (2.1–2.6) — shipped 2026-05-06
 - ✅ Phase 2b (2b.1–2b.7) — shipped 2026-05-07
 - ✅ Repository restructure — completed 2026-05-13; live at `h2oflows-app/{api,web,docs}`
@@ -13,6 +13,9 @@ Current state as of May 2026. Phase 1 (gauge dashboard + reach pages + AI assist
 - ✅ **Dashboard UX polish — web#67/#68 — merged 2026-05-21.** Full view mode, sparkline full-width in comfortable/full, 12h/24h selector top-left, card consistency, mobile hides full-mode button.
 - ✅ **[web#16] 2c.4 PRs A/B/C — 30d retention, poll status UI, admin gauges page — shipped 2026-05-22** (api#14–19, web#69–71)
 - ✅ **Umbrella A: UGC shift — merged 2026-05-23, tagged v0.4.0.** Runs rename, author model, fork, reports on user runs, features + KML import, community flow proposals + voting, clustering + dupe prevention, upvotes, anon read-only at `/runs/u/:id`, moderation primitives (abuse flags + admin queue).
+- ✅ **Umbrella G: UX Polish batch — merged 2026-05-31, tagged v0.6.0.** Dashboard filter removal, explore sidebar cleanup, forked-from inline, self-upvote guard, run editor polish (DashboardMembershipPicker, ask/override removal, KML move, similar-runs @handle), /my/runs table, gaugeSourceUrl util, admin Last CFS column, /me/gauges + refresh endpoint, /my/gauges page, /users/{handle}/runs/map/all, explore Browse User mode, NLDI tributary overlay, adaptive poll intervals.
+- ✅ **Umbrella I: All-user ownership + handle URLs — merged 2026-06-03.** Fork-on-add + handle claim, /runs/{handle}/{slug} routing, explore 3-tab redesign, dashboard card refactor, /my/runs retired, owner toolbar, curated concept dropped. Migration 106 (watchlist fork) + 107 (long_name). All runs user-owned; h2oflows curator handle for official content.
+- ✅ **long_name on user_reaches — merged 2026-06-03** (api#68, web#159). Migration 107 adds nullable `long_name` column; backfills forked runs from curated reach name. Editor exposes Short name + Full name fields. Dashboard shows full name as subtitle.
 - ⏳ **LLM audit (PR 9 deferred)** — nightly Haiku scan of new UGC, auto-flags outliers into abuse queue. Add when UGC volume warrants it. See "Post-v0.4 backlog" below.
 - ⏳ Pilot rollout (0.x) — on hold per user
 - ⏳ Phase 3 — SEO infra (build behind noindex wall, flip robots.txt at 1.0 launch)
