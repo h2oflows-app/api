@@ -82,24 +82,27 @@ func (h *ReachHandler) BasinMap(w http.ResponseWriter, r *http.Request) {
 			ST_X(r.end_point::geometry)   AS end_lng,
 			ST_Y(r.end_point::geometry)   AS end_lat,
 			CASE
-				WHEN lr.value IS NULL OR fr.label IS NULL THEN 'unknown'
-				WHEN fr.label = 'running'                 THEN 'runnable'
-				WHEN fr.label = 'low'                     THEN 'caution'
-				WHEN fr.label = 'high'                    THEN 'flood'
-				ELSE                                           'unknown'
+				WHEN fr.band_color IS NULL        THEN 'unknown'
+				WHEN fr.band_color LIKE 'red%'    THEN 'caution'
+				WHEN fr.band_color LIKE 'blue%'   THEN 'flood'
+				ELSE                                   'runnable'
 			END AS flow_status
 		FROM reaches r
 		LEFT JOIN rivers rv ON rv.id = r.river_id
 		LEFT JOIN gauges g ON g.id = r.primary_gauge_id
 		LEFT JOIN latest_reading lr ON lr.gauge_id = g.id
 		LEFT JOIN LATERAL (
-			SELECT label FROM flow_ranges
+			SELECT label, color FROM flow_ranges
 			WHERE reach_id = r.id
-			  AND (min_value IS NULL OR lr.value >= min_value)
-			  AND (max_value IS NULL OR lr.value <  max_value)
-			ORDER BY min_value ASC NULLS FIRST
+			  AND lr.value >= value
+			ORDER BY value DESC
 			LIMIT 1
-		) fr ON TRUE
+		) thresh ON TRUE,
+		LATERAL (
+			SELECT
+				COALESCE(thresh.label, CASE WHEN lr.value IS NOT NULL THEN r.base_label END) AS band_label,
+				COALESCE(thresh.color, CASE WHEN lr.value IS NOT NULL THEN r.base_color END) AS band_color
+		) fr
 		WHERE r.slug = ANY($1)
 		  AND r.centerline IS NOT NULL
 		ORDER BY r.river_order ASC NULLS LAST,

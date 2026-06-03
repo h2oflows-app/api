@@ -153,9 +153,8 @@ type embedAccessRow struct {
 }
 
 type embedFlowRangeRow struct {
-	label    string
-	minValue *float64
-	maxValue *float64
+	label string
+	value float64
 }
 
 type embedChunk struct {
@@ -233,17 +232,12 @@ func loadEmbedReach(ctx context.Context, pool *pgxpool.Pool, id string) (embedRe
 		return r, err
 	}
 
-	// Flow ranges via reach_id (direct lookup, no craft_type filter).
+	// Flow thresholds via reach_id.
 	frRows, err := pool.Query(ctx, `
-		SELECT fr.label, fr.min_value, fr.max_value
+		SELECT fr.label, fr.value
 		FROM flow_ranges fr
 		WHERE fr.reach_id = $1
-		ORDER BY CASE fr.label
-			WHEN 'low'     THEN 1
-			WHEN 'running' THEN 2
-			WHEN 'high'    THEN 3
-			ELSE 4
-		END
+		ORDER BY fr.value ASC
 	`, id)
 	if err != nil {
 		return r, err
@@ -251,7 +245,7 @@ func loadEmbedReach(ctx context.Context, pool *pgxpool.Pool, id string) (embedRe
 	defer frRows.Close()
 	for frRows.Next() {
 		var fr embedFlowRangeRow
-		if err := frRows.Scan(&fr.label, &fr.minValue, &fr.maxValue); err != nil {
+		if err := frRows.Scan(&fr.label, &fr.value); err != nil {
 			return r, err
 		}
 		r.flowRanges = append(r.flowRanges, fr)
@@ -416,14 +410,11 @@ func buildAccessChunk(reachName string, a embedAccessRow) string {
 func buildFlowRangesChunk(r embedReachRow) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "%s flow conditions:\n", r.name)
-	for _, fr := range r.flowRanges {
-		switch {
-		case fr.minValue != nil && fr.maxValue != nil:
-			fmt.Fprintf(&sb, "- %s: %.0f–%.0f cfs\n", fr.label, *fr.minValue, *fr.maxValue)
-		case fr.minValue != nil:
-			fmt.Fprintf(&sb, "- %s: above %.0f cfs\n", fr.label, *fr.minValue)
-		case fr.maxValue != nil:
-			fmt.Fprintf(&sb, "- %s: below %.0f cfs\n", fr.label, *fr.maxValue)
+	for i, fr := range r.flowRanges {
+		if i+1 < len(r.flowRanges) {
+			fmt.Fprintf(&sb, "- %s: %.0f–%.0f cfs\n", fr.label, fr.value, r.flowRanges[i+1].value)
+		} else {
+			fmt.Fprintf(&sb, "- %s: above %.0f cfs\n", fr.label, fr.value)
 		}
 	}
 	return strings.TrimRight(sb.String(), "\n")

@@ -280,8 +280,7 @@ func (imp *Importer) Import(ctx context.Context, doc *KMLDoc) (*Result, error) {
 		reachID   string
 		reachName string
 		label     string
-		minValue  *float64
-		maxValue  *float64
+		value     *float64
 	}
 	type gaugeAssoc struct {
 		reachID    string
@@ -355,8 +354,8 @@ func (imp *Importer) Import(ctx context.Context, doc *KMLDoc) (*Result, error) {
 						multiDayDays = &v
 					}
 				default:
-					if label, minVal, maxVal, ok := parseFlowRangePM(pm.Name, pm.Description); ok {
-						folderFlowRanges = append(folderFlowRanges, reachFlowRange{"", "", label, minVal, maxVal})
+					if label, val, ok := parseFlowRangePM(pm.Name, pm.Description); ok {
+						folderFlowRanges = append(folderFlowRanges, reachFlowRange{"", "", label, val})
 					}
 				}
 				continue
@@ -461,7 +460,7 @@ func (imp *Importer) Import(ctx context.Context, doc *KMLDoc) (*Result, error) {
 
 	// Upsert flow ranges after reach matching so reach IDs are known.
 	for _, fr := range flowRanges {
-		if err := imp.upsertFlowRange(ctx, fr.reachID, fr.label, fr.minValue, fr.maxValue); err != nil {
+		if err := imp.upsertFlowRange(ctx, fr.reachID, fr.label, fr.value); err != nil {
 			res.Log = append(res.Log, fmt.Sprintf("⚠  [%s] flow range %s: %v", fr.reachName, fr.label, err))
 		}
 	}
@@ -665,17 +664,17 @@ var flowRangeKeywords = map[string]string{
 }
 
 // parseFlowRangePM detects a flow-range metadata placemark and returns the
-// DB label, min/max value, and true when the placemark name is a known keyword.
+// DB label, threshold value, and true when the placemark name is a known keyword.
 //
-// Description format:
-//   - "below"/"low" / "above"/"high": single CFS value — max_value or min_value respectively
-//   - "running": "min,max" pair (or single value treated as min)
-func parseFlowRangePM(name, desc string) (label string, minVal, maxVal *float64, ok bool) {
+// Mapping to new threshold model (V9: highest threshold where cfs >= value):
+//   - "low": threshold value=0 (always matches; overridden by higher thresholds)
+//   - "running": threshold value=first parsed number (lower bound of runnable flow)
+//   - "high": threshold value=first parsed number (lower bound of high flow)
+func parseFlowRangePM(name, desc string) (label string, value *float64, ok bool) {
 	label, ok = flowRangeKeywords[strings.ToLower(strings.TrimSpace(name))]
 	if !ok {
-		return "", nil, nil, false
+		return "", nil, false
 	}
-	parts := strings.SplitN(strings.TrimSpace(desc), ",", 2)
 	parseVal := func(s string) *float64 {
 		s = strings.TrimSpace(s)
 		if s == "" {
@@ -688,36 +687,46 @@ func parseFlowRangePM(name, desc string) (label string, minVal, maxVal *float64,
 	}
 	switch label {
 	case "low":
-		// single value = upper bound (< this)
-		maxVal = parseVal(parts[0])
-	case "high":
-		// single value = lower bound (>= this)
-		minVal = parseVal(parts[0])
+		zero := 0.0
+		value = &zero
 	default:
-		// "min,max" or just "min"
-		minVal = parseVal(parts[0])
-		if len(parts) == 2 {
-			maxVal = parseVal(parts[1])
-		}
+		parts := strings.SplitN(strings.TrimSpace(desc), ",", 2)
+		value = parseVal(parts[0])
 	}
-	return label, minVal, maxVal, true
+	return label, value, true
 }
 
-// upsertFlowRange writes a single flow range band for a reach.
+// defaultColorForLabel returns a color key for KML-imported flow ranges.
+func defaultColorForLabel(label string) string {
+	switch label {
+	case "low":
+		return "red-3"
+	case "high":
+		return "orange-3"
+	default:
+		return "green-3"
+	}
+}
+
+// upsertFlowRange writes a single flow range threshold for a reach.
 // gauge_id intentionally left NULL — KML ranges are reach-level, not gauge-specific.
-func (imp *Importer) upsertFlowRange(ctx context.Context, reachID, label string, minVal, maxVal *float64) error {
+func (imp *Importer) upsertFlowRange(ctx context.Context, reachID, label string, value *float64) error {
 	if imp.DryRun {
 		return nil
 	}
+	v := 0.0
+	if value != nil {
+		v = *value
+	}
 	_, err := imp.pool.Exec(ctx, `
-		INSERT INTO flow_ranges (reach_id, label, min_value, max_value, data_source)
+		INSERT INTO flow_ranges (reach_id, label, value, color, data_source)
 		VALUES ($1, $2, $3, $4, 'manual')
 		ON CONFLICT (reach_id, label)
 		DO UPDATE SET
-			min_value   = EXCLUDED.min_value,
-			max_value   = EXCLUDED.max_value,
+			value       = EXCLUDED.value,
+			color       = EXCLUDED.color,
 			data_source = EXCLUDED.data_source
-	`, reachID, label, minVal, maxVal)
+	`, reachID, label, v, defaultColorForLabel(label))
 	return err
 }
 

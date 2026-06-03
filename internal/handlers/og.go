@@ -75,7 +75,7 @@ func (h *OGHandler) loadReachData(ctx context.Context, slug string) (og.ReachDat
 			r.class_max,
 			r.length_mi,
 			lr.value AS current_cfs,
-			fr.label AS flow_band_label
+			fr.band_label AS flow_band_label
 		FROM reaches r
 		LEFT JOIN rivers rv ON rv.id = r.river_id
 		LEFT JOIN gauges g  ON g.id  = r.primary_gauge_id
@@ -86,13 +86,15 @@ func (h *OGHandler) loadReachData(ctx context.Context, slug string) (og.ReachDat
 			ORDER BY timestamp DESC LIMIT 1
 		) lr ON TRUE
 		LEFT JOIN LATERAL (
-			SELECT label FROM flow_ranges
+			SELECT label, color FROM flow_ranges
 			WHERE reach_id = r.id
-			  AND (min_value IS NULL OR lr.value >= min_value)
-			  AND (max_value IS NULL OR lr.value <  max_value)
-			ORDER BY min_value ASC NULLS FIRST
+			  AND lr.value >= value
+			ORDER BY value DESC
 			LIMIT 1
-		) fr ON TRUE
+		) thresh ON TRUE,
+		LATERAL (
+			SELECT COALESCE(thresh.label, CASE WHEN lr.value IS NOT NULL THEN r.base_label END) AS band_label
+		) fr
 		WHERE r.slug = $1
 	`, slug).Scan(&name, &commonName, &riverName, &region, &classMax, &lengthMi, &cfs, &bandLabel)
 	if err != nil {
