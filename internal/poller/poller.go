@@ -205,19 +205,27 @@ func (p *Poller) writeReading(ctx context.Context, gaugeID string, r gauge.Readi
 	_, err = p.db.Exec(ctx, `
 		UPDATE gauges
 		SET current_cfs = $2,
-		    flow_status  = COALESCE(
+		    flow_status = COALESCE(
 		        (SELECT CASE
-		                    WHEN fr.label = 'running' THEN 'runnable'
-		                    WHEN fr.label = 'low'     THEN 'caution'
-		                    WHEN fr.label = 'high'    THEN 'flood'
+		                    WHEN bc LIKE 'red%'  THEN 'caution'
+		                    WHEN bc LIKE 'blue%' THEN 'flood'
+		                    WHEN bc IS NOT NULL  THEN 'runnable'
 		                    ELSE 'unknown'
 		                END
-		         FROM flow_ranges fr
-		         WHERE fr.gauge_id = $1
-		           AND (fr.min_value IS NULL OR $2 >= fr.min_value)
-		           AND (fr.max_value IS NULL OR $2 <  fr.max_value)
-		         ORDER BY fr.min_value ASC NULLS FIRST
-		         LIMIT 1),
+		         FROM (
+		             SELECT COALESCE(
+		                 (SELECT fr2.color
+		                  FROM flow_ranges fr2
+		                  WHERE fr2.gauge_id = $1 AND $2 >= fr2.value
+		                  ORDER BY fr2.value DESC LIMIT 1),
+		                 r.base_color
+		             ) AS bc
+		             FROM flow_ranges fr
+		             JOIN reaches r ON r.id = fr.reach_id
+		             WHERE fr.gauge_id = $1
+		             LIMIT 1
+		         ) _bc
+		        ),
 		        'unknown'
 		    )
 		WHERE id = $1

@@ -125,33 +125,21 @@ func (h *ReportHandler) ensureProfile(ctx context.Context, ownerID, email string
 
 // ── Flow band helpers ─────────────────────────────────────────────────────────
 
-type flowRangeRow struct {
-	label    string
-	minValue *float64
-	maxValue *float64
-}
-
-func computeFlowBand(cfs float64, ranges []flowRangeRow) *string {
-	var runningMin, runningMax *float64
-	for _, r := range ranges {
-		if r.label == "running" {
-			runningMin = r.minValue
-			runningMax = r.maxValue
+// bandLabelForCFS applies V9 logic: highest threshold where cfs >= value; else base_label.
+func bandLabelForCFS(cfs float64, baseLabel string, thresholds []FlowBandThreshold) *string {
+	best := ""
+	bestVal := -1.0
+	for _, t := range thresholds {
+		if cfs >= t.Value && t.Value > bestVal {
+			best = t.Label
+			bestVal = t.Value
 		}
 	}
-	if runningMin == nil && runningMax == nil {
-		return nil
+	if best == "" {
+		best = baseLabel
 	}
-	var band string
-	switch {
-	case runningMin != nil && cfs <= *runningMin:
-		band = "low"
-	case runningMax != nil && cfs >= *runningMax:
-		band = "high"
-	default:
-		band = "running"
-	}
-	return &band
+	s := best
+	return &s
 }
 
 // stampCFSAndBand queries the gauge reading nearest to `at` for the reach's
@@ -170,23 +158,29 @@ func (h *ReportHandler) stampCFSAndBand(ctx context.Context, reachID string, at 
 		return nil, nil
 	}
 
+	var baseLabel string
+	_ = h.db.QueryRow(ctx, `SELECT base_label FROM reaches WHERE id = $1`, reachID).Scan(&baseLabel)
+	if baseLabel == "" {
+		return &cfs, nil
+	}
+
 	frRows, err := h.db.Query(ctx,
-		`SELECT label, min_value, max_value FROM flow_ranges WHERE reach_id = $1`, reachID,
+		`SELECT value, label FROM flow_ranges WHERE reach_id = $1 ORDER BY value ASC`, reachID,
 	)
 	if err != nil {
 		return &cfs, nil
 	}
 	defer frRows.Close()
 
-	var ranges []flowRangeRow
+	var thresholds []FlowBandThreshold
 	for frRows.Next() {
-		var fr flowRangeRow
-		if frRows.Scan(&fr.label, &fr.minValue, &fr.maxValue) == nil {
-			ranges = append(ranges, fr)
+		var t FlowBandThreshold
+		if frRows.Scan(&t.Value, &t.Label) == nil {
+			thresholds = append(thresholds, t)
 		}
 	}
 
-	band := computeFlowBand(cfs, ranges)
+	band := bandLabelForCFS(cfs, baseLabel, thresholds)
 	return &cfs, band
 }
 

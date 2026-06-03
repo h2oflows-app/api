@@ -43,7 +43,7 @@ CREATE TEMP TABLE _fr_running AS
   WHERE label = 'running';
 
 UPDATE flow_ranges
-  SET value = min_value, label = 'Running', color = 'green-3'
+  SET value = COALESCE(min_value, 0), label = 'Running', color = 'green-3'
   WHERE label = 'running';
 
 INSERT INTO flow_ranges (reach_id, gauge_id, label, value, color, data_source, verified)
@@ -63,7 +63,7 @@ CREATE TEMP TABLE _urfr_running AS
   WHERE label = 'running';
 
 UPDATE user_reach_flow_ranges
-  SET value = min_value, label = 'Running', color = 'green-3'
+  SET value = COALESCE(min_value, 0), label = 'Running', color = 'green-3'
   WHERE label = 'running';
 
 INSERT INTO user_reach_flow_ranges (user_reach_id, label, value, color)

@@ -191,30 +191,33 @@ const mapBaseSQL = `
 		ST_Y(r.end_point::geometry)      AS take_out_lat,
 		lr.value                         AS current_cfs,
 		g.last_reading_at,
-		fr.label                         AS flow_label,
+		fr.band_label                    AS flow_label,
 		g.id                             AS gauge_id,
 		g.reach_relationship,
 		g.featured                       AS gauge_trusted,
 		g.gauge_notes,
 		g.info_links,
 		CASE
-			WHEN lr.value IS NULL OR fr.label IS NULL THEN 'unknown'
-			WHEN fr.label = 'running'                 THEN 'runnable'
-			WHEN fr.label = 'low'                     THEN 'caution'
-			WHEN fr.label = 'high'                    THEN 'flood'
-			ELSE                                           'unknown'
+			WHEN fr.band_color IS NULL        THEN 'unknown'
+			WHEN fr.band_color LIKE 'red%'    THEN 'caution'
+			WHEN fr.band_color LIKE 'blue%'   THEN 'flood'
+			ELSE                                   'runnable'
 		END AS flow_status
 	FROM reaches r
 	LEFT JOIN gauges g ON g.id = r.primary_gauge_id
 	LEFT JOIN latest_reading lr ON lr.gauge_id = g.id
 	LEFT JOIN LATERAL (
-		SELECT label FROM flow_ranges
+		SELECT label, color FROM flow_ranges
 		WHERE reach_id = r.id
-		  AND (min_value IS NULL OR lr.value >= min_value)
-		  AND (max_value IS NULL OR lr.value <  max_value)
-		ORDER BY min_value ASC NULLS FIRST
+		  AND lr.value >= value
+		ORDER BY value DESC
 		LIMIT 1
-	) fr ON TRUE
+	) thresh ON TRUE,
+	LATERAL (
+		SELECT
+			COALESCE(thresh.label, CASE WHEN lr.value IS NOT NULL THEN r.base_label END) AS band_label,
+			COALESCE(thresh.color, CASE WHEN lr.value IS NOT NULL THEN r.base_color END) AS band_color
+	) fr
 `
 
 // Map handles GET /api/v1/reaches/map
@@ -406,31 +409,34 @@ func (h *ReachHandler) queryAllFeatures(ctx context.Context) ([]Feature, error) 
 			ST_Y(r.end_point::geometry)     AS take_out_lat,
 			lr.value                        AS current_cfs,
 			g.last_reading_at,
-			fr.label                        AS flow_label,
+			fr.band_label                   AS flow_label,
 			g.id                            AS gauge_id,
 			g.reach_relationship,
 			g.featured                      AS gauge_trusted,
 			g.gauge_notes,
 			g.info_links,
 			CASE
-				WHEN lr.value IS NULL OR fr.label IS NULL THEN 'unknown'
-				WHEN fr.label = 'running'                 THEN 'runnable'
-				WHEN fr.label = 'low'                     THEN 'caution'
-				WHEN fr.label = 'high'                    THEN 'flood'
-				ELSE                                           'unknown'
+				WHEN fr.band_color IS NULL        THEN 'unknown'
+				WHEN fr.band_color LIKE 'red%'    THEN 'caution'
+				WHEN fr.band_color LIKE 'blue%'   THEN 'flood'
+				ELSE                                   'runnable'
 			END AS flow_status
 		FROM reaches r
 		LEFT JOIN rivers rv ON rv.id = r.river_id
 		LEFT JOIN gauges g ON g.id = r.primary_gauge_id
 		LEFT JOIN latest_reading lr ON lr.gauge_id = g.id
 		LEFT JOIN LATERAL (
-			SELECT label FROM flow_ranges
+			SELECT label, color FROM flow_ranges
 			WHERE reach_id = r.id
-			  AND (min_value IS NULL OR lr.value >= min_value)
-			  AND (max_value IS NULL OR lr.value <  max_value)
-			ORDER BY min_value ASC NULLS FIRST
+			  AND lr.value >= value
+			ORDER BY value DESC
 			LIMIT 1
-		) fr ON TRUE
+		) thresh ON TRUE,
+		LATERAL (
+			SELECT
+				COALESCE(thresh.label, CASE WHEN lr.value IS NOT NULL THEN r.base_label END) AS band_label,
+				COALESCE(thresh.color, CASE WHEN lr.value IS NOT NULL THEN r.base_color END) AS band_color
+		) fr
 		WHERE r.centerline IS NOT NULL
 	`)
 	if err != nil {
@@ -571,19 +577,18 @@ func (h *ReachHandler) queryAllListItems(ctx context.Context) ([]reachListItem, 
 				(SELECT MAX(class_rating) FROM rapids WHERE reach_id = r.id AND class_rating IS NOT NULL),
 				r.class_max
 			) AS class_max,
-			lr.value       AS current_cfs,
-			fr.label       AS flow_label,
-			g.id           AS gauge_id,
-			g.external_id  AS gauge_external_id,
+			lr.value           AS current_cfs,
+			fr.band_label      AS flow_label,
+			g.id               AS gauge_id,
+			g.external_id      AS gauge_external_id,
 			g.source       AS gauge_source,
 			g.name         AS gauge_name,
 			g.status       AS gauge_status,
 			CASE
-				WHEN lr.value IS NULL OR fr.label IS NULL THEN 'unknown'
-				WHEN fr.label = 'running'                 THEN 'runnable'
-				WHEN fr.label = 'low'                     THEN 'caution'
-				WHEN fr.label = 'high'                    THEN 'flood'
-				ELSE                                           'unknown'
+				WHEN fr.band_color IS NULL        THEN 'unknown'
+				WHEN fr.band_color LIKE 'red%'    THEN 'caution'
+				WHEN fr.band_color LIKE 'blue%'   THEN 'flood'
+				ELSE                                   'runnable'
 			END AS flow_status,
 			r.author_id,
 			up.handle AS author_handle
@@ -593,13 +598,17 @@ func (h *ReachHandler) queryAllListItems(ctx context.Context) ([]reachListItem, 
 		LEFT JOIN user_profiles up ON up.owner_id = r.author_id
 		LEFT JOIN latest_reading lr ON lr.gauge_id = g.id
 		LEFT JOIN LATERAL (
-			SELECT label FROM flow_ranges
+			SELECT label, color FROM flow_ranges
 			WHERE reach_id = r.id
-			  AND (min_value IS NULL OR lr.value >= min_value)
-			  AND (max_value IS NULL OR lr.value <  max_value)
-			ORDER BY min_value ASC NULLS FIRST
+			  AND lr.value >= value
+			ORDER BY value DESC
 			LIMIT 1
-		) fr ON TRUE
+		) thresh ON TRUE,
+		LATERAL (
+			SELECT
+				COALESCE(thresh.label, CASE WHEN lr.value IS NOT NULL THEN r.base_label END) AS band_label,
+				COALESCE(thresh.color, CASE WHEN lr.value IS NOT NULL THEN r.base_color END) AS band_color
+		) fr
 		ORDER BY rv.basin NULLS LAST,
 		         r.river_name NULLS LAST,
 		         g.elevation_ft DESC NULLS LAST,
@@ -706,13 +715,12 @@ func (h *ReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 			COALESCE(ST_X(g.location::geometry), NULL) AS gauge_lng,
 			COALESCE(ST_Y(g.location::geometry), NULL) AS gauge_lat,
 			CASE
-				WHEN lr.value IS NULL OR fr.label IS NULL THEN 'unknown'
-				WHEN fr.label = 'running'                 THEN 'runnable'
-				WHEN fr.label = 'low'                     THEN 'caution'
-				WHEN fr.label = 'high'                    THEN 'flood'
-				ELSE 'unknown'
+				WHEN fr.band_color IS NULL        THEN 'unknown'
+				WHEN fr.band_color LIKE 'red%'    THEN 'caution'
+				WHEN fr.band_color LIKE 'blue%'   THEN 'flood'
+				ELSE                                   'runnable'
 			END AS flow_status,
-			fr.label AS flow_band_label,
+			fr.band_label AS flow_band_label,
 			r.author_id,
 			up.handle AS author_handle
 		FROM reaches r
@@ -726,32 +734,17 @@ func (h *ReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 			ORDER BY timestamp DESC LIMIT 1
 		) lr ON TRUE
 		LEFT JOIN LATERAL (
-			WITH eff AS (
-				SELECT label, min_value, max_value
-				FROM flow_ranges
-				WHERE reach_id = r.id
-				  AND NOT EXISTS (
-				      SELECT 1 FROM reach_flow_band_overrides
-				      WHERE reach_id = r.id AND user_id = $2)
-				UNION ALL
-				SELECT 'low'::text, NULL::numeric, o.low_max
-				  FROM reach_flow_band_overrides o
-				  WHERE o.reach_id = r.id AND o.user_id = $2 AND o.low_max IS NOT NULL
-				UNION ALL
-				SELECT 'running'::text, o.running_min, o.running_max
-				  FROM reach_flow_band_overrides o
-				  WHERE o.reach_id = r.id AND o.user_id = $2
-				UNION ALL
-				SELECT 'high'::text, o.high_min, NULL::numeric
-				  FROM reach_flow_band_overrides o
-				  WHERE o.reach_id = r.id AND o.user_id = $2 AND o.high_min IS NOT NULL
-			)
-			SELECT label FROM eff
-			WHERE (min_value IS NULL OR lr.value >= min_value)
-			  AND (max_value IS NULL OR lr.value <  max_value)
-			ORDER BY min_value ASC NULLS FIRST
+			SELECT label, color FROM flow_ranges
+			WHERE reach_id = r.id
+			  AND lr.value >= value
+			ORDER BY value DESC
 			LIMIT 1
-		) fr ON TRUE
+		) thresh ON TRUE,
+		LATERAL (
+			SELECT
+				COALESCE(thresh.label, CASE WHEN lr.value IS NOT NULL THEN r.base_label END) AS band_label,
+				COALESCE(thresh.color, CASE WHEN lr.value IS NOT NULL THEN r.base_color END) AS band_color
+		) fr
 		WHERE r.slug = $1
 	`, slug, userID).Scan(
 		&reach.ID, &reach.Slug, &reach.Name, &reach.Region,
@@ -794,17 +787,17 @@ func (h *ReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 			g.reach_relationship,
 			lr.value AS current_cfs,
 			CASE
-				WHEN lr.value IS NULL OR fr.label IS NULL THEN 'unknown'
-				WHEN fr.label = 'running'                 THEN 'runnable'
-				WHEN fr.label = 'low'                     THEN 'caution'
-				WHEN fr.label = 'high'                    THEN 'flood'
-				ELSE 'unknown'
+				WHEN fr.band_color IS NULL        THEN 'unknown'
+				WHEN fr.band_color LIKE 'red%'    THEN 'caution'
+				WHEN fr.band_color LIKE 'blue%'   THEN 'flood'
+				ELSE                                   'runnable'
 			END AS flow_status,
-			fr.label AS flow_band_label,
+			fr.band_label AS flow_band_label,
 			lr.timestamp AS last_reading_at,
 			ST_X(g.location::geometry) AS lng,
 			ST_Y(g.location::geometry) AS lat
 		FROM gauges g
+		LEFT JOIN reaches gr ON gr.id = g.reach_id
 		LEFT JOIN LATERAL (
 			SELECT value, timestamp FROM gauge_readings
 			WHERE gauge_id = g.id
@@ -812,13 +805,17 @@ func (h *ReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 			ORDER BY timestamp DESC LIMIT 1
 		) lr ON TRUE
 		LEFT JOIN LATERAL (
-			SELECT label FROM flow_ranges
+			SELECT label, color FROM flow_ranges
 			WHERE reach_id = g.reach_id
-			  AND (min_value IS NULL OR lr.value >= min_value)
-			  AND (max_value IS NULL OR lr.value <  max_value)
-			ORDER BY min_value ASC NULLS FIRST
+			  AND lr.value >= value
+			ORDER BY value DESC
 			LIMIT 1
-		) fr ON TRUE
+		) thresh ON TRUE,
+		LATERAL (
+			SELECT
+				COALESCE(thresh.label, CASE WHEN lr.value IS NOT NULL THEN gr.base_label END) AS band_label,
+				COALESCE(thresh.color, CASE WHEN lr.value IS NOT NULL THEN gr.base_color END) AS band_color
+		) fr
 		WHERE g.reach_id = $1
 		  AND ($2::uuid IS NULL OR g.id != $2::uuid)
 		  AND g.status = 'active'
@@ -1134,36 +1131,25 @@ func (h *ReachHandler) GetHazards(w http.ResponseWriter, r *http.Request) {
 
 // GetFlowRanges handles GET /api/v1/reaches/{slug}/flow-ranges
 //
-// Returns the 3-band flow ranges for a reach, sorted min_value ASC.
-// The frontend overlays these as colored bands on the gauge graph.
+// Returns flow bands for a reach in the new flexible shape (V15).
 func (h *ReachHandler) GetFlowRanges(w http.ResponseWriter, r *http.Request) {
 	slug := chi.URLParam(r, "slug")
 
-	type flowRange struct {
-		Label        string   `json:"label"`
-		MinValue     *float64 `json:"min_value"`
-		MaxValue     *float64 `json:"max_value"`
-		ClassMod     *float64 `json:"class_modifier"`
-		SourceURL    *string  `json:"source_url,omitempty"`
-		DataSource   string   `json:"data_source"`
-		AIConfidence *int     `json:"ai_confidence,omitempty"`
-		Verified     bool     `json:"verified"`
+	var fb FlowBands
+	err := h.db.QueryRow(r.Context(),
+		`SELECT base_label, base_color FROM reaches WHERE slug = $1`, slug,
+	).Scan(&fb.BaseLabel, &fb.BaseColor)
+	if err != nil {
+		errorResponse(w, http.StatusNotFound, "reach not found")
+		return
 	}
 
 	rows, err := h.db.Query(r.Context(), `
-		SELECT
-			fr.label,
-			fr.min_value,
-			fr.max_value,
-			fr.class_modifier,
-			fr.source_url,
-			fr.data_source,
-			fr.ai_confidence,
-			fr.verified
+		SELECT fr.value, fr.label, fr.color
 		FROM flow_ranges fr
 		JOIN reaches rch ON rch.id = fr.reach_id
 		WHERE rch.slug = $1
-		ORDER BY fr.min_value ASC NULLS FIRST
+		ORDER BY fr.value ASC
 	`, slug)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
@@ -1171,99 +1157,60 @@ func (h *ReachHandler) GetFlowRanges(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	results := make([]flowRange, 0)
+	fb.Thresholds = make([]FlowBandThreshold, 0)
 	for rows.Next() {
-		var fr flowRange
-		if err := rows.Scan(
-			&fr.Label, &fr.MinValue, &fr.MaxValue,
-			&fr.ClassMod, &fr.SourceURL,
-			&fr.DataSource, &fr.AIConfidence, &fr.Verified,
-		); err != nil {
-			continue
+		var t FlowBandThreshold
+		if rows.Scan(&t.Value, &t.Label, &t.Color) == nil {
+			fb.Thresholds = append(fb.Thresholds, t)
 		}
-		results = append(results, fr)
-	}
-	if err := rows.Err(); err != nil {
-		errorResponse(w, http.StatusInternalServerError, "scan failed")
-		return
 	}
 
-	jsonResponse(w, http.StatusOK, results)
+	jsonResponse(w, http.StatusOK, fb)
 }
 
-// SetFlowRanges handles PUT /api/v1/reaches/{slug}/flow-ranges
-//
-// Upserts the three canonical bands for a reach. Missing bands are deleted.
-// Body example:
-//
-//	{
-//	  "low":     { "max_value": 170 },
-//	  "running": { "min_value": 170, "max_value": 400 },
-//	  "high":    { "min_value": 400 }
-//	}
+// SetFlowRanges handles PUT /api/v1/reaches/{slug}/flow-ranges (admin/curated).
+// Accepts FlowBands shape: {base_label, base_color, thresholds:[{value,label,color}]}.
 func (h *ReachHandler) SetFlowRanges(w http.ResponseWriter, r *http.Request) {
 	slug := chi.URLParam(r, "slug")
 
-	type bandInput struct {
-		MinValue *float64 `json:"min_value"`
-		MaxValue *float64 `json:"max_value"`
-	}
-	var body struct {
-		Low     *bandInput `json:"low"`
-		Running *bandInput `json:"running"`
-		High    *bandInput `json:"high"`
-	}
+	var body FlowBands
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
+	if msg := validateFlowBands(body); msg != "" {
+		errorResponse(w, http.StatusBadRequest, msg)
+		return
+	}
 
-	// Resolve reach ID.
 	var reachID string
+	var gaugeID *string
 	err := h.db.QueryRow(r.Context(),
-		`SELECT id FROM reaches WHERE slug = $1`, slug,
-	).Scan(&reachID)
+		`SELECT id, primary_gauge_id::text FROM reaches WHERE slug = $1`, slug,
+	).Scan(&reachID, &gaugeID)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "reach not found")
 		return
 	}
 
-	// Keep gauge_id FK populated from the reach's primary gauge.
-	var gaugeID *string
-	_ = h.db.QueryRow(r.Context(),
-		`SELECT primary_gauge_id::text FROM reaches WHERE id = $1`, reachID,
-	).Scan(&gaugeID)
-
-	type band struct {
-		label string
-		input *bandInput
-	}
-	bands := []band{
-		{"low", body.Low},
-		{"running", body.Running},
-		{"high", body.High},
+	ctx := r.Context()
+	_, err = h.db.Exec(ctx,
+		`UPDATE reaches SET base_label = $1, base_color = $2 WHERE id = $3`,
+		body.BaseLabel, body.BaseColor, reachID,
+	)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "update failed: "+err.Error())
+		return
 	}
 
-	for _, b := range bands {
-		if b.input == nil {
-			_, _ = h.db.Exec(r.Context(), `
-				DELETE FROM flow_ranges
-				WHERE reach_id = $1 AND label = $2
-			`, reachID, b.label)
-			continue
-		}
-		_, err := h.db.Exec(r.Context(), `
-			INSERT INTO flow_ranges
-			  (gauge_id, reach_id, label, min_value, max_value, data_source, verified)
+	_, _ = h.db.Exec(ctx, `DELETE FROM flow_ranges WHERE reach_id = $1`, reachID)
+	for _, t := range body.Thresholds {
+		_, err := h.db.Exec(ctx, `
+			INSERT INTO flow_ranges (gauge_id, reach_id, label, value, color, data_source, verified)
 			VALUES ($1, $2, $3, $4, $5, 'manual', true)
-			ON CONFLICT (reach_id, label) DO UPDATE
-			  SET min_value   = EXCLUDED.min_value,
-			      max_value   = EXCLUDED.max_value,
-			      data_source = 'manual',
-			      verified    = true
-		`, gaugeID, reachID, b.label, b.input.MinValue, b.input.MaxValue)
+		`, gaugeID, reachID, t.Label, t.Value, t.Color)
 		if err != nil {
-			errorResponse(w, http.StatusInternalServerError, "upsert failed: "+err.Error())
+			errorResponse(w, http.StatusInternalServerError, "insert failed: "+err.Error())
 			return
 		}
 	}

@@ -288,18 +288,20 @@ func (h *GaugeHandler) GetFlowRanges(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// flow_ranges are per-reach. For the gauge endpoint (used by sparklines on the
-	// dashboard), return ranges for the alphabetically-first reach using this gauge.
+	// flow_bands are per-reach. Return bands for the alphabetically-first reach using this gauge.
+	var fb FlowBands
+	err := h.db.QueryRow(r.Context(), `
+		SELECT base_label, base_color FROM reaches
+		WHERE primary_gauge_id = $1
+		ORDER BY slug LIMIT 1
+	`, gaugeID).Scan(&fb.BaseLabel, &fb.BaseColor)
+	if err != nil {
+		errorResponse(w, http.StatusNotFound, "no reach found for gauge")
+		return
+	}
+
 	rows, err := h.db.Query(r.Context(), `
-		SELECT
-			fr.label,
-			fr.min_value,
-			fr.max_value,
-			fr.class_modifier,
-			fr.source_url,
-			fr.data_source,
-			fr.ai_confidence,
-			fr.verified
+		SELECT fr.value, fr.label, fr.color
 		FROM flow_ranges fr
 		JOIN reaches rch ON rch.id = fr.reach_id
 		WHERE rch.primary_gauge_id = $1
@@ -308,7 +310,7 @@ func (h *GaugeHandler) GetFlowRanges(w http.ResponseWriter, r *http.Request) {
 			  WHERE primary_gauge_id = $1
 			  ORDER BY slug LIMIT 1
 		  )
-		ORDER BY fr.min_value ASC NULLS FIRST
+		ORDER BY fr.value ASC
 	`, gaugeID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
@@ -316,34 +318,19 @@ func (h *GaugeHandler) GetFlowRanges(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	type flowRange struct {
-		Label        string   `json:"label"`
-		MinValue     *float64 `json:"min_value"`
-		MaxValue     *float64 `json:"max_value"`
-		ClassMod     *float64 `json:"class_modifier"`
-		SourceURL    *string  `json:"source_url,omitempty"`
-		DataSource   string   `json:"data_source"`
-		AIConfidence *int     `json:"ai_confidence,omitempty"`
-		Verified     bool     `json:"verified"`
-	}
-	results := make([]flowRange, 0)
+	fb.Thresholds = make([]FlowBandThreshold, 0)
 	for rows.Next() {
-		var fr flowRange
-		if err := rows.Scan(
-			&fr.Label, &fr.MinValue, &fr.MaxValue,
-			&fr.ClassMod, &fr.SourceURL,
-			&fr.DataSource, &fr.AIConfidence, &fr.Verified,
-		); err != nil {
-			continue
+		var t FlowBandThreshold
+		if rows.Scan(&t.Value, &t.Label, &t.Color) == nil {
+			fb.Thresholds = append(fb.Thresholds, t)
 		}
-		results = append(results, fr)
 	}
 	if err := rows.Err(); err != nil {
 		errorResponse(w, http.StatusInternalServerError, "scan failed")
 		return
 	}
 
-	jsonResponse(w, http.StatusOK, results)
+	jsonResponse(w, http.StatusOK, fb)
 }
 
 // --- Search params ----------------------------------------------------------
@@ -588,25 +575,25 @@ func (h *GaugeHandler) querySearch(r *http.Request, p searchParams) (interface {
 			g.last_poll_success_at
 		FROM gauges g
 		LEFT JOIN LATERAL (
-			SELECT fr.label,
-			       CASE
-			           WHEN fr.label = 'running' THEN 'runnable'
-			           WHEN fr.label = 'low'     THEN 'caution'
-			           WHEN fr.label = 'high'    THEN 'flood'
-			           ELSE 'unknown'
-			       END AS flow_status
-			FROM flow_ranges fr
-			JOIN reaches rch ON rch.id = fr.reach_id
-			WHERE rch.primary_gauge_id = g.id
-			  AND rch.id = (
-			      SELECT id FROM reaches
-			      WHERE primary_gauge_id = g.id
-			      ORDER BY slug LIMIT 1
-			  )
-			  AND (fr.min_value IS NULL OR g.current_cfs >= fr.min_value)
-			  AND (fr.max_value IS NULL OR g.current_cfs < fr.max_value)
-			ORDER BY fr.min_value ASC NULLS FIRST, fr.max_value ASC NULLS LAST
-			LIMIT 1
+			SELECT
+				COALESCE(t.label, rch_base.base_label) AS label,
+				CASE
+					WHEN COALESCE(t.color, rch_base.base_color) LIKE 'red%'  THEN 'caution'
+					WHEN COALESCE(t.color, rch_base.base_color) LIKE 'blue%' THEN 'flood'
+					WHEN COALESCE(t.color, rch_base.base_color) IS NOT NULL  THEN 'runnable'
+					ELSE 'unknown'
+				END AS flow_status
+			FROM (
+				SELECT id, base_label, base_color FROM reaches
+				WHERE primary_gauge_id = g.id ORDER BY slug LIMIT 1
+			) rch_base
+			LEFT JOIN LATERAL (
+				SELECT fr.label, fr.color FROM flow_ranges fr
+				WHERE fr.reach_id = rch_base.id
+				  AND g.current_cfs >= fr.value
+				ORDER BY fr.value DESC LIMIT 1
+			) t ON TRUE
+			WHERE g.current_cfs IS NOT NULL
 		) fr_band ON TRUE
 		WHERE %s
 		ORDER BY %s
@@ -824,67 +811,30 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			LIMIT 1
 		) ctx_reach ON TRUE
 		LEFT JOIN LATERAL (
-			SELECT eff.label,
-			       CASE
-			           WHEN eff.label = 'running' THEN 'runnable'
-			           WHEN eff.label = 'low'     THEN 'caution'
-			           WHEN eff.label = 'high'    THEN 'flood'
-			           ELSE 'unknown'
-			       END AS flow_status
+			SELECT
+				COALESCE(t.label, rch_w.base_label) AS label,
+				CASE
+					WHEN COALESCE(t.color, rch_w.base_color) LIKE 'red%'  THEN 'caution'
+					WHEN COALESCE(t.color, rch_w.base_color) LIKE 'blue%' THEN 'flood'
+					WHEN COALESCE(t.color, rch_w.base_color) IS NOT NULL  THEN 'runnable'
+					ELSE 'unknown'
+				END AS flow_status
 			FROM (
-				SELECT fr.label, fr.min_value, fr.max_value
-				FROM flow_ranges fr
-				JOIN reaches rch ON rch.id = fr.reach_id
-				WHERE rch.primary_gauge_id = g.id
-				  AND rch.slug = COALESCE(
+				SELECT id, base_label, base_color FROM reaches
+				WHERE primary_gauge_id = g.id
+				  AND slug = COALESCE(
 				      ctx.reach_slug,
 				      (SELECT slug FROM reaches WHERE primary_gauge_id = g.id ORDER BY slug LIMIT 1)
 				  )
-				  AND NOT EXISTS (
-				      SELECT 1 FROM reach_flow_band_overrides o2
-				      JOIN reaches rch2 ON rch2.id = o2.reach_id
-				      WHERE rch2.primary_gauge_id = g.id
-				        AND rch2.slug = COALESCE(
-				            ctx.reach_slug,
-				            (SELECT slug FROM reaches WHERE primary_gauge_id = g.id ORDER BY slug LIMIT 1)
-				        )
-				        AND o2.user_id = $3
-				  )
-				UNION ALL
-				SELECT 'low'::text, NULL::numeric, o.low_max
-				  FROM reach_flow_band_overrides o
-				  JOIN reaches rch ON rch.id = o.reach_id
-				  WHERE rch.primary_gauge_id = g.id
-				    AND rch.slug = COALESCE(
-				        ctx.reach_slug,
-				        (SELECT slug FROM reaches WHERE primary_gauge_id = g.id ORDER BY slug LIMIT 1)
-				    )
-				    AND o.user_id = $3 AND o.low_max IS NOT NULL
-				UNION ALL
-				SELECT 'running'::text, o.running_min, o.running_max
-				  FROM reach_flow_band_overrides o
-				  JOIN reaches rch ON rch.id = o.reach_id
-				  WHERE rch.primary_gauge_id = g.id
-				    AND rch.slug = COALESCE(
-				        ctx.reach_slug,
-				        (SELECT slug FROM reaches WHERE primary_gauge_id = g.id ORDER BY slug LIMIT 1)
-				    )
-				    AND o.user_id = $3
-				UNION ALL
-				SELECT 'high'::text, o.high_min, NULL::numeric
-				  FROM reach_flow_band_overrides o
-				  JOIN reaches rch ON rch.id = o.reach_id
-				  WHERE rch.primary_gauge_id = g.id
-				    AND rch.slug = COALESCE(
-				        ctx.reach_slug,
-				        (SELECT slug FROM reaches WHERE primary_gauge_id = g.id ORDER BY slug LIMIT 1)
-				    )
-				    AND o.user_id = $3 AND o.high_min IS NOT NULL
-			) eff
-			WHERE (eff.min_value IS NULL OR g.current_cfs >= eff.min_value)
-			  AND (eff.max_value IS NULL OR g.current_cfs <  eff.max_value)
-			ORDER BY eff.min_value ASC NULLS FIRST, eff.max_value ASC NULLS LAST
-			LIMIT 1
+				LIMIT 1
+			) rch_w
+			LEFT JOIN LATERAL (
+				SELECT fr.label, fr.color FROM flow_ranges fr
+				WHERE fr.reach_id = rch_w.id
+				  AND g.current_cfs >= fr.value
+				ORDER BY fr.value DESC LIMIT 1
+			) t ON TRUE
+			WHERE g.current_cfs IS NOT NULL
 		) fr_band ON TRUE
 	`, gaugeIDs, reachSlugs, userID)
 	if err != nil {

@@ -220,10 +220,8 @@ func (h *FlowBandOverrideHandler) AdminQueue(w http.ResponseWriter, r *http.Requ
 		    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY o.running_min) AS median_running_min,
 		    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY o.running_max) AS median_running_max,
 		    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY o.high_min)    AS median_high_min,
-		    (SELECT max_value FROM flow_ranges WHERE reach_id = r.id AND label = 'low')     AS canonical_low_max,
-		    (SELECT min_value FROM flow_ranges WHERE reach_id = r.id AND label = 'running') AS canonical_running_min,
-		    (SELECT max_value FROM flow_ranges WHERE reach_id = r.id AND label = 'running') AS canonical_running_max,
-		    (SELECT min_value FROM flow_ranges WHERE reach_id = r.id AND label = 'high')    AS canonical_high_min
+		    (SELECT value FROM flow_ranges WHERE reach_id = r.id AND label = 'Running' LIMIT 1) AS canonical_running_value,
+		    (SELECT value FROM flow_ranges WHERE reach_id = r.id AND label = 'High'    LIMIT 1) AS canonical_high_value
 		FROM reach_flow_band_overrides o
 		JOIN reaches r ON r.id = o.reach_id
 		LEFT JOIN rivers rv ON rv.id = r.river_id
@@ -237,19 +235,17 @@ func (h *FlowBandOverrideHandler) AdminQueue(w http.ResponseWriter, r *http.Requ
 	}
 	defer rows.Close()
 	type queueRow struct {
-		ReachID             string   `json:"reach_id"`
-		Slug                string   `json:"slug"`
-		Name                string   `json:"name"`
-		RiverName           *string  `json:"river_name"`
-		OverrideCount       int      `json:"override_count"`
-		MedianLowMax        *float64 `json:"median_low_max"`
-		MedianRunningMin    *float64 `json:"median_running_min"`
-		MedianRunningMax    *float64 `json:"median_running_max"`
-		MedianHighMin       *float64 `json:"median_high_min"`
-		CanonicalLowMax     *float64 `json:"canonical_low_max"`
-		CanonicalRunningMin *float64 `json:"canonical_running_min"`
-		CanonicalRunningMax *float64 `json:"canonical_running_max"`
-		CanonicalHighMin    *float64 `json:"canonical_high_min"`
+		ReachID               string   `json:"reach_id"`
+		Slug                  string   `json:"slug"`
+		Name                  string   `json:"name"`
+		RiverName             *string  `json:"river_name"`
+		OverrideCount         int      `json:"override_count"`
+		MedianLowMax          *float64 `json:"median_low_max"`
+		MedianRunningMin      *float64 `json:"median_running_min"`
+		MedianRunningMax      *float64 `json:"median_running_max"`
+		MedianHighMin         *float64 `json:"median_high_min"`
+		CanonicalRunningValue *float64 `json:"canonical_running_value"`
+		CanonicalHighValue    *float64 `json:"canonical_high_value"`
 	}
 	out := make([]queueRow, 0)
 	for rows.Next() {
@@ -257,7 +253,7 @@ func (h *FlowBandOverrideHandler) AdminQueue(w http.ResponseWriter, r *http.Requ
 		if err := rows.Scan(
 			&q.ReachID, &q.Slug, &q.Name, &q.RiverName, &q.OverrideCount,
 			&q.MedianLowMax, &q.MedianRunningMin, &q.MedianRunningMax, &q.MedianHighMin,
-			&q.CanonicalLowMax, &q.CanonicalRunningMin, &q.CanonicalRunningMax, &q.CanonicalHighMin,
+			&q.CanonicalRunningValue, &q.CanonicalHighValue,
 		); err == nil {
 			out = append(out, q)
 		}
@@ -299,29 +295,25 @@ func (h *FlowBandOverrideHandler) AdminApplyMedian(w http.ResponseWriter, r *htt
 		errorResponse(w, http.StatusBadRequest, "missing required medians")
 		return
 	}
-	upsert := func(label string, mn, mx *float64) error {
+	upsert := func(label string, val float64, color string) error {
 		_, e := h.db.Exec(r.Context(), `
 			INSERT INTO flow_ranges
-			    (gauge_id, reach_id, label, min_value, max_value, data_source, verified)
+			    (gauge_id, reach_id, label, value, color, data_source, verified)
 			VALUES ($1, $2, $3, $4, $5, 'override_median', true)
 			ON CONFLICT (reach_id, label) DO UPDATE SET
-			    min_value   = EXCLUDED.min_value,
-			    max_value   = EXCLUDED.max_value,
+			    value       = EXCLUDED.value,
+			    color       = EXCLUDED.color,
 			    data_source = 'override_median',
 			    verified    = true
-		`, gaugeID, reachID, label, mn, mx)
+		`, gaugeID, reachID, label, val, color)
 		return e
 	}
-	if err := upsert("low", nil, lowMax); err != nil {
-		errorResponse(w, http.StatusInternalServerError, "low upsert: "+err.Error())
+	if err := upsert("Running", *runMin, "green-3"); err != nil {
+		errorResponse(w, http.StatusInternalServerError, "Running upsert: "+err.Error())
 		return
 	}
-	if err := upsert("running", runMin, runMax); err != nil {
-		errorResponse(w, http.StatusInternalServerError, "running upsert: "+err.Error())
-		return
-	}
-	if err := upsert("high", highMin, nil); err != nil {
-		errorResponse(w, http.StatusInternalServerError, "high upsert: "+err.Error())
+	if err := upsert("High", *runMax, "orange-3"); err != nil {
+		errorResponse(w, http.StatusInternalServerError, "High upsert: "+err.Error())
 		return
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{

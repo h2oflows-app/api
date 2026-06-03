@@ -58,11 +58,10 @@ func (h *UserProfileHandler) GetProfile(w http.ResponseWriter, r *http.Request) 
 			ur.class_min, ur.class_max,
 			COALESCE(lr.value, cg.last_value_cfs) AS current_cfs,
 			CASE
-				WHEN COALESCE(lr.value, cg.last_value_cfs) IS NULL OR fr.label IS NULL THEN 'unknown'
-				WHEN fr.label = 'running' THEN 'runnable'
-				WHEN fr.label = 'low'     THEN 'caution'
-				WHEN fr.label = 'high'    THEN 'flood'
-				ELSE 'unknown'
+				WHEN fr.band_color IS NULL        THEN 'unknown'
+				WHEN fr.band_color LIKE 'red%'    THEN 'caution'
+				WHEN fr.band_color LIKE 'blue%'   THEN 'flood'
+				ELSE                                   'runnable'
 			END AS flow_status,
 			ur.created_at
 		FROM user_reaches ur
@@ -74,13 +73,17 @@ func (h *UserProfileHandler) GetProfile(w http.ResponseWriter, r *http.Request) 
 			ORDER BY timestamp DESC LIMIT 1
 		) lr ON TRUE
 		LEFT JOIN LATERAL (
-			SELECT label FROM user_reach_flow_ranges
+			SELECT label, color FROM user_reach_flow_ranges
 			WHERE user_reach_id = ur.id
-			  AND (min_value IS NULL OR COALESCE(lr.value, cg.last_value_cfs) >= min_value)
-			  AND (max_value IS NULL OR COALESCE(lr.value, cg.last_value_cfs) <  max_value)
-			ORDER BY min_value ASC NULLS FIRST
+			  AND COALESCE(lr.value, cg.last_value_cfs) >= value
+			ORDER BY value DESC
 			LIMIT 1
-		) fr ON TRUE
+		) thresh ON TRUE,
+		LATERAL (
+			SELECT
+				COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END) AS band_label,
+				COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END) AS band_color
+		) fr
 		WHERE ur.owner_id = $1 AND ur.is_private = FALSE
 		ORDER BY ur.created_at DESC
 	`, ownerID)
@@ -131,11 +134,10 @@ func (h *UserProfileHandler) MapAllByHandle(w http.ResponseWriter, r *http.Reque
 			ST_Y(ur.take_out::geometry)            AS take_out_lat,
 			COALESCE(lr.value, cg.last_value_cfs)  AS current_cfs,
 			CASE
-				WHEN COALESCE(lr.value, cg.last_value_cfs) IS NULL OR fr.label IS NULL THEN 'unknown'
-				WHEN fr.label = 'running' THEN 'runnable'
-				WHEN fr.label = 'low'     THEN 'caution'
-				WHEN fr.label = 'high'    THEN 'flood'
-				ELSE 'unknown'
+				WHEN fr.band_color IS NULL        THEN 'unknown'
+				WHEN fr.band_color LIKE 'red%'    THEN 'caution'
+				WHEN fr.band_color LIKE 'blue%'   THEN 'flood'
+				ELSE                                   'runnable'
 			END AS flow_status,
 			ur.primary_gauge_id::text AS gauge_id,
 			ur.class_max,
@@ -149,13 +151,17 @@ func (h *UserProfileHandler) MapAllByHandle(w http.ResponseWriter, r *http.Reque
 			ORDER BY timestamp DESC LIMIT 1
 		) lr ON TRUE
 		LEFT JOIN LATERAL (
-			SELECT label FROM user_reach_flow_ranges
+			SELECT label, color FROM user_reach_flow_ranges
 			WHERE user_reach_id = ur.id
-			  AND (min_value IS NULL OR COALESCE(lr.value, cg.last_value_cfs) >= min_value)
-			  AND (max_value IS NULL OR COALESCE(lr.value, cg.last_value_cfs) <  max_value)
-			ORDER BY min_value ASC NULLS FIRST
+			  AND COALESCE(lr.value, cg.last_value_cfs) >= value
+			ORDER BY value DESC
 			LIMIT 1
-		) fr ON TRUE
+		) thresh ON TRUE,
+		LATERAL (
+			SELECT
+				COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END) AS band_label,
+				COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END) AS band_color
+		) fr
 		WHERE ur.owner_id = $1 AND ur.is_private = FALSE
 	`, ownerID)
 	if err != nil {
