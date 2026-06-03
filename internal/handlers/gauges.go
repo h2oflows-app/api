@@ -802,8 +802,8 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 				  )
 				UNION ALL
 				SELECT
-					ur.name AS common_name,
-					NULL    AS full_name,
+					ur.name     AS common_name,
+					ur.long_name AS full_name,
 					ur.river_name,
 					COALESCE(ur_rv.basin, g.watershed_name) AS basin_group,
 					ST_X(ur.put_in::geometry) AS center_lng,

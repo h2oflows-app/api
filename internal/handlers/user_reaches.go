@@ -131,6 +131,7 @@ type userReachSummary struct {
 	ID          string     `json:"id"`
 	Slug        string     `json:"slug"`
 	Name        string     `json:"name"`
+	LongName    *string    `json:"long_name"`
 	RiverName   *string    `json:"river_name"`
 	StateAbbr   *string    `json:"state_abbr"`
 	BasinGroup  *string    `json:"basin_group"`
@@ -536,7 +537,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := h.db.Query(r.Context(), `
 		SELECT
-			ur.id, ur.slug, ur.name, ur.river_name,
+			ur.id, ur.slug, ur.name, ur.long_name, ur.river_name,
 			rv.state_abbr, rv.basin AS basin_group,
 			ST_X(ur.put_in::geometry)    AS put_in_lng,
 			ST_Y(ur.put_in::geometry)    AS put_in_lat,
@@ -591,7 +592,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var s userReachSummary
 		if err := rows.Scan(
-			&s.ID, &s.Slug, &s.Name, &s.RiverName,
+			&s.ID, &s.Slug, &s.Name, &s.LongName, &s.RiverName,
 			&s.StateAbbr, &s.BasinGroup,
 			&s.PutInLng, &s.PutInLat, &s.TakeOutLng, &s.TakeOutLat,
 			&s.Note, &s.CreatedAt,
@@ -623,7 +624,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 
 	err := h.db.QueryRow(r.Context(), `
 		SELECT
-			ur.id, ur.slug, ur.name, ur.river_name,
+			ur.id, ur.slug, ur.name, ur.long_name, ur.river_name,
 			ST_X(ur.put_in::geometry)    AS put_in_lng,
 			ST_Y(ur.put_in::geometry)    AS put_in_lat,
 			ST_X(ur.take_out::geometry)  AS take_out_lng,
@@ -686,7 +687,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 		) fr ON TRUE
 		WHERE ur.owner_id = $1 AND ur.slug = $2
 	`, ownerID, slug).Scan(
-		&d.ID, &d.Slug, &d.Name, &d.RiverName,
+		&d.ID, &d.Slug, &d.Name, &d.LongName, &d.RiverName,
 		&d.PutInLng, &d.PutInLat, &d.TakeOutLng, &d.TakeOutLat,
 		&d.Note, &d.CreatedAt,
 		&d.ClassMin, &d.ClassMax,
@@ -817,7 +818,7 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 
 	err := h.db.QueryRow(r.Context(), `
 		SELECT
-			ur.id, ur.slug, ur.name, ur.river_name,
+			ur.id, ur.slug, ur.name, ur.long_name, ur.river_name,
 			ST_X(ur.put_in::geometry)    AS put_in_lng,
 			ST_Y(ur.put_in::geometry)    AS put_in_lat,
 			ST_X(ur.take_out::geometry)  AS take_out_lng,
@@ -883,7 +884,7 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 		) fr ON TRUE
 		WHERE ur.id = $1 AND ur.is_private = FALSE
 	`, runID).Scan(
-		&d.ID, &d.Slug, &d.Name, &d.RiverName,
+		&d.ID, &d.Slug, &d.Name, &d.LongName, &d.RiverName,
 		&d.PutInLng, &d.PutInLat, &d.TakeOutLng, &d.TakeOutLat,
 		&d.Note, &d.CreatedAt,
 		&d.ClassMin, &d.ClassMax,
@@ -998,6 +999,7 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 	var body struct {
 		Name      string   `json:"name"`
+		LongName  *string  `json:"long_name"`
 		RiverName string   `json:"river_name"`
 		GnisID    string   `json:"gnis_id"`
 		PutIn     latLng   `json:"put_in"`
@@ -1062,14 +1064,14 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var reachID string
 	err := h.db.QueryRow(ctx, `
 		INSERT INTO user_reaches
-			(owner_id, slug, name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, class_min, class_max, is_private)
+			(owner_id, slug, name, long_name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, class_min, class_max, is_private)
 		VALUES
-			($1, $2, $3, $4, $5,
-			 ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography,
-			 ST_SetSRID(ST_MakePoint($8, $9), 4326)::geography,
-			 NULLIF($10,''), NULLIF($11,''), $12, $13, $14, $15)
+			($1, $2, $3, $4, $5, $6,
+			 ST_SetSRID(ST_MakePoint($7, $8), 4326)::geography,
+			 ST_SetSRID(ST_MakePoint($9, $10), 4326)::geography,
+			 NULLIF($11,''), NULLIF($12,''), $13, $14, $15, $16)
 		RETURNING id
-	`, ownerID, slug, body.Name, riverID, finalRiverName,
+	`, ownerID, slug, body.Name, body.LongName, riverID, finalRiverName,
 		body.PutIn.Lng, body.PutIn.Lat,
 		body.TakeOut.Lng, body.TakeOut.Lat,
 		body.UpComID, body.DownComID, body.Note,
@@ -1124,6 +1126,7 @@ func (h *UserReachHandler) Import(w http.ResponseWriter, r *http.Request) { //no
 	}
 	var body struct {
 		Name      string  `json:"name"`
+		LongName  *string `json:"long_name"`
 		RiverName string  `json:"river_name"`
 		GnisID    string  `json:"gnis_id"`
 		PutIn     latLng  `json:"put_in"`
@@ -1185,14 +1188,14 @@ func (h *UserReachHandler) Import(w http.ResponseWriter, r *http.Request) { //no
 	var reachID string
 	err := h.db.QueryRow(ctx, `
 		INSERT INTO user_reaches
-			(owner_id, slug, name, river_id, river_name, put_in, take_out, up_comid, down_comid, note)
+			(owner_id, slug, name, long_name, river_id, river_name, put_in, take_out, up_comid, down_comid, note)
 		VALUES
-			($1, $2, $3, $4, $5,
-			 ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography,
-			 ST_SetSRID(ST_MakePoint($8, $9), 4326)::geography,
-			 NULLIF($10,''), NULLIF($11,''), $12)
+			($1, $2, $3, $4, $5, $6,
+			 ST_SetSRID(ST_MakePoint($7, $8), 4326)::geography,
+			 ST_SetSRID(ST_MakePoint($9, $10), 4326)::geography,
+			 NULLIF($11,''), NULLIF($12,''), $13)
 		RETURNING id
-	`, ownerID, slug, body.Name, riverID, finalRiverName,
+	`, ownerID, slug, body.Name, body.LongName, riverID, finalRiverName,
 		body.PutIn.Lng, body.PutIn.Lat,
 		body.TakeOut.Lng, body.TakeOut.Lat,
 		body.UpComID, body.DownComID, body.Note,
@@ -1260,6 +1263,7 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 	var body struct {
 		Name      *string  `json:"name"`
+		LongName  *string  `json:"long_name"`
 		Note      *string  `json:"note"`
 		RiverName *string  `json:"river_name"`
 		GnisID    *string  `json:"gnis_id"`
@@ -1290,18 +1294,20 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		UPDATE user_reaches
 		SET
 			name       = COALESCE($3, name),
-			note       = $4,
-			river_name = CASE WHEN $5 THEN $6 ELSE river_name END,
-			class_min  = CASE WHEN $7 THEN $8::numeric ELSE class_min END,
-			class_max  = CASE WHEN $9 THEN $10::numeric ELSE class_max END,
-			is_private = CASE WHEN $11 THEN $12 ELSE is_private END,
+			long_name  = CASE WHEN $4 THEN $5 ELSE long_name END,
+			note       = $6,
+			river_name = CASE WHEN $7 THEN $8 ELSE river_name END,
+			class_min  = CASE WHEN $9 THEN $10::numeric ELSE class_min END,
+			class_max  = CASE WHEN $11 THEN $12::numeric ELSE class_max END,
+			is_private = CASE WHEN $13 THEN $14 ELSE is_private END,
 			updated_at = NOW(),
 			last_modified_after_fork_at = CASE
 				WHEN original_forked_at IS NOT NULL THEN NOW()
 				ELSE last_modified_after_fork_at
 			END
 		WHERE owner_id = $1 AND slug = $2
-	`, ownerID, slug, body.Name, body.Note, body.RiverName != nil, riverName,
+	`, ownerID, slug, body.Name, body.LongName != nil, body.LongName, body.Note,
+		body.RiverName != nil, riverName,
 		body.ClassMin != nil, body.ClassMin,
 		body.ClassMax != nil, body.ClassMax,
 		body.IsPrivate != nil, body.IsPrivate)
@@ -1944,7 +1950,7 @@ func (h *UserReachHandler) ListCommunity(w http.ResponseWriter, r *http.Request)
 	search := "%" + q + "%"
 	rows, err := h.db.Query(r.Context(), `
 		SELECT
-			ur.id, ur.slug, ur.name, ur.river_name,
+			ur.id, ur.slug, ur.name, ur.long_name, ur.river_name,
 			rv.state_abbr, rv.basin AS basin_group,
 			ST_X(ur.put_in::geometry)   AS put_in_lng,
 			ST_Y(ur.put_in::geometry)   AS put_in_lat,
@@ -2002,7 +2008,7 @@ func (h *UserReachHandler) ListCommunity(w http.ResponseWriter, r *http.Request)
 	for rows.Next() {
 		var s userReachSummary
 		if err := rows.Scan(
-			&s.ID, &s.Slug, &s.Name, &s.RiverName,
+			&s.ID, &s.Slug, &s.Name, &s.LongName, &s.RiverName,
 			&s.StateAbbr, &s.BasinGroup,
 			&s.PutInLng, &s.PutInLat, &s.TakeOutLng, &s.TakeOutLat,
 			&s.Note, &s.CreatedAt,
