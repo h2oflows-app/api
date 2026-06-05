@@ -237,8 +237,10 @@ func (h *UserReachHandler) MapAll(w http.ResponseWriter, r *http.Request) {
 			END AS flow_status,
 			ur.primary_gauge_id::text AS gauge_id,
 			ur.class_max,
-			COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0) AS upvote_count
+			COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0) AS upvote_count,
+			up.handle AS author_handle
 		FROM user_reaches ur
+		LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
 		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
 		LEFT JOIN LATERAL (
 			SELECT value FROM gauge_readings
@@ -268,17 +270,18 @@ func (h *UserReachHandler) MapAll(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type featureProps struct {
-		ID          string   `json:"id"`
-		Slug        string   `json:"slug"`
-		Name        string   `json:"name"`
-		RiverName   *string  `json:"river_name"`
-		CommonName  *string  `json:"common_name"`
-		ClassMax    *float64 `json:"class_max"`
-		FlowStatus  string   `json:"flow_status"`
-		CurrentCFS  *float64 `json:"current_cfs"`
-		GaugeID     *string  `json:"gauge_id"`
-		IsUserReach bool     `json:"is_user_reach"`
-		UpvoteCount int64    `json:"upvote_count"`
+		ID           string   `json:"id"`
+		Slug         string   `json:"slug"`
+		Name         string   `json:"name"`
+		RiverName    *string  `json:"river_name"`
+		CommonName   *string  `json:"common_name"`
+		ClassMax     *float64 `json:"class_max"`
+		FlowStatus   string   `json:"flow_status"`
+		CurrentCFS   *float64 `json:"current_cfs"`
+		GaugeID      *string  `json:"gauge_id"`
+		IsUserReach  bool     `json:"is_user_reach"`
+		UpvoteCount  int64    `json:"upvote_count"`
+		AuthorHandle *string  `json:"author_handle"`
 	}
 	type feature struct {
 		Type       string          `json:"type"`
@@ -299,12 +302,14 @@ func (h *UserReachHandler) MapAll(w http.ResponseWriter, r *http.Request) {
 			gaugeID         *string
 			classMax        *float64
 			upvoteCount     int64
+			authorHandle    *string
 		)
 		if err := rows.Scan(
 			&id, &slug, &name, &riverName,
 			&centerlineJSON,
 			&putInLng, &putInLat, &takeOutLng, &takeOutLat,
 			&currentCFS, &flowStatus, &gaugeID, &classMax, &upvoteCount,
+			&authorHandle,
 		); err != nil {
 			continue
 		}
@@ -338,7 +343,8 @@ func (h *UserReachHandler) MapAll(w http.ResponseWriter, r *http.Request) {
 				FlowStatus:  flowStatus,
 				CurrentCFS:  currentCFS,
 				GaugeID:     gaugeID,
-				IsUserReach: true,
+				IsUserReach:  true,
+				AuthorHandle: authorHandle,
 				UpvoteCount: upvoteCount,
 			},
 		})
