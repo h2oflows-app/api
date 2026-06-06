@@ -147,4 +147,9 @@ type DiscoverOptions struct {
 	// For sources that don't support server-side bbox filtering, adapters
 	// should filter the results themselves before returning.
 	BoundingBox *BoundingBox
+
+	// NameLike filters to sites whose name contains this substring (case-insensitive).
+	// Sources that support server-side name search pass it as a query param;
+	// others filter the returned list client-side.
+	NameLike string
 }
