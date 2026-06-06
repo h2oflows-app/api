@@ -167,8 +167,10 @@ func (s *DWRSource) DiscoverSites(ctx context.Context, opts DiscoverOptions) ([]
 			}
 		}
 
-		// Client-side name filter
-		if nameLower != "" && !strings.Contains(strings.ToLower(site.Name), nameLower) {
+		// Client-side name filter — match station name OR abbreviation (ExternalID).
+		if nameLower != "" &&
+			!strings.Contains(strings.ToLower(site.Name), nameLower) &&
+			!strings.Contains(strings.ToLower(site.ExternalID), nameLower) {
 			continue
 		}
 
