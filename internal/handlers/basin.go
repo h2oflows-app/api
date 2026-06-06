@@ -40,26 +40,46 @@ type basinMapResponse struct {
 	Reaches   []basinReachItem `json:"reaches"`
 }
 
+// basinSlugExpr is the SQL expression that converts a river basin name or
+// gauge watershed name into the same normalized slug the frontend produces via
+// slugifyBasin(cleanBasinName(name)): strip Upper/Middle/Lower prefix, strip
+// River/Basin suffix, lowercase, replace non-alnum runs with '-', trim dashes.
+const basinSlugExpr = `trim('-' FROM lower(regexp_replace(
+	trim(regexp_replace(
+		regexp_replace(
+			COALESCE(%s, ''),
+			'^(Upper|Middle|Lower)\s+', '', 'i'
+		),
+		'\s+(Rivers?|Basins?)$', '', 'i'
+	)),
+	'[^a-z0-9]+', '-', 'gi'
+)))`
+
 // BasinMap handles GET /api/v1/reaches/basin/{slug}/map
 //
 // Returns centerlines, class, comIDs, and flow status for a set of reaches
-// identified by the ?slugs= comma-separated list. The {slug} path param is
-// the normalized basin name (used for caching/telemetry; not a DB filter).
-// When the caller is authenticated the query also includes the user's own
-// user_reaches so that custom runs appear on the basin map.
+// identified by the ?slugs= comma-separated list AND (when authenticated) all
+// of the caller's user_reaches whose river/watershed slug matches the basin.
+// The {slug} path param is the normalized basin name.
 func (h *ReachHandler) BasinMap(w http.ResponseWriter, r *http.Request) {
 	basinSlug := chi.URLParam(r, "slug")
 	empty := basinMapResponse{BasinSlug: basinSlug, Reaches: []basinReachItem{}}
 
+	// Ensure a non-nil slice so ANY($1) on an empty list is '{}'::text[], not NULL.
 	slugs := parseSlugsParam(r.URL.Query().Get("slugs"))
-	if len(slugs) == 0 {
-		jsonResponse(w, http.StatusOK, empty)
-		return
+	if slugs == nil {
+		slugs = []string{}
 	}
 
 	var ownerID *string
 	if uid, ok := auth.UserIDFromContext(r.Context()); ok {
 		ownerID = &uid
+	}
+
+	// Nothing to do: no slug list and no auth means no user_reaches to scan.
+	if len(slugs) == 0 && ownerID == nil {
+		jsonResponse(w, http.StatusOK, empty)
+		return
 	}
 
 	rows, err := h.db.Query(r.Context(), `
@@ -116,6 +136,7 @@ func (h *ReachHandler) BasinMap(w http.ResponseWriter, r *http.Request) {
 
 		UNION ALL
 
+		-- User_reaches matched by requested slug list (dashboard gauge contexts).
 		SELECT
 			ur.slug,
 			ur.name,
@@ -160,9 +181,68 @@ func (h *ReachHandler) BasinMap(w http.ResponseWriter, r *http.Request) {
 		      SELECT 1 FROM reaches WHERE slug = ur.slug AND centerline IS NOT NULL
 		  )
 
+		UNION ALL
+
+		-- All user_reaches whose river/watershed basin slug matches the URL param.
+		-- This is the primary source: runs appear even without a dashboard gauge link.
+		SELECT
+			ur3.slug,
+			ur3.name,
+			ur3.river_name,
+			NULL::text     AS common_name,
+			NULL::smallint AS river_order,
+			ur3.class_min,
+			ur3.class_max,
+			ur3.up_comid   AS anchor_comid,
+			ur3.up_comid   AS start_comid,
+			ur3.down_comid AS end_comid,
+			ST_AsGeoJSON(ur3.centerline::geometry) AS centerline,
+			ST_X(ur3.put_in::geometry)    AS start_lng,
+			ST_Y(ur3.put_in::geometry)    AS start_lat,
+			ST_X(ur3.take_out::geometry)  AS end_lng,
+			ST_Y(ur3.take_out::geometry)  AS end_lat,
+			CASE
+				WHEN fr3.band_color IS NULL       THEN 'unknown'
+				WHEN fr3.band_color LIKE 'red%'   THEN 'caution'
+				WHEN fr3.band_color LIKE 'blue%'  THEN 'flood'
+				ELSE                                   'runnable'
+			END AS flow_status
+		FROM user_reaches ur3
+		LEFT JOIN rivers rv3 ON rv3.id = ur3.river_id
+		LEFT JOIN gauges g3 ON g3.id = ur3.primary_gauge_id
+		LEFT JOIN latest_reading lr3 ON lr3.gauge_id = g3.id
+		LEFT JOIN LATERAL (
+			SELECT label, color FROM user_reach_flow_ranges
+			WHERE user_reach_id = ur3.id
+			  AND lr3.value >= value
+			ORDER BY value DESC
+			LIMIT 1
+		) thresh3 ON TRUE,
+		LATERAL (
+			SELECT
+				COALESCE(thresh3.label, CASE WHEN lr3.value IS NOT NULL THEN ur3.base_label END) AS band_label,
+				COALESCE(thresh3.color, CASE WHEN lr3.value IS NOT NULL THEN ur3.base_color END) AS band_color
+		) fr3
+		WHERE ur3.owner_id = $2
+		  AND ur3.centerline IS NOT NULL
+		  AND trim('-' FROM lower(regexp_replace(
+		      trim(regexp_replace(
+		          regexp_replace(
+		              COALESCE(rv3.basin, g3.watershed_name, ''),
+		              '^(Upper|Middle|Lower)\s+', '', 'i'
+		          ),
+		          '\s+(Rivers?|Basins?)$', '', 'i'
+		      )),
+		      '[^a-z0-9]+', '-', 'gi'
+		  ))) = $3
+		  AND NOT EXISTS (
+		      SELECT 1 FROM reaches WHERE slug = ur3.slug AND centerline IS NOT NULL
+		  )
+		  AND NOT (ur3.slug = ANY($1))
+
 		ORDER BY river_order ASC NULLS LAST,
 		         start_lng ASC NULLS LAST
-	`, slugs, ownerID)
+	`, slugs, ownerID, basinSlug)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
 		return
@@ -254,8 +334,20 @@ func (h *ReachHandler) BasinNetwork(w http.ResponseWriter, r *http.Request) {
 	empty := nldi.Collection{Type: "FeatureCollection", Features: []nldi.Feature{}}
 	emptyOK := basinNetworkResponse{Tributaries: empty, Gauges: empty, NLDIAvailable: true}
 
+	basinSlug := chi.URLParam(r, "slug")
+
+	// Ensure non-nil slice so ANY($1) on empty list is '{}'::text[], not NULL.
 	slugs := parseSlugsParam(r.URL.Query().Get("slugs"))
-	if len(slugs) == 0 {
+	if slugs == nil {
+		slugs = []string{}
+	}
+
+	var ownerIDNet *string
+	if uid, ok := auth.UserIDFromContext(r.Context()); ok {
+		ownerIDNet = &uid
+	}
+
+	if len(slugs) == 0 && ownerIDNet == nil {
 		jsonResponse(w, http.StatusOK, emptyOK)
 		return
 	}
@@ -263,11 +355,6 @@ func (h *ReachHandler) BasinNetwork(w http.ResponseWriter, r *http.Request) {
 	type reachAnchor struct {
 		startCID string
 		lengthKm float64
-	}
-
-	var ownerIDNet *string
-	if uid, ok := auth.UserIDFromContext(r.Context()); ok {
-		ownerIDNet = &uid
 	}
 
 	rows, err := h.db.Query(r.Context(), `
@@ -289,7 +376,32 @@ func (h *ReachHandler) BasinNetwork(w http.ResponseWriter, r *http.Request) {
 		  AND NOT EXISTS (
 		      SELECT 1 FROM reaches WHERE slug = ur2.slug AND start_comid IS NOT NULL
 		  )
-	`, slugs, ownerIDNet)
+
+		UNION ALL
+
+		SELECT
+			ur3.up_comid AS start_comid,
+			COALESCE(ST_Length(ur3.centerline::geography) / 1000.0, 0) AS length_km
+		FROM user_reaches ur3
+		LEFT JOIN rivers rv3 ON rv3.id = ur3.river_id
+		LEFT JOIN gauges g3 ON g3.id = ur3.primary_gauge_id
+		WHERE ur3.owner_id = $2
+		  AND ur3.up_comid IS NOT NULL
+		  AND trim('-' FROM lower(regexp_replace(
+		      trim(regexp_replace(
+		          regexp_replace(
+		              COALESCE(rv3.basin, g3.watershed_name, ''),
+		              '^(Upper|Middle|Lower)\s+', '', 'i'
+		          ),
+		          '\s+(Rivers?|Basins?)$', '', 'i'
+		      )),
+		      '[^a-z0-9]+', '-', 'gi'
+		  ))) = $3
+		  AND NOT EXISTS (
+		      SELECT 1 FROM reaches WHERE slug = ur3.slug AND start_comid IS NOT NULL
+		  )
+		  AND NOT (ur3.slug = ANY($1))
+	`, slugs, ownerIDNet, basinSlug)
 	if err != nil {
 		jsonResponse(w, http.StatusOK, emptyOK)
 		return
