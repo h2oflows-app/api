@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
 	"github.com/h2oflow/h2oflow/apps/api/internal/nldi"
 	"golang.org/x/sync/errgroup"
 )
@@ -44,6 +45,8 @@ type basinMapResponse struct {
 // Returns centerlines, class, comIDs, and flow status for a set of reaches
 // identified by the ?slugs= comma-separated list. The {slug} path param is
 // the normalized basin name (used for caching/telemetry; not a DB filter).
+// When the caller is authenticated the query also includes the user's own
+// user_reaches so that custom runs appear on the basin map.
 func (h *ReachHandler) BasinMap(w http.ResponseWriter, r *http.Request) {
 	basinSlug := chi.URLParam(r, "slug")
 	empty := basinMapResponse{BasinSlug: basinSlug, Reaches: []basinReachItem{}}
@@ -52,6 +55,11 @@ func (h *ReachHandler) BasinMap(w http.ResponseWriter, r *http.Request) {
 	if len(slugs) == 0 {
 		jsonResponse(w, http.StatusOK, empty)
 		return
+	}
+
+	var ownerID *string
+	if uid, ok := auth.UserIDFromContext(r.Context()); ok {
+		ownerID = &uid
 	}
 
 	rows, err := h.db.Query(r.Context(), `
@@ -105,9 +113,56 @@ func (h *ReachHandler) BasinMap(w http.ResponseWriter, r *http.Request) {
 		) fr
 		WHERE r.slug = ANY($1)
 		  AND r.centerline IS NOT NULL
-		ORDER BY r.river_order ASC NULLS LAST,
-		         ST_X(r.start_point::geometry) ASC NULLS LAST
-	`, slugs)
+
+		UNION ALL
+
+		SELECT
+			ur.slug,
+			ur.name,
+			ur.river_name,
+			NULL::text     AS common_name,
+			NULL::smallint AS river_order,
+			ur.class_min,
+			ur.class_max,
+			ur.up_comid    AS anchor_comid,
+			ur.up_comid    AS start_comid,
+			ur.down_comid  AS end_comid,
+			ST_AsGeoJSON(ur.centerline::geometry) AS centerline,
+			ST_X(ur.put_in::geometry)    AS start_lng,
+			ST_Y(ur.put_in::geometry)    AS start_lat,
+			ST_X(ur.take_out::geometry)  AS end_lng,
+			ST_Y(ur.take_out::geometry)  AS end_lat,
+			CASE
+				WHEN fr_u.band_color IS NULL       THEN 'unknown'
+				WHEN fr_u.band_color LIKE 'red%'   THEN 'caution'
+				WHEN fr_u.band_color LIKE 'blue%'  THEN 'flood'
+				ELSE                                    'runnable'
+			END AS flow_status
+		FROM user_reaches ur
+		LEFT JOIN gauges g_u ON g_u.id = ur.primary_gauge_id
+		LEFT JOIN latest_reading lr_u ON lr_u.gauge_id = g_u.id
+		LEFT JOIN LATERAL (
+			SELECT label, color FROM user_reach_flow_ranges
+			WHERE user_reach_id = ur.id
+			  AND lr_u.value >= value
+			ORDER BY value DESC
+			LIMIT 1
+		) thresh_u ON TRUE,
+		LATERAL (
+			SELECT
+				COALESCE(thresh_u.label, CASE WHEN lr_u.value IS NOT NULL THEN ur.base_label END) AS band_label,
+				COALESCE(thresh_u.color, CASE WHEN lr_u.value IS NOT NULL THEN ur.base_color END) AS band_color
+		) fr_u
+		WHERE ur.slug = ANY($1)
+		  AND ur.owner_id = $2
+		  AND ur.centerline IS NOT NULL
+		  AND NOT EXISTS (
+		      SELECT 1 FROM reaches WHERE slug = ur.slug AND centerline IS NOT NULL
+		  )
+
+		ORDER BY river_order ASC NULLS LAST,
+		         start_lng ASC NULLS LAST
+	`, slugs, ownerID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
 		return
@@ -210,13 +265,31 @@ func (h *ReachHandler) BasinNetwork(w http.ResponseWriter, r *http.Request) {
 		lengthKm float64
 	}
 
+	var ownerIDNet *string
+	if uid, ok := auth.UserIDFromContext(r.Context()); ok {
+		ownerIDNet = &uid
+	}
+
 	rows, err := h.db.Query(r.Context(), `
 		SELECT
 			start_comid,
 			COALESCE(ST_Length(centerline::geography) / 1000.0, 0) AS length_km
 		FROM reaches
 		WHERE slug = ANY($1) AND start_comid IS NOT NULL
-	`, slugs)
+
+		UNION ALL
+
+		SELECT
+			ur2.up_comid AS start_comid,
+			COALESCE(ST_Length(ur2.centerline::geography) / 1000.0, 0) AS length_km
+		FROM user_reaches ur2
+		WHERE ur2.slug = ANY($1)
+		  AND ur2.up_comid IS NOT NULL
+		  AND ur2.owner_id = $2
+		  AND NOT EXISTS (
+		      SELECT 1 FROM reaches WHERE slug = ur2.slug AND start_comid IS NOT NULL
+		  )
+	`, slugs, ownerIDNet)
 	if err != nil {
 		jsonResponse(w, http.StatusOK, emptyOK)
 		return
