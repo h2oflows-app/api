@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
 	"github.com/h2oflow/h2oflow/apps/api/internal/ai"
 	"github.com/h2oflow/h2oflow/apps/api/internal/poller"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -700,8 +699,6 @@ func (h *GaugeHandler) BatchPost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaugeIDs, reachSlugs []string) {
-	userID, _ := auth.UserIDFromContext(r.Context())
-
 	// ctx CTE: one row per requested (gauge_id, reach_slug) pair.
 	// NULLIF converts "" back to NULL so SQL COALESCE logic works correctly.
 	rows, err := h.db.Query(r.Context(), `
@@ -836,7 +833,7 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			) t ON TRUE
 			WHERE g.current_cfs IS NOT NULL
 		) fr_band ON TRUE
-	`, gaugeIDs, reachSlugs, userID)
+	`, gaugeIDs, reachSlugs)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
 		return
