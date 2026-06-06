@@ -52,21 +52,23 @@ func (h *GaugeExternalHandler) SearchExternal(w http.ResponseWriter, r *http.Req
 
 	var wg sync.WaitGroup
 
-	// USGS: always search. When state is set pass stateCd; without it NWIS
-	// attempts a national name search (may be rejected for broad queries).
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		opts := gauge.DiscoverOptions{NameLike: q, ActiveOnly: true}
-		if state != "" {
-			opts.StateCodes = []string{state}
-		}
-		sites, err := h.usgs.DiscoverSites(r.Context(), opts)
-		if err != nil {
-			log.Printf("gauge search-external USGS state=%q q=%q: %v", state, q, err)
-		}
-		results <- sourceResult{sites: sites, src: string(gauge.SourceUSGS)}
-	}()
+	// USGS NWIS requires a geographic filter (stateCd, bBox, or HUC) — national
+	// name-only search is rejected with 400. Only fire when state is selected.
+	if state != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sites, err := h.usgs.DiscoverSites(r.Context(), gauge.DiscoverOptions{
+				NameLike:   q,
+				StateCodes: []string{state},
+				ActiveOnly: true,
+			})
+			if err != nil {
+				log.Printf("gauge search-external USGS state=%q q=%q: %v", state, q, err)
+			}
+			results <- sourceResult{sites: sites, src: string(gauge.SourceUSGS)}
+		}()
+	}
 
 	// DWR: Colorado-only — only fires when state=CO is explicitly selected.
 	if state == "CO" {

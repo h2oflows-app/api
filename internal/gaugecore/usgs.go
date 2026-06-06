@@ -175,10 +175,6 @@ func (s *USGSSource) DiscoverSites(ctx context.Context, opts DiscoverOptions) ([
 		params.Set("stateCd", strings.Join(opts.StateCodes, ","))
 	}
 
-	if opts.NameLike != "" {
-		params.Set("siteNameLike", opts.NameLike)
-	}
-
 	endpoint := fmt.Sprintf("%s/site/?%s", s.nwisBase, params.Encode())
 
 	resp, err := s.get(ctx, endpoint)
@@ -191,7 +187,21 @@ func (s *USGSSource) DiscoverSites(ctx context.Context, opts DiscoverOptions) ([
 		return nil, fmt.Errorf("%w: HTTP %d", ErrSourceUnavailable, resp.StatusCode)
 	}
 
-	return parseNWISSiteRDB(resp.Body)
+	all, err := parseNWISSiteRDB(resp.Body)
+	if err != nil || opts.NameLike == "" {
+		return all, err
+	}
+
+	// Client-side name filter — NWIS has no server-side name-search param.
+	nameLower := strings.ToLower(opts.NameLike)
+	filtered := all[:0]
+	for _, s := range all {
+		if strings.Contains(strings.ToLower(s.Name), nameLower) ||
+			strings.Contains(strings.ToLower(s.ExternalID), nameLower) {
+			filtered = append(filtered, s)
+		}
+	}
+	return filtered, nil
 }
 
 // get performs a GET request, attaching the API key header if one is set.
