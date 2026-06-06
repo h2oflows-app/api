@@ -2,12 +2,13 @@ package handlers
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
 
-	gauge "github.com/h2oflow/h2oflow/apps/api/internal/gaugecore"
 	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
+	gauge "github.com/h2oflow/h2oflow/apps/api/internal/gaugecore"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -43,14 +44,6 @@ func (h *GaugeExternalHandler) SearchExternal(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	opts := gauge.DiscoverOptions{
-		NameLike:   q,
-		ActiveOnly: true,
-	}
-	if state != "" {
-		opts.StateCodes = []string{state}
-	}
-
 	type sourceResult struct {
 		sites []*gauge.SiteMetadata
 		src   string
@@ -59,21 +52,36 @@ func (h *GaugeExternalHandler) SearchExternal(w http.ResponseWriter, r *http.Req
 
 	var wg sync.WaitGroup
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		sites, _ := h.usgs.DiscoverSites(r.Context(), opts)
-		results <- sourceResult{sites: sites, src: string(gauge.SourceUSGS)}
-	}()
+	// USGS NWIS requires a geographic filter (stateCd, bBox, or HUC) — national
+	// name-only search is rejected with 400. Only fire when state is selected.
+	if state != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sites, err := h.usgs.DiscoverSites(r.Context(), gauge.DiscoverOptions{
+				NameLike:   q,
+				StateCodes: []string{state},
+				ActiveOnly: true,
+			})
+			if err != nil {
+				log.Printf("gauge search-external USGS state=%q q=%q: %v", state, q, err)
+			}
+			results <- sourceResult{sites: sites, src: string(gauge.SourceUSGS)}
+		}()
+	}
 
+	// DWR: Colorado-only — only fires when state=CO is explicitly selected.
 	if state == "CO" {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sites, _ := h.dwr.DiscoverSites(r.Context(), gauge.DiscoverOptions{
+			sites, err := h.dwr.DiscoverSites(r.Context(), gauge.DiscoverOptions{
 				NameLike:   q,
 				ActiveOnly: true,
 			})
+			if err != nil {
+				log.Printf("gauge search-external DWR q=%q: %v", q, err)
+			}
 			results <- sourceResult{sites: sites, src: string(gauge.SourceDWR)}
 		}()
 	}
