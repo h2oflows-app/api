@@ -175,6 +175,10 @@ func (s *USGSSource) DiscoverSites(ctx context.Context, opts DiscoverOptions) ([
 		params.Set("stateCd", strings.Join(opts.StateCodes, ","))
 	}
 
+	if opts.NameLike != "" {
+		params.Set("siteNameLike", opts.NameLike)
+	}
+
 	endpoint := fmt.Sprintf("%s/site/?%s", s.nwisBase, params.Encode())
 
 	resp, err := s.get(ctx, endpoint)

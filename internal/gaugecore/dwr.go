@@ -153,6 +153,7 @@ func (s *DWRSource) DiscoverSites(ctx context.Context, opts DiscoverOptions) ([]
 		return nil, fmt.Errorf("decoding DWR station list: %w", err)
 	}
 
+	nameLower := strings.ToLower(opts.NameLike)
 	sites := make([]*SiteMetadata, 0, len(result.ResultList))
 	for _, st := range result.ResultList {
 		site := st.toSiteMetadata()
@@ -164,6 +165,11 @@ func (s *DWRSource) DiscoverSites(ctx context.Context, opts DiscoverOptions) ([]
 				site.Location.Lng < bb.West || site.Location.Lng > bb.East {
 				continue
 			}
+		}
+
+		// Client-side name filter
+		if nameLower != "" && !strings.Contains(strings.ToLower(site.Name), nameLower) {
+			continue
 		}
 
 		sites = append(sites, site)

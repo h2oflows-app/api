@@ -103,6 +103,7 @@ func main() {
 	}
 
 	gauges      := handlers.NewGaugeHandler(pool, enricher).WithPoller(p)
+	gaugeExt    := handlers.NewGaugeExternalHandler(pool, gauge.NewUSGSSource(cfg.USGSAPIKey), gauge.NewDWRSource())
 	reaches     := handlers.NewReachHandler(pool, asker).WithPoller(p)
 	watchlist   := handlers.NewWatchlistHandler(pool)
 	admin       := handlers.NewAdminHandler(pool).WithPoller(p)
@@ -165,6 +166,7 @@ func main() {
 		// LoadAppRoles enriches context with DB roles for authenticated users.
 		r.Use(loadAppRoles)
 		r.Get("/gauges/search", gauges.Search)
+		r.Get("/gauges/search-external", gaugeExt.SearchExternal)
 		r.Get("/gauges/batch", gauges.BatchGet)
 		r.Post("/gauges/batch", gauges.BatchPost)
 		r.Get("/gauges/{id}/readings", gauges.GetReadings)
@@ -227,6 +229,7 @@ func main() {
 
 		r.Get("/me/gauges", meGauges.List)
 		r.Post("/me/gauges/{id}/refresh", meGauges.Refresh)
+			r.Post("/me/gauges/add-external", gaugeExt.AddExternal)
 
 		// /me/runs/{slug} — user-facing aliases for /me/reaches/{slug}
 		r.Get("/me/runs", userReaches.List)
