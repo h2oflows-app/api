@@ -16,11 +16,10 @@ import (
 type GaugeExternalHandler struct {
 	db   *pgxpool.Pool
 	usgs *gauge.USGSSource
-	dwr  *gauge.DWRSource
 }
 
-func NewGaugeExternalHandler(db *pgxpool.Pool, usgs *gauge.USGSSource, dwr *gauge.DWRSource) *GaugeExternalHandler {
-	return &GaugeExternalHandler{db: db, usgs: usgs, dwr: dwr}
+func NewGaugeExternalHandler(db *pgxpool.Pool, usgs *gauge.USGSSource) *GaugeExternalHandler {
+	return &GaugeExternalHandler{db: db, usgs: usgs}
 }
 
 type externalSiteResult struct {
@@ -70,17 +69,47 @@ func (h *GaugeExternalHandler) SearchExternal(w http.ResponseWriter, r *http.Req
 		}()
 	}
 
-	// DWR: Colorado-only — only fires when state=CO is explicitly selected.
+	// DWR: search our DB (poller keeps all active DWR gauges current).
+	// Calling dwr.state.co.us directly from the API container is unreliable;
+	// the DB is the authoritative source since the poller runs successfully.
 	if state == "CO" {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sites, err := h.dwr.DiscoverSites(r.Context(), gauge.DiscoverOptions{
-				NameLike:   q,
-				ActiveOnly: true,
-			})
+			pattern := "%" + q + "%"
+			rows, err := h.db.Query(r.Context(), `
+				SELECT external_id, name,
+				       ST_X(location::geometry) AS lng,
+				       ST_Y(location::geometry) AS lat
+				FROM gauges
+				WHERE source = 'dwr'
+				  AND status != 'retired'
+				  AND (name ILIKE $1 OR external_id ILIKE $1)
+				ORDER BY name
+				LIMIT 20
+			`, pattern)
 			if err != nil {
-				log.Printf("gauge search-external DWR q=%q: %v", q, err)
+				log.Printf("gauge search-external DWR db q=%q: %v", q, err)
+				results <- sourceResult{sites: nil, src: string(gauge.SourceDWR)}
+				return
+			}
+			defer rows.Close()
+			var sites []*gauge.SiteMetadata
+			for rows.Next() {
+				var extID, name string
+				var lng, lat *float64
+				if err := rows.Scan(&extID, &name, &lng, &lat); err != nil {
+					continue
+				}
+				s := &gauge.SiteMetadata{
+					ExternalID: extID,
+					Name:       name,
+					SourceType: gauge.SourceDWR,
+				}
+				if lng != nil && lat != nil {
+					s.Location = &gauge.LatLng{Lng: *lng, Lat: *lat}
+				}
+				sites = append(sites, s)
 			}
 			results <- sourceResult{sites: sites, src: string(gauge.SourceDWR)}
 		}()

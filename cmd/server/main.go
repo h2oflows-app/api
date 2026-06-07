@@ -103,7 +103,7 @@ func main() {
 	}
 
 	gauges      := handlers.NewGaugeHandler(pool, enricher).WithPoller(p)
-	gaugeExt    := handlers.NewGaugeExternalHandler(pool, gauge.NewUSGSSource(cfg.USGSAPIKey), gauge.NewDWRSource())
+	gaugeExt    := handlers.NewGaugeExternalHandler(pool, gauge.NewUSGSSource(cfg.USGSAPIKey))
 	reaches     := handlers.NewReachHandler(pool, asker).WithPoller(p)
 	watchlist   := handlers.NewWatchlistHandler(pool)
 	admin       := handlers.NewAdminHandler(pool).WithPoller(p)
