@@ -198,11 +198,11 @@ func (h *GaugeExternalHandler) AddExternal(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Add to watchlist (upsert — idempotent if already added).
+	// Add to watchlist as a standalone gauge (no reach context).
 	_, err = h.db.Exec(r.Context(), `
-		INSERT INTO user_watchlists (user_id, gauge_id, dashboard_id)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (user_id, gauge_id, dashboard_id) DO NOTHING
+		INSERT INTO user_watchlists (user_id, gauge_id, reach_slug, dashboard_id)
+		VALUES ($1, $2::uuid, NULL, $3::uuid)
+		ON CONFLICT DO NOTHING
 	`, ownerID, gaugeID, body.DashboardID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "failed to add to watchlist")
