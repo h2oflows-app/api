@@ -173,6 +173,17 @@ func (h *GaugeExternalHandler) AddExternal(w http.ResponseWriter, r *http.Reques
 
 	extID := normalizeExternalID(strings.TrimSpace(body.ExternalID), body.Source)
 
+	// dashboard_id is NOT NULL — resolve to user's first dashboard if not supplied.
+	if body.DashboardID == nil {
+		var dbID string
+		if err := h.db.QueryRow(r.Context(),
+			`SELECT id FROM user_dashboards WHERE user_id = $1 ORDER BY position LIMIT 1`,
+			ownerID,
+		).Scan(&dbID); err == nil {
+			body.DashboardID = &dbID
+		}
+	}
+
 	// Upsert gauge record.
 	var gaugeID string
 	var err error
