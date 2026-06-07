@@ -173,6 +173,17 @@ func (h *GaugeExternalHandler) AddExternal(w http.ResponseWriter, r *http.Reques
 
 	extID := normalizeExternalID(strings.TrimSpace(body.ExternalID), body.Source)
 
+	// dashboard_id is NOT NULL — resolve to user's first dashboard if not supplied.
+	if body.DashboardID == nil {
+		var dbID string
+		if err := h.db.QueryRow(r.Context(),
+			`SELECT id FROM user_dashboards WHERE user_id = $1 ORDER BY position LIMIT 1`,
+			ownerID,
+		).Scan(&dbID); err == nil {
+			body.DashboardID = &dbID
+		}
+	}
+
 	// Upsert gauge record.
 	var gaugeID string
 	var err error
@@ -198,11 +209,11 @@ func (h *GaugeExternalHandler) AddExternal(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Add to watchlist (upsert — idempotent if already added).
+	// Add to watchlist as a standalone gauge (no reach context).
 	_, err = h.db.Exec(r.Context(), `
-		INSERT INTO user_watchlists (user_id, gauge_id, dashboard_id)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (user_id, gauge_id, dashboard_id) DO NOTHING
+		INSERT INTO user_watchlists (user_id, gauge_id, reach_slug, dashboard_id)
+		VALUES ($1, $2::uuid, NULL, $3::uuid)
+		ON CONFLICT DO NOTHING
 	`, ownerID, gaugeID, body.DashboardID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "failed to add to watchlist")
