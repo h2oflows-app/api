@@ -200,7 +200,7 @@ func (h *GaugeExternalHandler) AddExternal(w http.ResponseWriter, r *http.Reques
 
 	// Add to watchlist (upsert — idempotent if already added).
 	_, err = h.db.Exec(r.Context(), `
-		INSERT INTO watchlist (user_id, gauge_id, dashboard_id)
+		INSERT INTO user_watchlists (user_id, gauge_id, dashboard_id)
 		VALUES ($1, $2, $3)
 		ON CONFLICT (user_id, gauge_id, dashboard_id) DO NOTHING
 	`, ownerID, gaugeID, body.DashboardID)
