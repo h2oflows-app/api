@@ -41,16 +41,15 @@ func (h *UpvoteHandler) Toggle(w http.ResponseWriter, r *http.Request) {
 	runID := chi.URLParam(r, "runId")
 	ctx := r.Context()
 
-	var isPrivate bool
-	var ownerID string
+	var visibility, ownerID string
 	if err := h.db.QueryRow(ctx,
-		`SELECT is_private, owner_id FROM user_reaches WHERE id = $1`, runID,
-	).Scan(&isPrivate, &ownerID); err != nil {
+		`SELECT visibility, owner_id FROM user_reaches WHERE id = $1`, runID,
+	).Scan(&visibility, &ownerID); err != nil {
 		errorResponse(w, http.StatusNotFound, "run not found")
 		return
 	}
-	if isPrivate {
-		errorResponse(w, http.StatusForbidden, "run is private")
+	if visibility != "public" {
+		errorResponse(w, http.StatusForbidden, "run is not public")
 		return
 	}
 	if ownerID == callerID {

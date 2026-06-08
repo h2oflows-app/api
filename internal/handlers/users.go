@@ -84,7 +84,7 @@ func (h *UserProfileHandler) GetProfile(w http.ResponseWriter, r *http.Request) 
 				COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END) AS band_label,
 				COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END) AS band_color
 		) fr
-		WHERE ur.owner_id = $1 AND ur.is_private = FALSE
+		WHERE ur.owner_id = $1 AND ur.visibility = 'public' AND ur.deleted_at IS NULL
 		ORDER BY ur.created_at DESC
 	`, ownerID)
 	if err != nil {
@@ -162,7 +162,7 @@ func (h *UserProfileHandler) MapAllByHandle(w http.ResponseWriter, r *http.Reque
 				COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END) AS band_label,
 				COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END) AS band_color
 		) fr
-		WHERE ur.owner_id = $1 AND ur.is_private = FALSE
+		WHERE ur.owner_id = $1 AND ur.visibility = 'public' AND ur.deleted_at IS NULL
 	`, ownerID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")

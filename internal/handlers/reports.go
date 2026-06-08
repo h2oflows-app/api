@@ -526,7 +526,7 @@ func (h *ReportHandler) ListByRunID(w http.ResponseWriter, r *http.Request) {
 
 	var userReachID string
 	if err := h.db.QueryRow(ctx,
-		`SELECT id FROM user_reaches WHERE id = $1 AND is_private = FALSE`, runID,
+		`SELECT id FROM user_reaches WHERE id = $1 AND visibility = 'public' AND deleted_at IS NULL`, runID,
 	).Scan(&userReachID); err != nil {
 		errorResponse(w, http.StatusNotFound, "run not found")
 		return

@@ -90,7 +90,7 @@ func (h *ClusterHandler) nearbyRuns(r *http.Request, putInLat, putInLng, takeOut
 			COALESCE((SELECT COUNT(*) FROM reports rp WHERE rp.user_reach_id = ur.id AND rp.deleted_at IS NULL), 0)::int AS report_count
 		FROM user_reaches ur
 		LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
-		WHERE ur.is_private = FALSE
+		WHERE ur.visibility = 'public' AND ur.deleted_at IS NULL
 		  AND ($6 = '' OR ur.id::text <> $6)
 		  AND ST_DWithin(ur.put_in::geography,   ST_MakePoint($2, $1)::geography, $5)
 		  AND ST_DWithin(ur.take_out::geography, ST_MakePoint($4, $3)::geography, $5)
@@ -199,7 +199,7 @@ func (h *ClusterHandler) ClusterForRun(w http.ResponseWriter, r *http.Request) {
 			ST_Y(put_in::geometry),  ST_X(put_in::geometry),
 			ST_Y(take_out::geometry), ST_X(take_out::geometry),
 			COALESCE(up_comid, ''),
-			is_private::text
+			visibility::text
 		FROM user_reaches WHERE id = $1
 	`, runID).Scan(&putInLat, &putInLng, &takeOutLat, &takeOutLng, &upComID, &isPrivate)
 	if err != nil {
@@ -207,8 +207,8 @@ func (h *ClusterHandler) ClusterForRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Private runs: only owner can see cluster.
-	if isPrivate == "true" {
+	// Non-public runs: only owner can see cluster.
+	if isPrivate != "public" {
 		callerID := h.callerID(r)
 		var ownerID string
 		_ = h.db.QueryRow(r.Context(), `SELECT owner_id FROM user_reaches WHERE id = $1`, runID).Scan(&ownerID)

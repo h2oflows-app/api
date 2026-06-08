@@ -146,7 +146,8 @@ type userReachSummary struct {
 	CustomGaugeName  *string    `json:"custom_gauge_name"`
 	LastReadAt       *time.Time `json:"last_reading_at"`
 	CreatedAt        time.Time  `json:"created_at"`
-	IsPrivate        bool       `json:"is_private"`
+	Visibility       string     `json:"visibility"`
+	IsPrivate        bool       `json:"is_private"` // backward compat; derived from Visibility
 	AuthorHandle     *string    `json:"author_handle"`
 	IsOfficial       bool       `json:"is_official"`
 }
@@ -371,13 +372,13 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 			SELECT a.id AS run_id, MIN(b.id::text) AS cluster_id
 			FROM user_reaches a
 			JOIN user_reaches b ON (
-				b.is_private = FALSE
+				b.visibility = 'public' AND b.deleted_at IS NULL
 				AND a.up_comid IS NOT NULL
 				AND b.up_comid = a.up_comid
 				AND ST_DWithin(a.put_in::geography,   b.put_in::geography,   1609.34)
 				AND ST_DWithin(a.take_out::geography, b.take_out::geography, 1609.34)
 			)
-			WHERE a.is_private = FALSE
+			WHERE a.visibility = 'public' AND a.deleted_at IS NULL
 			GROUP BY a.id
 		)
 		SELECT
@@ -428,7 +429,7 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 				COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END) AS band_label,
 				COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END) AS band_color
 		) fr
-		WHERE ur.is_private = FALSE
+		WHERE ur.visibility = 'public' AND ur.deleted_at IS NULL
 	`)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
@@ -565,7 +566,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			ur.custom_gauge_id::text AS custom_gauge_id,
 			cg.slug AS custom_gauge_slug,
 			cg.name AS custom_gauge_name,
-			ur.is_private,
+			ur.visibility,
 			up.handle AS author_handle
 		FROM user_reaches ur
 		LEFT JOIN rivers rv ON rv.id = ur.river_id
@@ -610,8 +611,9 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			&s.CurrentCFS, &s.LastReadAt,
 			&s.FlowStatus, &s.FlowBand, &s.GaugeID,
 			&s.CustomGaugeID, &s.CustomGaugeSlug, &s.CustomGaugeName,
-			&s.IsPrivate, &s.AuthorHandle,
+			&s.Visibility, &s.AuthorHandle,
 		); err == nil {
+			s.IsPrivate = s.Visibility != "public"
 			items = append(items, s)
 		}
 	}
@@ -665,7 +667,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 			rv.slug AS river_slug,
 			rv.state_abbr AS river_state_abbr,
 			rv.basin AS river_basin,
-			ur.is_private,
+			ur.visibility,
 			COALESCE(fr_reach.slug, fr_ur.slug) AS forked_from_slug,
 			COALESCE(
 				COALESCE(fr_reach.common_name, fr_reach.name),
@@ -712,7 +714,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 		&d.CurrentCFS, &d.LastReadAt,
 		&d.FlowStatus, &d.FlowBand,
 		&d.RiverSlug, &d.RiverStateAbbr, &d.RiverBasin,
-		&d.IsPrivate,
+		&d.Visibility,
 		&d.ForkedFromSlug, &d.ForkedFromName,
 		&d.OriginalAuthorHandle, &d.OriginalForkedAt, &d.LastModifiedAfterForkAt,
 	)
@@ -720,6 +722,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
 		return
 	}
+	d.IsPrivate = d.Visibility != "public"
 
 	if geojsonBytes != nil {
 		raw := json.RawMessage(geojsonBytes)
@@ -809,7 +812,7 @@ func (h *UserReachHandler) GetPublicByHandle(w http.ResponseWriter, r *http.Requ
 	err := h.db.QueryRow(r.Context(), `
 		SELECT ur.id FROM user_reaches ur
 		JOIN user_profiles up ON up.owner_id = ur.owner_id
-		WHERE ur.slug = $1 AND LOWER(up.handle) = LOWER($2) AND ur.is_private = FALSE
+		WHERE ur.slug = $1 AND LOWER(up.handle) = LOWER($2) AND ur.visibility = 'public' AND ur.deleted_at IS NULL
 	`, slug, handle).Scan(&runID)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "run not found")
@@ -865,7 +868,7 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 			rv.slug AS river_slug,
 			rv.state_abbr AS river_state_abbr,
 			rv.basin AS river_basin,
-			ur.is_private,
+			ur.visibility,
 			COALESCE(fr_reach.slug, fr_ur.slug) AS forked_from_slug,
 			COALESCE(
 				COALESCE(fr_reach.common_name, fr_reach.name),
@@ -901,7 +904,7 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 				COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END) AS band_label,
 				COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END) AS band_color
 		) fr
-		WHERE ur.id = $1 AND ur.is_private = FALSE
+		WHERE ur.id = $1 AND ur.visibility = 'public' AND ur.deleted_at IS NULL
 	`, runID).Scan(
 		&d.ID, &d.Slug, &d.Name, &d.LongName, &d.RiverName,
 		&d.PutInLng, &d.PutInLat, &d.TakeOutLng, &d.TakeOutLat,
@@ -915,7 +918,7 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 		&d.CurrentCFS, &d.LastReadAt,
 		&d.FlowStatus, &d.FlowBand,
 		&d.RiverSlug, &d.RiverStateAbbr, &d.RiverBasin,
-		&d.IsPrivate,
+		&d.Visibility,
 		&d.ForkedFromSlug, &d.ForkedFromName,
 		&authorID, &d.AuthorHandle,
 		&d.OriginalAuthorHandle, &d.OriginalForkedAt, &d.LastModifiedAfterForkAt,
@@ -925,6 +928,7 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
+	d.IsPrivate = d.Visibility != "public"
 	d.IsOfficial = (d.AuthorHandle == nil)
 	d.IsOwn = callerID != "" && callerID == authorID
 
@@ -1027,6 +1031,7 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Note      *string   `json:"note"`
 		ClassMin  *float64  `json:"class_min"`
 		ClassMax  *float64  `json:"class_max"`
+		// is_private kept for backward compat; maps to visibility column
 		IsPrivate bool      `json:"is_private"`
 		FlowBands *FlowBands `json:"flow_bands"`
 	}
@@ -1075,21 +1080,28 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 		slug = fmt.Sprintf("%s-%d", baseSlug, i)
 	}
 
+	createVisibility := "private"
+	if !body.IsPrivate {
+		createVisibility = "public"
+	}
+
 	var reachID string
 	err := h.db.QueryRow(ctx, `
 		INSERT INTO user_reaches
-			(owner_id, slug, name, long_name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, class_min, class_max, is_private)
+			(owner_id, slug, name, long_name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, class_min, class_max, visibility, published_at)
 		VALUES
 			($1, $2, $3, $4, $5, $6,
 			 ST_SetSRID(ST_MakePoint($7, $8), 4326)::geography,
 			 ST_SetSRID(ST_MakePoint($9, $10), 4326)::geography,
-			 NULLIF($11,''), NULLIF($12,''), $13, $14, $15, $16)
+			 NULLIF($11,''), NULLIF($12,''), $13, $14, $15,
+			 $16::run_visibility,
+			 CASE WHEN $16 = 'public' THEN NOW() ELSE NULL END)
 		RETURNING id
 	`, ownerID, slug, body.Name, body.LongName, riverID, finalRiverName,
 		body.PutIn.Lng, body.PutIn.Lat,
 		body.TakeOut.Lng, body.TakeOut.Lat,
 		body.UpComID, body.DownComID, body.Note,
-		body.ClassMin, body.ClassMax, body.IsPrivate,
+		body.ClassMin, body.ClassMax, createVisibility,
 	).Scan(&reachID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("create failed: %v", err))
@@ -1267,7 +1279,9 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		DownComID *string  `json:"down_comid"`
 		ClassMin  *float64 `json:"class_min"`
 		ClassMax  *float64 `json:"class_max"`
-		IsPrivate *bool    `json:"is_private"`
+		// is_private kept for backward compat; maps to visibility column
+		IsPrivate  *bool   `json:"is_private"`
+		Visibility *string `json:"visibility"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid JSON")
@@ -1283,7 +1297,19 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	// Core fields update. Set last_modified_after_fork_at when run is a fork (V4).
+	// Resolve visibility update: accept both old is_private and new visibility field.
+	var newVisibility *string
+	if body.Visibility != nil {
+		newVisibility = body.Visibility
+	} else if body.IsPrivate != nil {
+		v := "public"
+		if *body.IsPrivate {
+			v = "private"
+		}
+		newVisibility = &v
+	}
+
+	// Core fields update. Set last_modified_after_fork_at when run is a fork.
 	tag, err := h.db.Exec(ctx, `
 		UPDATE user_reaches
 		SET
@@ -1293,7 +1319,11 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 			river_name = CASE WHEN $7 THEN $8 ELSE river_name END,
 			class_min  = CASE WHEN $9 THEN $10::numeric ELSE class_min END,
 			class_max  = CASE WHEN $11 THEN $12::numeric ELSE class_max END,
-			is_private = CASE WHEN $13 THEN $14 ELSE is_private END,
+			visibility = CASE WHEN $13 THEN $14::run_visibility ELSE visibility END,
+			published_at = CASE
+				WHEN $13 AND $14 = 'public' AND published_at IS NULL THEN NOW()
+				ELSE published_at
+			END,
 			updated_at = NOW(),
 			last_modified_after_fork_at = CASE
 				WHEN original_forked_at IS NOT NULL THEN NOW()
@@ -1304,7 +1334,7 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		body.RiverName != nil, riverName,
 		body.ClassMin != nil, body.ClassMin,
 		body.ClassMax != nil, body.ClassMax,
-		body.IsPrivate != nil, body.IsPrivate)
+		newVisibility != nil, newVisibility)
 	if err != nil || tag.RowsAffected() == 0 {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
 		return
@@ -1701,7 +1731,7 @@ func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 			ST_AsGeoJSON(ur.centerline::geometry)
 		FROM user_reaches ur
 		LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
-		WHERE ur.id = $1 AND ur.is_private = FALSE
+		WHERE ur.id = $1 AND ur.visibility = 'public' AND ur.deleted_at IS NULL
 	`, runID).Scan(
 		&src.ID, &src.Name, &src.OwnerID, &src.AuthorHandle,
 		&src.RiverID, &src.RiverName,
@@ -1975,7 +2005,7 @@ func (h *UserReachHandler) ListCommunity(w http.ResponseWriter, r *http.Request)
 			ur.custom_gauge_id::text,
 			cg.slug AS custom_gauge_slug,
 			cg.name AS custom_gauge_name,
-			ur.is_private,
+			ur.visibility,
 			up.handle AS author_handle,
 			(up.owner_id IS NULL) AS is_official
 		FROM user_reaches ur
@@ -2000,7 +2030,7 @@ func (h *UserReachHandler) ListCommunity(w http.ResponseWriter, r *http.Request)
 				COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END) AS band_label,
 				COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END) AS band_color
 		) fr
-		WHERE ur.is_private = FALSE
+		WHERE ur.visibility = 'public' AND ur.deleted_at IS NULL
 		  AND ($1 = '%%' OR ur.name ILIKE $1 OR ur.river_name ILIKE $1)
 		ORDER BY ur.created_at DESC, ur.id
 		LIMIT $2 OFFSET $3
@@ -2023,8 +2053,9 @@ func (h *UserReachHandler) ListCommunity(w http.ResponseWriter, r *http.Request)
 			&s.CurrentCFS, &s.LastReadAt,
 			&s.FlowStatus, &s.FlowBand,
 			&s.GaugeID, &s.CustomGaugeID, &s.CustomGaugeSlug, &s.CustomGaugeName,
-			&s.IsPrivate, &s.AuthorHandle, &s.IsOfficial,
+			&s.Visibility, &s.AuthorHandle, &s.IsOfficial,
 		); err == nil {
+			s.IsPrivate = s.Visibility != "public"
 			items = append(items, s)
 		}
 	}
