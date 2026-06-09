@@ -275,6 +275,16 @@ func (h *WatchlistHandler) Remove(w http.ResponseWriter, r *http.Request) {
 
 	var err error
 	switch kind {
+	case "reference":
+		// id is the referenced_user_reach_id UUID. After removal, GC tombstoned run if zero refs. (V13)
+		_, err = h.db.Exec(r.Context(), `
+			DELETE FROM user_watchlists
+			WHERE user_id = $1 AND referenced_user_reach_id = $2::uuid
+			  AND ($3::uuid IS NULL OR dashboard_id = $3::uuid)
+		`, userID, id, dashboardIDPtr)
+		if err == nil {
+			go gcTombstonedRun(r.Context(), h.db, id)
+		}
 	case "reach":
 		// id is the reach_slug (text); removes all entries for this reach (gauge-linked or not).
 		_, err = h.db.Exec(r.Context(), `

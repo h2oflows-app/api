@@ -148,6 +148,7 @@ type userReachSummary struct {
 	CreatedAt        time.Time  `json:"created_at"`
 	Visibility       string     `json:"visibility"`
 	IsPrivate        bool       `json:"is_private"` // backward compat; derived from Visibility
+	DeletedAt        *time.Time `json:"deleted_at"`
 	AuthorHandle     *string    `json:"author_handle"`
 	IsOfficial       bool       `json:"is_official"`
 }
@@ -812,7 +813,7 @@ func (h *UserReachHandler) GetPublicByHandle(w http.ResponseWriter, r *http.Requ
 	err := h.db.QueryRow(r.Context(), `
 		SELECT ur.id FROM user_reaches ur
 		JOIN user_profiles up ON up.owner_id = ur.owner_id
-		WHERE ur.slug = $1 AND LOWER(up.handle) = LOWER($2) AND ur.visibility = 'public' AND ur.deleted_at IS NULL
+		WHERE ur.slug = $1 AND LOWER(up.handle) = LOWER($2) AND ur.visibility = 'public'
 	`, slug, handle).Scan(&runID)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "run not found")
@@ -878,7 +879,8 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 			up.handle AS author_handle,
 			ur.original_author_handle,
 			ur.original_forked_at,
-			ur.last_modified_after_fork_at
+			ur.last_modified_after_fork_at,
+			ur.deleted_at
 		FROM user_reaches ur
 		LEFT JOIN rivers rv ON rv.id = ur.river_id
 		LEFT JOIN gauges g ON g.id = ur.primary_gauge_id
@@ -904,7 +906,7 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 				COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END) AS band_label,
 				COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END) AS band_color
 		) fr
-		WHERE ur.id = $1 AND ur.visibility = 'public' AND ur.deleted_at IS NULL
+		WHERE ur.id = $1 AND ur.visibility = 'public'
 	`, runID).Scan(
 		&d.ID, &d.Slug, &d.Name, &d.LongName, &d.RiverName,
 		&d.PutInLng, &d.PutInLat, &d.TakeOutLng, &d.TakeOutLat,
@@ -922,6 +924,7 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 		&d.ForkedFromSlug, &d.ForkedFromName,
 		&authorID, &d.AuthorHandle,
 		&d.OriginalAuthorHandle, &d.OriginalForkedAt, &d.LastModifiedAfterForkAt,
+		&d.DeletedAt,
 	)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "run not found")
@@ -1399,6 +1402,7 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 // ── Delete ───────────────────────────────────────────────────────────────────
 
 // DELETE /api/v1/me/reaches/{slug}
+// Tombstones when referenced by other users; hard-deletes when zero refs. (V11, V13)
 func (h *UserReachHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	ownerID, ok := h.ownerID(r)
 	if !ok {
@@ -1406,13 +1410,34 @@ func (h *UserReachHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slug := chi.URLParam(r, "slug")
+	ctx := r.Context()
 
-	tag, err := h.db.Exec(r.Context(),
-		`DELETE FROM user_reaches WHERE owner_id = $1 AND slug = $2`, ownerID, slug)
-	if err != nil || tag.RowsAffected() == 0 {
+	var runID string
+	if err := h.db.QueryRow(ctx,
+		`SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2 AND deleted_at IS NULL`,
+		ownerID, slug,
+	).Scan(&runID); err != nil {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
 		return
 	}
+
+	// Count external references from other users' dashboards. (V11)
+	var refCount int
+	_ = h.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM user_watchlists WHERE referenced_user_reach_id = $1`,
+		runID,
+	).Scan(&refCount)
+
+	if refCount > 0 {
+		// Referenced — soft delete (tombstone). (V11)
+		_, _ = h.db.Exec(ctx,
+			`UPDATE user_reaches SET deleted_at = NOW(), updated_at = NOW() WHERE id = $1`,
+			runID)
+	} else {
+		// Zero refs — hard delete. Votes deleted first due to RESTRICT FK. (V13)
+		hardDeleteRun(ctx, h.db, runID)
+	}
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -2092,6 +2117,31 @@ func (h *UserReachHandler) ListCommunity(w http.ResponseWriter, r *http.Request)
 		HasMore:    hasMore,
 		NextOffset: offset + len(items),
 	})
+}
+
+// ── GC helpers ───────────────────────────────────────────────────────────────
+
+// hardDeleteRun deletes upvotes (RESTRICT FK) then hard-deletes the run. (V13)
+func hardDeleteRun(ctx context.Context, db *pgxpool.Pool, runID string) {
+	_, _ = db.Exec(ctx, `DELETE FROM run_upvotes WHERE user_reach_id = $1`, runID)
+	_, _ = db.Exec(ctx, `DELETE FROM user_reaches WHERE id = $1`, runID)
+}
+
+// gcTombstonedRun hard-deletes a tombstoned run when it has zero references. (V13)
+// Called after a reference is removed from user_watchlists.
+func gcTombstonedRun(ctx context.Context, db *pgxpool.Pool, runID string) {
+	var isEligible bool
+	_ = db.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM user_reaches
+			WHERE id = $1 AND deleted_at IS NOT NULL
+		) AND NOT EXISTS(
+			SELECT 1 FROM user_watchlists WHERE referenced_user_reach_id = $1
+		)
+	`, runID).Scan(&isEligible)
+	if isEligible {
+		hardDeleteRun(ctx, db, runID)
+	}
 }
 
 // ── Publish ───────────────────────────────────────────────────────────────────
