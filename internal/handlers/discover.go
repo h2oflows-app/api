@@ -33,6 +33,7 @@ type discoverRun struct {
 	PutInLng            *float64  `json:"put_in_lng"`
 	PutInLat            *float64  `json:"put_in_lat"`
 	OriginalAuthorHandle *string  `json:"original_author_handle"`
+	ForkCount           int       `json:"fork_count"`
 }
 
 // ListRuns handles GET /api/v1/discover/runs.
@@ -73,6 +74,7 @@ func (h *DiscoverHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 			upvote_count, last_forked_at, gauge_name,
 			put_in_lng, put_in_lat,
 			original_author_handle,
+			fork_count,
 			text_rank
 		FROM (
 			-- curated H2OFlows reaches
@@ -91,6 +93,7 @@ func (h *DiscoverHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 				ST_X(r.start_point::geometry)       AS put_in_lng,
 				ST_Y(r.start_point::geometry)       AS put_in_lat,
 				NULL::text                          AS original_author_handle,
+				0::int                              AS fork_count,
 				CASE
 					WHEN LOWER(r.name) = LOWER($1)              THEN 2
 					WHEN LOWER(r.name) LIKE LOWER($1) || '%'    THEN 1
@@ -128,6 +131,9 @@ func (h *DiscoverHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 				ST_X(ur.put_in::geometry)           AS put_in_lng,
 				ST_Y(ur.put_in::geometry)           AS put_in_lat,
 				ur.original_author_handle           AS original_author_handle,
+				(SELECT COUNT(*)::int FROM user_reaches f
+				 WHERE f.forked_from_user_reach_id = ur.id
+				   AND f.visibility = 'public' AND f.deleted_at IS NULL) AS fork_count,
 				CASE
 					WHEN LOWER(ur.name) = LOWER($1)             THEN 2
 					WHEN LOWER(ur.name) LIKE LOWER($1) || '%'   THEN 1
@@ -137,7 +143,9 @@ func (h *DiscoverHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 			LEFT JOIN gauges g ON g.id = ur.primary_gauge_id
 			LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
 			LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
-			WHERE ur.is_private = FALSE
+			WHERE ur.visibility = 'public' AND ur.deleted_at IS NULL
+			  AND ur.completeness_score >= 0.2
+			  AND ur.forked_from_user_reach_id IS NULL
 			  AND ($1 = '' OR ur.name ILIKE '%' || $1 || '%' OR ur.river_name ILIKE '%' || $1 || '%')
 			  AND ($2::float8 IS NULL OR ur.class_max >= $2)
 			  AND ($3::float8 IS NULL OR ur.class_min <= $3)
@@ -162,7 +170,7 @@ func (h *DiscoverHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 			&run.ClassMin, &run.ClassMax, &run.LengthMi,
 			&run.UpvoteCount, &run.LastForkedAt, &run.GaugeName,
 			&run.PutInLng, &run.PutInLat,
-			&run.OriginalAuthorHandle,
+			&run.OriginalAuthorHandle, &run.ForkCount,
 			&textRank,
 		); err != nil {
 			continue

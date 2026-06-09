@@ -20,11 +20,12 @@ func NewWatchlistHandler(db *pgxpool.Pool) *WatchlistHandler {
 }
 
 type watchlistItem struct {
-	Kind          string  `json:"kind"` // "gauge" | "custom_gauge"
-	GaugeID       *string `json:"gauge_id"`
-	CustomGaugeID *string `json:"custom_gauge_id"`
-	ReachSlug     *string `json:"reach_slug"`
-	DashboardID   *string `json:"dashboard_id"`
+	Kind                  string  `json:"kind"` // "gauge" | "custom_gauge" | "reference"
+	GaugeID               *string `json:"gauge_id"`
+	CustomGaugeID         *string `json:"custom_gauge_id"`
+	ReachSlug             *string `json:"reach_slug"`
+	DashboardID           *string `json:"dashboard_id"`
+	ReferencedUserReachID *string `json:"referenced_user_reach_id"`
 }
 
 // List handles GET /api/v1/watchlist?dashboard_id=<uuid>
@@ -49,14 +50,16 @@ func (h *WatchlistHandler) List(w http.ResponseWriter, r *http.Request) {
 
 	if dashboardID != "" {
 		pgrows, err = h.db.Query(r.Context(), `
-			SELECT gauge_id::text, custom_gauge_id::text, reach_slug, dashboard_id::text
+			SELECT gauge_id::text, custom_gauge_id::text, reach_slug, dashboard_id::text,
+			       referenced_user_reach_id::text
 			FROM   user_watchlists
 			WHERE  user_id = $1 AND dashboard_id = $2::uuid
 			ORDER  BY created_at
 		`, userID, dashboardID)
 	} else {
 		pgrows, err = h.db.Query(r.Context(), `
-			SELECT gauge_id::text, custom_gauge_id::text, reach_slug, dashboard_id::text
+			SELECT gauge_id::text, custom_gauge_id::text, reach_slug, dashboard_id::text,
+			       referenced_user_reach_id::text
 			FROM   user_watchlists
 			WHERE  user_id = $1
 			ORDER  BY created_at
@@ -71,10 +74,13 @@ func (h *WatchlistHandler) List(w http.ResponseWriter, r *http.Request) {
 	items := []watchlistItem{}
 	for pgrows.Next() {
 		var item watchlistItem
-		if err := pgrows.Scan(&item.GaugeID, &item.CustomGaugeID, &item.ReachSlug, &item.DashboardID); err == nil {
-			if item.CustomGaugeID != nil {
+		if err := pgrows.Scan(&item.GaugeID, &item.CustomGaugeID, &item.ReachSlug, &item.DashboardID, &item.ReferencedUserReachID); err == nil {
+			switch {
+			case item.ReferencedUserReachID != nil:
+				item.Kind = "reference"
+			case item.CustomGaugeID != nil:
 				item.Kind = "custom_gauge"
-			} else {
+			default:
 				item.Kind = "gauge"
 			}
 			items = append(items, item)
@@ -269,6 +275,16 @@ func (h *WatchlistHandler) Remove(w http.ResponseWriter, r *http.Request) {
 
 	var err error
 	switch kind {
+	case "reference":
+		// id is the referenced_user_reach_id UUID. After removal, GC tombstoned run if zero refs. (V13)
+		_, err = h.db.Exec(r.Context(), `
+			DELETE FROM user_watchlists
+			WHERE user_id = $1 AND referenced_user_reach_id = $2::uuid
+			  AND ($3::uuid IS NULL OR dashboard_id = $3::uuid)
+		`, userID, id, dashboardIDPtr)
+		if err == nil {
+			go gcTombstonedRun(r.Context(), h.db, id)
+		}
 	case "reach":
 		// id is the reach_slug (text); removes all entries for this reach (gauge-linked or not).
 		_, err = h.db.Exec(r.Context(), `
@@ -297,4 +313,71 @@ func (h *WatchlistHandler) Remove(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// AddReference handles POST /api/v1/user-runs/{runId}/add-to-dashboard
+// Adds a public run to the caller's dashboard by reference (no copy). (V6)
+// Body: { "dashboard_id": "<uuid>" }  (optional; defaults to first dashboard)
+func (h *WatchlistHandler) AddReference(w http.ResponseWriter, r *http.Request) {
+	userID, ok := auth.UserIDFromContext(r.Context())
+	if !ok {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	runID := chi.URLParam(r, "runId")
+	ctx := r.Context()
+
+	// Verify run is public and not tombstoned (V6).
+	var exists bool
+	if err := h.db.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM user_reaches WHERE id = $1 AND visibility = 'public' AND deleted_at IS NULL)`,
+		runID,
+	).Scan(&exists); err != nil || !exists {
+		errorResponse(w, http.StatusNotFound, "run not found or not public")
+		return
+	}
+
+	var body struct {
+		DashboardID *string `json:"dashboard_id"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+
+	// Resolve dashboard_id: use provided or default to first dashboard.
+	dashboardID := body.DashboardID
+	if dashboardID == nil {
+		var dbID string
+		err := h.db.QueryRow(ctx, `
+			SELECT id::text FROM user_dashboards
+			WHERE owner_id = $1 ORDER BY position, created_at LIMIT 1
+		`, userID).Scan(&dbID)
+		if err != nil {
+			// Auto-create default dashboard.
+			err = h.db.QueryRow(ctx, `
+				INSERT INTO user_dashboards (owner_id, slug, name, position)
+				VALUES ($1, 'default', 'My Dashboard', 0)
+				ON CONFLICT (owner_id, slug) DO UPDATE SET name = EXCLUDED.name
+				RETURNING id::text
+			`, userID).Scan(&dbID)
+			if err != nil {
+				errorResponse(w, http.StatusInternalServerError, "dashboard resolution failed")
+				return
+			}
+		}
+		dashboardID = &dbID
+	}
+
+	_, err := h.db.Exec(ctx, `
+		INSERT INTO user_watchlists (user_id, referenced_user_reach_id, dashboard_id)
+		VALUES ($1, $2::uuid, $3::uuid)
+		ON CONFLICT DO NOTHING
+	`, userID, runID, dashboardID)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "insert failed")
+		return
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"referenced_user_reach_id": runID,
+		"dashboard_id":             dashboardID,
+	})
 }

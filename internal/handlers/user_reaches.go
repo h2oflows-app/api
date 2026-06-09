@@ -146,7 +146,11 @@ type userReachSummary struct {
 	CustomGaugeName  *string    `json:"custom_gauge_name"`
 	LastReadAt       *time.Time `json:"last_reading_at"`
 	CreatedAt        time.Time  `json:"created_at"`
-	IsPrivate        bool       `json:"is_private"`
+	Visibility       string     `json:"visibility"`
+	IsPrivate        bool       `json:"is_private"` // backward compat; derived from Visibility
+	DeletedAt        *time.Time `json:"deleted_at"`
+	ForkCount        int        `json:"fork_count"`
+	IsFork           bool       `json:"is_fork"`
 	AuthorHandle     *string    `json:"author_handle"`
 	IsOfficial       bool       `json:"is_official"`
 }
@@ -367,18 +371,40 @@ func (h *UserReachHandler) MapAll(w http.ResponseWriter, r *http.Request) {
 // Same shape as MapAll. Public endpoint — no auth required.
 func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.db.Query(r.Context(), `
-		WITH cluster_groups AS (
+		WITH geo_clusters AS (
+			-- Geometry-based clustering: same COMID + within 1mi at put-in and take-out.
 			SELECT a.id AS run_id, MIN(b.id::text) AS cluster_id
 			FROM user_reaches a
 			JOIN user_reaches b ON (
-				b.is_private = FALSE
+				b.visibility = 'public' AND b.deleted_at IS NULL
 				AND a.up_comid IS NOT NULL
 				AND b.up_comid = a.up_comid
 				AND ST_DWithin(a.put_in::geography,   b.put_in::geography,   1609.34)
 				AND ST_DWithin(a.take_out::geography, b.take_out::geography, 1609.34)
 			)
-			WHERE a.is_private = FALSE
+			WHERE a.visibility = 'public' AND a.deleted_at IS NULL
 			GROUP BY a.id
+		),
+		cluster_groups AS (
+			-- Lineage-first clustering: forks under public parent; fall back to geo. (V10)
+			SELECT ur.id AS run_id,
+				COALESCE(
+					CASE
+						WHEN ur.forked_from_user_reach_id IS NOT NULL
+						  AND EXISTS(
+							SELECT 1 FROM user_reaches p
+							WHERE p.id = ur.forked_from_user_reach_id
+							  AND p.visibility = 'public' AND p.deleted_at IS NULL
+						  )
+						THEN ur.forked_from_user_reach_id::text
+						ELSE NULL
+					END,
+					gc.cluster_id,
+					ur.id::text
+				) AS cluster_id
+			FROM user_reaches ur
+			LEFT JOIN geo_clusters gc ON gc.run_id = ur.id
+			WHERE ur.visibility = 'public' AND ur.deleted_at IS NULL
 		)
 		SELECT
 			ur.id, ur.slug, ur.name, ur.river_name,
@@ -399,12 +425,15 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 			up.handle AS author_handle,
 			(up.owner_id IS NULL) AS is_official,
 			COALESCE(cgrp.cluster_id, ur.id::text) AS cluster_id,
-			(
-				COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0)
-				+ COALESCE((SELECT COUNT(*) FROM reports rp WHERE rp.user_reach_id = ur.id AND rp.deleted_at IS NULL), 0) * 2
-				+ (CASE WHEN ur.centerline IS NOT NULL THEN 1 ELSE 0 END
-				   + CASE WHEN EXISTS(SELECT 1 FROM user_reach_flow_ranges WHERE user_reach_id = ur.id) THEN 1 ELSE 0 END
-				   + CASE WHEN ur.note IS NOT NULL AND char_length(ur.note) >= 20 THEN 1 ELSE 0 END) * 5
+			(ur.forked_from_user_reach_id IS NOT NULL) AS is_fork,
+			(SELECT COUNT(*)::int FROM user_reaches f
+			 WHERE f.forked_from_user_reach_id = ur.id
+			   AND f.visibility = 'public' AND f.deleted_at IS NULL) AS fork_count,
+			-- Bayesian rank: (C*prior + votes)/(C + votes)*100. C=5. (V19)
+			ROUND(
+				(5.0 * ur.completeness_score + COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0)::float)
+				/ GREATEST(5.0 + COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0)::float, 1.0)
+				* 100
 			)::int AS rank_score
 		FROM user_reaches ur
 		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
@@ -428,7 +457,7 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 				COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END) AS band_label,
 				COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END) AS band_color
 		) fr
-		WHERE ur.is_private = FALSE
+		WHERE ur.visibility = 'public' AND ur.deleted_at IS NULL
 	`)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
@@ -450,6 +479,8 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 		AuthorHandle *string  `json:"author_handle"`
 		IsOfficial   bool     `json:"is_official"`
 		ClusterID    string   `json:"cluster_id"`
+		IsFork       bool     `json:"is_fork"`
+		ForkCount    int      `json:"fork_count"`
 		RankScore    int      `json:"rank_score"`
 	}
 	type feature struct {
@@ -473,6 +504,8 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 			authorHandle           *string
 			isOfficial             bool
 			clusterID              string
+			isFork                 bool
+			forkCount              int
 			rankScore              int
 		)
 		if err := rows.Scan(
@@ -481,7 +514,7 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 			&putInLng, &putInLat, &takeOutLng, &takeOutLat,
 			&currentCFS, &flowStatus, &gaugeID, &classMax,
 			&authorHandle, &isOfficial,
-			&clusterID, &rankScore,
+			&clusterID, &isFork, &forkCount, &rankScore,
 		); err != nil {
 			continue
 		}
@@ -518,6 +551,8 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 				AuthorHandle: authorHandle,
 				IsOfficial:   isOfficial,
 				ClusterID:    clusterID,
+				IsFork:       isFork,
+				ForkCount:    forkCount,
 				RankScore:    rankScore,
 			},
 		})
@@ -565,7 +600,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			ur.custom_gauge_id::text AS custom_gauge_id,
 			cg.slug AS custom_gauge_slug,
 			cg.name AS custom_gauge_name,
-			ur.is_private,
+			ur.visibility,
 			up.handle AS author_handle
 		FROM user_reaches ur
 		LEFT JOIN rivers rv ON rv.id = ur.river_id
@@ -610,8 +645,9 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			&s.CurrentCFS, &s.LastReadAt,
 			&s.FlowStatus, &s.FlowBand, &s.GaugeID,
 			&s.CustomGaugeID, &s.CustomGaugeSlug, &s.CustomGaugeName,
-			&s.IsPrivate, &s.AuthorHandle,
+			&s.Visibility, &s.AuthorHandle,
 		); err == nil {
+			s.IsPrivate = s.Visibility != "public"
 			items = append(items, s)
 		}
 	}
@@ -665,7 +701,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 			rv.slug AS river_slug,
 			rv.state_abbr AS river_state_abbr,
 			rv.basin AS river_basin,
-			ur.is_private,
+			ur.visibility,
 			COALESCE(fr_reach.slug, fr_ur.slug) AS forked_from_slug,
 			COALESCE(
 				COALESCE(fr_reach.common_name, fr_reach.name),
@@ -712,7 +748,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 		&d.CurrentCFS, &d.LastReadAt,
 		&d.FlowStatus, &d.FlowBand,
 		&d.RiverSlug, &d.RiverStateAbbr, &d.RiverBasin,
-		&d.IsPrivate,
+		&d.Visibility,
 		&d.ForkedFromSlug, &d.ForkedFromName,
 		&d.OriginalAuthorHandle, &d.OriginalForkedAt, &d.LastModifiedAfterForkAt,
 	)
@@ -720,6 +756,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
 		return
 	}
+	d.IsPrivate = d.Visibility != "public"
 
 	if geojsonBytes != nil {
 		raw := json.RawMessage(geojsonBytes)
@@ -809,7 +846,7 @@ func (h *UserReachHandler) GetPublicByHandle(w http.ResponseWriter, r *http.Requ
 	err := h.db.QueryRow(r.Context(), `
 		SELECT ur.id FROM user_reaches ur
 		JOIN user_profiles up ON up.owner_id = ur.owner_id
-		WHERE ur.slug = $1 AND LOWER(up.handle) = LOWER($2) AND ur.is_private = FALSE
+		WHERE ur.slug = $1 AND LOWER(up.handle) = LOWER($2) AND ur.visibility = 'public'
 	`, slug, handle).Scan(&runID)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "run not found")
@@ -865,7 +902,7 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 			rv.slug AS river_slug,
 			rv.state_abbr AS river_state_abbr,
 			rv.basin AS river_basin,
-			ur.is_private,
+			ur.visibility,
 			COALESCE(fr_reach.slug, fr_ur.slug) AS forked_from_slug,
 			COALESCE(
 				COALESCE(fr_reach.common_name, fr_reach.name),
@@ -875,7 +912,8 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 			up.handle AS author_handle,
 			ur.original_author_handle,
 			ur.original_forked_at,
-			ur.last_modified_after_fork_at
+			ur.last_modified_after_fork_at,
+			ur.deleted_at
 		FROM user_reaches ur
 		LEFT JOIN rivers rv ON rv.id = ur.river_id
 		LEFT JOIN gauges g ON g.id = ur.primary_gauge_id
@@ -901,7 +939,7 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 				COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END) AS band_label,
 				COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END) AS band_color
 		) fr
-		WHERE ur.id = $1 AND ur.is_private = FALSE
+		WHERE ur.id = $1 AND ur.visibility = 'public'
 	`, runID).Scan(
 		&d.ID, &d.Slug, &d.Name, &d.LongName, &d.RiverName,
 		&d.PutInLng, &d.PutInLat, &d.TakeOutLng, &d.TakeOutLat,
@@ -915,16 +953,18 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 		&d.CurrentCFS, &d.LastReadAt,
 		&d.FlowStatus, &d.FlowBand,
 		&d.RiverSlug, &d.RiverStateAbbr, &d.RiverBasin,
-		&d.IsPrivate,
+		&d.Visibility,
 		&d.ForkedFromSlug, &d.ForkedFromName,
 		&authorID, &d.AuthorHandle,
 		&d.OriginalAuthorHandle, &d.OriginalForkedAt, &d.LastModifiedAfterForkAt,
+		&d.DeletedAt,
 	)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "run not found")
 		return
 	}
 
+	d.IsPrivate = d.Visibility != "public"
 	d.IsOfficial = (d.AuthorHandle == nil)
 	d.IsOwn = callerID != "" && callerID == authorID
 
@@ -1027,7 +1067,8 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Note      *string   `json:"note"`
 		ClassMin  *float64  `json:"class_min"`
 		ClassMax  *float64  `json:"class_max"`
-		IsPrivate bool      `json:"is_private"`
+		// is_private kept for backward compat; nil (absent) = private by default (V1)
+		IsPrivate *bool     `json:"is_private"`
 		FlowBands *FlowBands `json:"flow_bands"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -1075,21 +1116,29 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 		slug = fmt.Sprintf("%s-%d", baseSlug, i)
 	}
 
+	// V1: default private; is_private=false (explicit) → public for backward compat
+	createVisibility := "private"
+	if body.IsPrivate != nil && !*body.IsPrivate {
+		createVisibility = "public"
+	}
+
 	var reachID string
 	err := h.db.QueryRow(ctx, `
 		INSERT INTO user_reaches
-			(owner_id, slug, name, long_name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, class_min, class_max, is_private)
+			(owner_id, slug, name, long_name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, class_min, class_max, visibility, published_at)
 		VALUES
 			($1, $2, $3, $4, $5, $6,
 			 ST_SetSRID(ST_MakePoint($7, $8), 4326)::geography,
 			 ST_SetSRID(ST_MakePoint($9, $10), 4326)::geography,
-			 NULLIF($11,''), NULLIF($12,''), $13, $14, $15, $16)
+			 NULLIF($11,''), NULLIF($12,''), $13, $14, $15,
+			 $16::run_visibility,
+			 CASE WHEN $16 = 'public' THEN NOW() ELSE NULL END)
 		RETURNING id
 	`, ownerID, slug, body.Name, body.LongName, riverID, finalRiverName,
 		body.PutIn.Lng, body.PutIn.Lat,
 		body.TakeOut.Lng, body.TakeOut.Lat,
 		body.UpComID, body.DownComID, body.Note,
-		body.ClassMin, body.ClassMax, body.IsPrivate,
+		body.ClassMin, body.ClassMax, createVisibility,
 	).Scan(&reachID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("create failed: %v", err))
@@ -1109,6 +1158,7 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	saveCompleteness(ctx, h.db, reachID)
 	jsonResponse(w, http.StatusCreated, map[string]string{"id": reachID, "slug": slug})
 }
 
@@ -1237,6 +1287,7 @@ func (h *UserReachHandler) Import(w http.ResponseWriter, r *http.Request) { //no
 		}
 	}
 
+	saveCompleteness(ctx, h.db, reachID)
 	jsonResponse(w, http.StatusCreated, map[string]string{"id": reachID, "slug": slug})
 }
 
@@ -1267,7 +1318,9 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		DownComID *string  `json:"down_comid"`
 		ClassMin  *float64 `json:"class_min"`
 		ClassMax  *float64 `json:"class_max"`
-		IsPrivate *bool    `json:"is_private"`
+		// is_private kept for backward compat; maps to visibility column
+		IsPrivate  *bool   `json:"is_private"`
+		Visibility *string `json:"visibility"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid JSON")
@@ -1283,7 +1336,46 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	// Core fields update. Set last_modified_after_fork_at when run is a fork (V4).
+	// Resolve visibility update: accept both old is_private and new visibility field.
+	var newVisibility *string
+	if body.Visibility != nil {
+		newVisibility = body.Visibility
+	} else if body.IsPrivate != nil {
+		v := "public"
+		if *body.IsPrivate {
+			v = "private"
+		}
+		newVisibility = &v
+	}
+
+	// V2/V3 ratchet guard: read current state before applying visibility change.
+	if newVisibility != nil {
+		if *newVisibility == "public" {
+			errorResponse(w, http.StatusBadRequest, "use POST /publish to make a run public")
+			return
+		}
+		var curVisibility string
+		var publishedAt *string
+		if err := h.db.QueryRow(ctx,
+			`SELECT visibility, published_at::text FROM user_reaches WHERE owner_id = $1 AND slug = $2`,
+			ownerID, slug,
+		).Scan(&curVisibility, &publishedAt); err != nil {
+			errorResponse(w, http.StatusNotFound, "user reach not found")
+			return
+		}
+		if curVisibility == "public" {
+			// V2: once public, visibility is immutable (only delete path exists)
+			errorResponse(w, http.StatusConflict, "run is public; visibility cannot be changed")
+			return
+		}
+		if *newVisibility == "private" && publishedAt != nil {
+			// V3: unlisted→private only allowed if never published
+			errorResponse(w, http.StatusConflict, "run was published; cannot revert to private")
+			return
+		}
+	}
+
+	// Core fields update. Set last_modified_after_fork_at when run is a fork.
 	tag, err := h.db.Exec(ctx, `
 		UPDATE user_reaches
 		SET
@@ -1293,7 +1385,7 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 			river_name = CASE WHEN $7 THEN $8 ELSE river_name END,
 			class_min  = CASE WHEN $9 THEN $10::numeric ELSE class_min END,
 			class_max  = CASE WHEN $11 THEN $12::numeric ELSE class_max END,
-			is_private = CASE WHEN $13 THEN $14 ELSE is_private END,
+			visibility = CASE WHEN $13 THEN $14::run_visibility ELSE visibility END,
 			updated_at = NOW(),
 			last_modified_after_fork_at = CASE
 				WHEN original_forked_at IS NOT NULL THEN NOW()
@@ -1304,7 +1396,7 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		body.RiverName != nil, riverName,
 		body.ClassMin != nil, body.ClassMin,
 		body.ClassMax != nil, body.ClassMax,
-		body.IsPrivate != nil, body.IsPrivate)
+		newVisibility != nil, newVisibility)
 	if err != nil || tag.RowsAffected() == 0 {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
 		return
@@ -1341,11 +1433,18 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 			*body.UpComID, *body.DownComID)
 	}
 
+	// Recompute completeness after any field change. (V18)
+	var runID string
+	if h.db.QueryRow(ctx, `SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2`,
+		ownerID, slug).Scan(&runID) == nil {
+		saveCompleteness(ctx, h.db, runID)
+	}
 }
 
 // ── Delete ───────────────────────────────────────────────────────────────────
 
 // DELETE /api/v1/me/reaches/{slug}
+// Tombstones when referenced by other users; hard-deletes when zero refs. (V11, V13)
 func (h *UserReachHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	ownerID, ok := h.ownerID(r)
 	if !ok {
@@ -1353,13 +1452,34 @@ func (h *UserReachHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slug := chi.URLParam(r, "slug")
+	ctx := r.Context()
 
-	tag, err := h.db.Exec(r.Context(),
-		`DELETE FROM user_reaches WHERE owner_id = $1 AND slug = $2`, ownerID, slug)
-	if err != nil || tag.RowsAffected() == 0 {
+	var runID string
+	if err := h.db.QueryRow(ctx,
+		`SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2 AND deleted_at IS NULL`,
+		ownerID, slug,
+	).Scan(&runID); err != nil {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
 		return
 	}
+
+	// Count external references from other users' dashboards. (V11)
+	var refCount int
+	_ = h.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM user_watchlists WHERE referenced_user_reach_id = $1`,
+		runID,
+	).Scan(&refCount)
+
+	if refCount > 0 {
+		// Referenced — soft delete (tombstone). (V11)
+		_, _ = h.db.Exec(ctx,
+			`UPDATE user_reaches SET deleted_at = NOW(), updated_at = NOW() WHERE id = $1`,
+			runID)
+	} else {
+		// Zero refs — hard delete. Votes deleted first due to RESTRICT FK. (V13)
+		hardDeleteRun(ctx, h.db, runID)
+	}
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1450,6 +1570,7 @@ func (h *UserReachHandler) SetFlowRanges(w http.ResponseWriter, r *http.Request)
 		`, reachID, t.Label, t.Value, t.Color)
 	}
 
+	saveCompleteness(ctx, h.db, reachID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1461,7 +1582,8 @@ func (h *UserReachHandler) ClearGauge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slug := chi.URLParam(r, "slug")
-	tag, err := h.db.Exec(r.Context(), `
+	ctx := r.Context()
+	tag, err := h.db.Exec(ctx, `
 		UPDATE user_reaches
 		SET primary_gauge_id = NULL, custom_gauge_id = NULL, updated_at = NOW()
 		WHERE owner_id = $1 AND slug = $2
@@ -1469,6 +1591,10 @@ func (h *UserReachHandler) ClearGauge(w http.ResponseWriter, r *http.Request) {
 	if err != nil || tag.RowsAffected() == 0 {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
 		return
+	}
+	var rid string
+	if h.db.QueryRow(ctx, `SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2`, ownerID, slug).Scan(&rid) == nil {
+		saveCompleteness(ctx, h.db, rid)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1613,6 +1739,10 @@ func (h *UserReachHandler) SetGauge(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusNotFound, "user reach not found or gauge invalid")
 		return
 	}
+	var rid string
+	if h.db.QueryRow(r.Context(), `SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2`, ownerID, slug).Scan(&rid) == nil {
+		saveCompleteness(r.Context(), h.db, rid)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1701,7 +1831,7 @@ func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 			ST_AsGeoJSON(ur.centerline::geometry)
 		FROM user_reaches ur
 		LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
-		WHERE ur.id = $1 AND ur.is_private = FALSE
+		WHERE ur.id = $1 AND ur.visibility = 'public' AND ur.deleted_at IS NULL
 	`, runID).Scan(
 		&src.ID, &src.Name, &src.OwnerID, &src.AuthorHandle,
 		&src.RiverID, &src.RiverName,
@@ -1777,6 +1907,7 @@ func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 		WHERE user_reach_id = $2
 	`, newID, src.ID)
 
+	saveCompleteness(ctx, h.db, newID)
 	jsonResponse(w, http.StatusCreated, map[string]string{"id": newID, "slug": slug, "gauge_id": func() string {
 		if src.GaugeID != nil {
 			return *src.GaugeID
@@ -1928,6 +2059,7 @@ func (h *UserReachHandler) ForkReach(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	saveCompleteness(r.Context(), h.db, newID)
 	jsonResponse(w, http.StatusCreated, map[string]string{"id": newID, "slug": newSlug})
 }
 
@@ -1975,9 +2107,12 @@ func (h *UserReachHandler) ListCommunity(w http.ResponseWriter, r *http.Request)
 			ur.custom_gauge_id::text,
 			cg.slug AS custom_gauge_slug,
 			cg.name AS custom_gauge_name,
-			ur.is_private,
+			ur.visibility,
 			up.handle AS author_handle,
-			(up.owner_id IS NULL) AS is_official
+			(up.owner_id IS NULL) AS is_official,
+			(SELECT COUNT(*)::int FROM user_reaches f
+			 WHERE f.forked_from_user_reach_id = ur.id
+			   AND f.visibility = 'public' AND f.deleted_at IS NULL) AS fork_count
 		FROM user_reaches ur
 		LEFT JOIN rivers rv ON rv.id = ur.river_id
 		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
@@ -2000,9 +2135,14 @@ func (h *UserReachHandler) ListCommunity(w http.ResponseWriter, r *http.Request)
 				COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END) AS band_label,
 				COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END) AS band_color
 		) fr
-		WHERE ur.is_private = FALSE
+		WHERE ur.visibility = 'public' AND ur.deleted_at IS NULL
+		  AND ur.completeness_score >= 0.2
+		  AND ur.forked_from_user_reach_id IS NULL
 		  AND ($1 = '%%' OR ur.name ILIKE $1 OR ur.river_name ILIKE $1)
-		ORDER BY ur.created_at DESC, ur.id
+		ORDER BY
+			(5.0 * ur.completeness_score + COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0)::float)
+			/ GREATEST(5.0 + COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0)::float, 1.0) DESC,
+			ur.created_at DESC, ur.id
 		LIMIT $2 OFFSET $3
 	`, search, limit+1, offset)
 	if err != nil {
@@ -2023,8 +2163,9 @@ func (h *UserReachHandler) ListCommunity(w http.ResponseWriter, r *http.Request)
 			&s.CurrentCFS, &s.LastReadAt,
 			&s.FlowStatus, &s.FlowBand,
 			&s.GaugeID, &s.CustomGaugeID, &s.CustomGaugeSlug, &s.CustomGaugeName,
-			&s.IsPrivate, &s.AuthorHandle, &s.IsOfficial,
+			&s.Visibility, &s.AuthorHandle, &s.IsOfficial, &s.ForkCount,
 		); err == nil {
+			s.IsPrivate = s.Visibility != "public"
 			items = append(items, s)
 		}
 	}
@@ -2038,4 +2179,179 @@ func (h *UserReachHandler) ListCommunity(w http.ResponseWriter, r *http.Request)
 		HasMore:    hasMore,
 		NextOffset: offset + len(items),
 	})
+}
+
+// ── Completeness helpers ──────────────────────────────────────────────────────
+
+// saveCompleteness recomputes and stores completeness_score for a run. (V18)
+// Called after any mutation that could change presence of scored fields.
+func saveCompleteness(ctx context.Context, db *pgxpool.Pool, runID string) {
+	_, _ = db.Exec(ctx, `
+		UPDATE user_reaches ur
+		SET completeness_score = (
+			CASE WHEN ur.note IS NOT NULL AND char_length(ur.note) > 0             THEN 0.2 ELSE 0 END
+		  + CASE WHEN ur.primary_gauge_id IS NOT NULL OR ur.custom_gauge_id IS NOT NULL THEN 0.2 ELSE 0 END
+		  + CASE WHEN ur.class_min IS NOT NULL AND ur.class_max IS NOT NULL         THEN 0.2 ELSE 0 END
+		  + CASE WHEN EXISTS(SELECT 1 FROM user_reach_flow_ranges WHERE user_reach_id = ur.id) THEN 0.2 ELSE 0 END
+		  + CASE WHEN EXISTS(SELECT 1 FROM rapids WHERE user_reach_id = ur.id)      THEN 0.2 ELSE 0 END
+		)
+		WHERE ur.id = $1
+	`, runID)
+}
+
+// ── GC helpers ───────────────────────────────────────────────────────────────
+
+// hardDeleteRun deletes upvotes (RESTRICT FK) then hard-deletes the run. (V13)
+func hardDeleteRun(ctx context.Context, db *pgxpool.Pool, runID string) {
+	_, _ = db.Exec(ctx, `DELETE FROM run_upvotes WHERE user_reach_id = $1`, runID)
+	_, _ = db.Exec(ctx, `DELETE FROM user_reaches WHERE id = $1`, runID)
+}
+
+// gcTombstonedRun hard-deletes a tombstoned run when it has zero references. (V13)
+// Called after a reference is removed from user_watchlists.
+func gcTombstonedRun(ctx context.Context, db *pgxpool.Pool, runID string) {
+	var isEligible bool
+	_ = db.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM user_reaches
+			WHERE id = $1 AND deleted_at IS NOT NULL
+		) AND NOT EXISTS(
+			SELECT 1 FROM user_watchlists WHERE referenced_user_reach_id = $1
+		)
+	`, runID).Scan(&isEligible)
+	if isEligible {
+		hardDeleteRun(ctx, db, runID)
+	}
+}
+
+// ── Publish ───────────────────────────────────────────────────────────────────
+
+// POST /api/v1/me/runs/{slug}/publish
+// One-way ratchet: private|unlisted → public. Idempotent if already public.
+// Rejects: setting visibility below public after publish (V2).
+func (h *UserReachHandler) Publish(w http.ResponseWriter, r *http.Request) {
+	ownerID, ok := h.ownerID(r)
+	if !ok {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	slug := chi.URLParam(r, "slug")
+	ctx := r.Context()
+
+	var curVisibility string
+	var reachID string
+	if err := h.db.QueryRow(ctx,
+		`SELECT id, visibility FROM user_reaches WHERE owner_id = $1 AND slug = $2 AND deleted_at IS NULL`,
+		ownerID, slug,
+	).Scan(&reachID, &curVisibility); err != nil {
+		errorResponse(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	if curVisibility == "public" {
+		// Already public — idempotent, return current state.
+		jsonResponse(w, http.StatusOK, map[string]string{"visibility": "public"})
+		return
+	}
+
+	// V2: private|unlisted → public (one-way ratchet).
+	_, err := h.db.Exec(ctx, `
+		UPDATE user_reaches
+		SET visibility   = 'public',
+		    published_at = NOW(),
+		    updated_at   = NOW()
+		WHERE id = $1
+	`, reachID)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "publish failed")
+		return
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]string{"visibility": "public"})
+}
+
+// ── Adopt ─────────────────────────────────────────────────────────────────────
+
+// POST /api/v1/user-runs/{runId}/adopt
+// Transfers a tombstoned run to the caller when caller has an active reference.
+// Preserves votes; un-tombstones; keeps visibility public. (V14)
+func (h *UserReachHandler) Adopt(w http.ResponseWriter, r *http.Request) {
+	callerID, ok := h.ownerID(r)
+	if !ok {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	runID := chi.URLParam(r, "runId")
+	ctx := r.Context()
+
+	// Verify run is tombstoned.
+	var curOwnerID, slug string
+	var deletedAt *string
+	if err := h.db.QueryRow(ctx,
+		`SELECT owner_id::text, slug, deleted_at::text FROM user_reaches WHERE id = $1`,
+		runID,
+	).Scan(&curOwnerID, &slug, &deletedAt); err != nil {
+		errorResponse(w, http.StatusNotFound, "run not found")
+		return
+	}
+	if deletedAt == nil {
+		errorResponse(w, http.StatusConflict, "run is not tombstoned; cannot adopt live run")
+		return
+	}
+	if curOwnerID == callerID {
+		errorResponse(w, http.StatusConflict, "already own this run")
+		return
+	}
+
+	// Verify caller has active reference to this run. (V14)
+	var hasRef bool
+	if err := h.db.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM user_watchlists WHERE user_id = $1 AND referenced_user_reach_id = $2::uuid)`,
+		callerID, runID,
+	).Scan(&hasRef); err != nil || !hasRef {
+		errorResponse(w, http.StatusForbidden, "must have run on your dashboard to adopt it")
+		return
+	}
+
+	// Ensure slug is unique in adopter's namespace; re-slug if conflict.
+	finalSlug := slug
+	var conflict string
+	if err := h.db.QueryRow(ctx,
+		`SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2`,
+		callerID, slug,
+	).Scan(&conflict); err == nil {
+		// Conflict — append suffix until unique.
+		base := slug
+		for i := 2; i <= 20; i++ {
+			candidate := fmt.Sprintf("%s-%d", base, i)
+			if e := h.db.QueryRow(ctx,
+				`SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2`,
+				callerID, candidate,
+			).Scan(&conflict); e != nil {
+				finalSlug = candidate
+				break
+			}
+		}
+	}
+
+	// Transfer ownership; un-tombstone; record adoption. Votes preserved in run_upvotes.
+	// owner_id is TEXT; adopted_from_owner_id is UUID (may be NULL when curOwner is non-UUID dev value).
+	_, err := h.db.Exec(ctx, `
+		UPDATE user_reaches
+		SET owner_id               = $2,
+		    slug                   = $3,
+		    adopted_from_owner_id  = CASE WHEN $4 ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+		                                  THEN $4::uuid ELSE NULL END,
+		    deleted_at             = NULL,
+		    visibility             = 'public',
+		    updated_at             = NOW()
+		WHERE id = $1
+	`, runID, callerID, finalSlug, curOwnerID)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "adopt failed")
+		return
+	}
+
+	saveCompleteness(ctx, h.db, runID)
+	jsonResponse(w, http.StatusOK, map[string]string{"id": runID, "slug": finalSlug})
 }

@@ -57,7 +57,7 @@ func (h *ModerationHandler) FlagRun(w http.ResponseWriter, r *http.Request) {
 
 	var exists bool
 	if err := h.db.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM user_reaches WHERE id = $1 AND is_private = FALSE)`, runID,
+		`SELECT EXISTS(SELECT 1 FROM user_reaches WHERE id = $1 AND visibility = 'public' AND deleted_at IS NULL)`, runID,
 	).Scan(&exists); err != nil || !exists {
 		errorResponse(w, http.StatusNotFound, "run not found")
 		return

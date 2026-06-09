@@ -153,16 +153,16 @@ func (h *FlowProposalHandler) ListByRunID(w http.ResponseWriter, r *http.Request
 	runID := chi.URLParam(r, "runId")
 	callerID, _ := h.callerID(r) // optional auth for user_voted flag
 
-	var isPrivate bool
+	var visibility string
 	if err := h.db.QueryRow(r.Context(),
-		`SELECT is_private FROM user_reaches WHERE id = $1`,
+		`SELECT visibility FROM user_reaches WHERE id = $1`,
 		runID,
-	).Scan(&isPrivate); err != nil {
+	).Scan(&visibility); err != nil {
 		errorResponse(w, http.StatusNotFound, "run not found")
 		return
 	}
-	if isPrivate {
-		errorResponse(w, http.StatusForbidden, "run is private")
+	if visibility != "public" {
+		errorResponse(w, http.StatusForbidden, "run is not public")
 		return
 	}
 
@@ -208,16 +208,16 @@ func (h *FlowProposalHandler) UpsertByRunID(w http.ResponseWriter, r *http.Reque
 	}
 	runID := chi.URLParam(r, "runId")
 
-	var isPrivate bool
+	var visibility string
 	if err := h.db.QueryRow(r.Context(),
-		`SELECT is_private FROM user_reaches WHERE id = $1`,
+		`SELECT visibility FROM user_reaches WHERE id = $1`,
 		runID,
-	).Scan(&isPrivate); err != nil {
+	).Scan(&visibility); err != nil {
 		errorResponse(w, http.StatusNotFound, "run not found")
 		return
 	}
-	if isPrivate {
-		errorResponse(w, http.StatusForbidden, "run is private")
+	if visibility != "public" {
+		errorResponse(w, http.StatusForbidden, "run is not public")
 		return
 	}
 
@@ -281,19 +281,19 @@ func (h *FlowProposalHandler) ToggleVote(w http.ResponseWriter, r *http.Request)
 	}
 	proposalID := chi.URLParam(r, "proposalId")
 
-	// Verify proposal exists and run is not private.
-	var isPrivate bool
+	// Verify proposal exists and run is public.
+	var visibility string
 	if err := h.db.QueryRow(r.Context(), `
-		SELECT ur.is_private
+		SELECT ur.visibility
 		FROM flow_range_proposals fp
 		JOIN user_reaches ur ON ur.id = fp.user_reach_id
 		WHERE fp.id = $1
-	`, proposalID).Scan(&isPrivate); err != nil {
+	`, proposalID).Scan(&visibility); err != nil {
 		errorResponse(w, http.StatusNotFound, "proposal not found")
 		return
 	}
-	if isPrivate {
-		errorResponse(w, http.StatusForbidden, "run is private")
+	if visibility != "public" {
+		errorResponse(w, http.StatusForbidden, "run is not public")
 		return
 	}
 
