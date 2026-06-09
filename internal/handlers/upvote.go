@@ -42,14 +42,19 @@ func (h *UpvoteHandler) Toggle(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	var visibility, ownerID string
+	var deletedAt *string
 	if err := h.db.QueryRow(ctx,
-		`SELECT visibility, owner_id FROM user_reaches WHERE id = $1`, runID,
-	).Scan(&visibility, &ownerID); err != nil {
+		`SELECT visibility, owner_id, deleted_at::text FROM user_reaches WHERE id = $1`, runID,
+	).Scan(&visibility, &ownerID, &deletedAt); err != nil {
 		errorResponse(w, http.StatusNotFound, "run not found")
 		return
 	}
 	if visibility != "public" {
 		errorResponse(w, http.StatusForbidden, "run is not public")
+		return
+	}
+	if deletedAt != nil {
+		errorResponse(w, http.StatusForbidden, "run is tombstoned; votes frozen")
 		return
 	}
 	if ownerID == callerID {
