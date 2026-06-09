@@ -2335,11 +2335,13 @@ func (h *UserReachHandler) Adopt(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Transfer ownership; un-tombstone; record adoption. Votes preserved in run_upvotes.
+	// owner_id is TEXT; adopted_from_owner_id is UUID (may be NULL when curOwner is non-UUID dev value).
 	_, err := h.db.Exec(ctx, `
 		UPDATE user_reaches
-		SET owner_id               = $2::uuid,
+		SET owner_id               = $2,
 		    slug                   = $3,
-		    adopted_from_owner_id  = $4::uuid,
+		    adopted_from_owner_id  = CASE WHEN $4 ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+		                                  THEN $4::uuid ELSE NULL END,
 		    deleted_at             = NULL,
 		    visibility             = 'public',
 		    updated_at             = NOW()
