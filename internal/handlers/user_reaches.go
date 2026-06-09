@@ -401,12 +401,11 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 			up.handle AS author_handle,
 			(up.owner_id IS NULL) AS is_official,
 			COALESCE(cgrp.cluster_id, ur.id::text) AS cluster_id,
-			(
-				COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0)
-				+ COALESCE((SELECT COUNT(*) FROM reports rp WHERE rp.user_reach_id = ur.id AND rp.deleted_at IS NULL), 0) * 2
-				+ (CASE WHEN ur.centerline IS NOT NULL THEN 1 ELSE 0 END
-				   + CASE WHEN EXISTS(SELECT 1 FROM user_reach_flow_ranges WHERE user_reach_id = ur.id) THEN 1 ELSE 0 END
-				   + CASE WHEN ur.note IS NOT NULL AND char_length(ur.note) >= 20 THEN 1 ELSE 0 END) * 5
+			-- Bayesian rank: (C*prior + votes)/(C + votes)*100. C=5. (V19)
+			ROUND(
+				(5.0 * ur.completeness_score + COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0)::float)
+				/ GREATEST(5.0 + COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0)::float, 1.0)
+				* 100
 			)::int AS rank_score
 		FROM user_reaches ur
 		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
@@ -1124,6 +1123,7 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	saveCompleteness(ctx, h.db, reachID)
 	jsonResponse(w, http.StatusCreated, map[string]string{"id": reachID, "slug": slug})
 }
 
@@ -1252,6 +1252,7 @@ func (h *UserReachHandler) Import(w http.ResponseWriter, r *http.Request) { //no
 		}
 	}
 
+	saveCompleteness(ctx, h.db, reachID)
 	jsonResponse(w, http.StatusCreated, map[string]string{"id": reachID, "slug": slug})
 }
 
@@ -1397,6 +1398,12 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 			*body.UpComID, *body.DownComID)
 	}
 
+	// Recompute completeness after any field change. (V18)
+	var runID string
+	if h.db.QueryRow(ctx, `SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2`,
+		ownerID, slug).Scan(&runID) == nil {
+		saveCompleteness(ctx, h.db, runID)
+	}
 }
 
 // ── Delete ───────────────────────────────────────────────────────────────────
@@ -1528,6 +1535,7 @@ func (h *UserReachHandler) SetFlowRanges(w http.ResponseWriter, r *http.Request)
 		`, reachID, t.Label, t.Value, t.Color)
 	}
 
+	saveCompleteness(ctx, h.db, reachID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1539,7 +1547,8 @@ func (h *UserReachHandler) ClearGauge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slug := chi.URLParam(r, "slug")
-	tag, err := h.db.Exec(r.Context(), `
+	ctx := r.Context()
+	tag, err := h.db.Exec(ctx, `
 		UPDATE user_reaches
 		SET primary_gauge_id = NULL, custom_gauge_id = NULL, updated_at = NOW()
 		WHERE owner_id = $1 AND slug = $2
@@ -1547,6 +1556,10 @@ func (h *UserReachHandler) ClearGauge(w http.ResponseWriter, r *http.Request) {
 	if err != nil || tag.RowsAffected() == 0 {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
 		return
+	}
+	var rid string
+	if h.db.QueryRow(ctx, `SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2`, ownerID, slug).Scan(&rid) == nil {
+		saveCompleteness(ctx, h.db, rid)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1690,6 +1703,10 @@ func (h *UserReachHandler) SetGauge(w http.ResponseWriter, r *http.Request) {
 	if err != nil || tag.RowsAffected() == 0 {
 		errorResponse(w, http.StatusNotFound, "user reach not found or gauge invalid")
 		return
+	}
+	var rid string
+	if h.db.QueryRow(r.Context(), `SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2`, ownerID, slug).Scan(&rid) == nil {
+		saveCompleteness(r.Context(), h.db, rid)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1855,6 +1872,7 @@ func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 		WHERE user_reach_id = $2
 	`, newID, src.ID)
 
+	saveCompleteness(ctx, h.db, newID)
 	jsonResponse(w, http.StatusCreated, map[string]string{"id": newID, "slug": slug, "gauge_id": func() string {
 		if src.GaugeID != nil {
 			return *src.GaugeID
@@ -2006,6 +2024,7 @@ func (h *UserReachHandler) ForkReach(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	saveCompleteness(r.Context(), h.db, newID)
 	jsonResponse(w, http.StatusCreated, map[string]string{"id": newID, "slug": newSlug})
 }
 
@@ -2079,8 +2098,12 @@ func (h *UserReachHandler) ListCommunity(w http.ResponseWriter, r *http.Request)
 				COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END) AS band_color
 		) fr
 		WHERE ur.visibility = 'public' AND ur.deleted_at IS NULL
+		  AND ur.completeness_score >= 0.2
 		  AND ($1 = '%%' OR ur.name ILIKE $1 OR ur.river_name ILIKE $1)
-		ORDER BY ur.created_at DESC, ur.id
+		ORDER BY
+			(5.0 * ur.completeness_score + COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0)::float)
+			/ GREATEST(5.0 + COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0)::float, 1.0) DESC,
+			ur.created_at DESC, ur.id
 		LIMIT $2 OFFSET $3
 	`, search, limit+1, offset)
 	if err != nil {
@@ -2117,6 +2140,24 @@ func (h *UserReachHandler) ListCommunity(w http.ResponseWriter, r *http.Request)
 		HasMore:    hasMore,
 		NextOffset: offset + len(items),
 	})
+}
+
+// ── Completeness helpers ──────────────────────────────────────────────────────
+
+// saveCompleteness recomputes and stores completeness_score for a run. (V18)
+// Called after any mutation that could change presence of scored fields.
+func saveCompleteness(ctx context.Context, db *pgxpool.Pool, runID string) {
+	_, _ = db.Exec(ctx, `
+		UPDATE user_reaches ur
+		SET completeness_score = (
+			CASE WHEN ur.note IS NOT NULL AND char_length(ur.note) > 0             THEN 0.2 ELSE 0 END
+		  + CASE WHEN ur.primary_gauge_id IS NOT NULL OR ur.custom_gauge_id IS NOT NULL THEN 0.2 ELSE 0 END
+		  + CASE WHEN ur.class_min IS NOT NULL AND ur.class_max IS NOT NULL         THEN 0.2 ELSE 0 END
+		  + CASE WHEN EXISTS(SELECT 1 FROM user_reach_flow_ranges WHERE user_reach_id = ur.id) THEN 0.2 ELSE 0 END
+		  + CASE WHEN EXISTS(SELECT 1 FROM rapids WHERE user_reach_id = ur.id)      THEN 0.2 ELSE 0 END
+		)
+		WHERE ur.id = $1
+	`, runID)
 }
 
 // ── GC helpers ───────────────────────────────────────────────────────────────
@@ -2270,5 +2311,6 @@ func (h *UserReachHandler) Adopt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	saveCompleteness(ctx, h.db, runID)
 	jsonResponse(w, http.StatusOK, map[string]string{"id": runID, "slug": finalSlug})
 }

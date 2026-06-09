@@ -138,6 +138,7 @@ func (h *DiscoverHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 			LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
 			LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
 			WHERE ur.visibility = 'public' AND ur.deleted_at IS NULL
+			  AND ur.completeness_score >= 0.2
 			  AND ($1 = '' OR ur.name ILIKE '%' || $1 || '%' OR ur.river_name ILIKE '%' || $1 || '%')
 			  AND ($2::float8 IS NULL OR ur.class_max >= $2)
 			  AND ($3::float8 IS NULL OR ur.class_min <= $3)
