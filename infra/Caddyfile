@@ -1,3 +1,7 @@
 api.h2oflows.app {
     reverse_proxy api:8080
 }
+
+api-staging.h2oflows.app {
+    reverse_proxy api-stg:8080
+}
