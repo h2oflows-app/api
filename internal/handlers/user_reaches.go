@@ -1309,6 +1309,33 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		newVisibility = &v
 	}
 
+	// V2/V3 ratchet guard: read current state before applying visibility change.
+	if newVisibility != nil {
+		if *newVisibility == "public" {
+			errorResponse(w, http.StatusBadRequest, "use POST /publish to make a run public")
+			return
+		}
+		var curVisibility string
+		var publishedAt *string
+		if err := h.db.QueryRow(ctx,
+			`SELECT visibility, published_at::text FROM user_reaches WHERE owner_id = $1 AND slug = $2`,
+			ownerID, slug,
+		).Scan(&curVisibility, &publishedAt); err != nil {
+			errorResponse(w, http.StatusNotFound, "user reach not found")
+			return
+		}
+		if curVisibility == "public" {
+			// V2: once public, visibility is immutable (only delete path exists)
+			errorResponse(w, http.StatusConflict, "run is public; visibility cannot be changed")
+			return
+		}
+		if *newVisibility == "private" && publishedAt != nil {
+			// V3: unlisted→private only allowed if never published
+			errorResponse(w, http.StatusConflict, "run was published; cannot revert to private")
+			return
+		}
+	}
+
 	// Core fields update. Set last_modified_after_fork_at when run is a fork.
 	tag, err := h.db.Exec(ctx, `
 		UPDATE user_reaches
@@ -1320,10 +1347,6 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 			class_min  = CASE WHEN $9 THEN $10::numeric ELSE class_min END,
 			class_max  = CASE WHEN $11 THEN $12::numeric ELSE class_max END,
 			visibility = CASE WHEN $13 THEN $14::run_visibility ELSE visibility END,
-			published_at = CASE
-				WHEN $13 AND $14 = 'public' AND published_at IS NULL THEN NOW()
-				ELSE published_at
-			END,
 			updated_at = NOW(),
 			last_modified_after_fork_at = CASE
 				WHEN original_forked_at IS NOT NULL THEN NOW()
@@ -2069,4 +2092,50 @@ func (h *UserReachHandler) ListCommunity(w http.ResponseWriter, r *http.Request)
 		HasMore:    hasMore,
 		NextOffset: offset + len(items),
 	})
+}
+
+// ── Publish ───────────────────────────────────────────────────────────────────
+
+// POST /api/v1/me/runs/{slug}/publish
+// One-way ratchet: private|unlisted → public. Idempotent if already public.
+// Rejects: setting visibility below public after publish (V2).
+func (h *UserReachHandler) Publish(w http.ResponseWriter, r *http.Request) {
+	ownerID, ok := h.ownerID(r)
+	if !ok {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	slug := chi.URLParam(r, "slug")
+	ctx := r.Context()
+
+	var curVisibility string
+	var reachID string
+	if err := h.db.QueryRow(ctx,
+		`SELECT id, visibility FROM user_reaches WHERE owner_id = $1 AND slug = $2 AND deleted_at IS NULL`,
+		ownerID, slug,
+	).Scan(&reachID, &curVisibility); err != nil {
+		errorResponse(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	if curVisibility == "public" {
+		// Already public — idempotent, return current state.
+		jsonResponse(w, http.StatusOK, map[string]string{"visibility": "public"})
+		return
+	}
+
+	// V2: private|unlisted → public (one-way ratchet).
+	_, err := h.db.Exec(ctx, `
+		UPDATE user_reaches
+		SET visibility   = 'public',
+		    published_at = NOW(),
+		    updated_at   = NOW()
+		WHERE id = $1
+	`, reachID)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "publish failed")
+		return
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]string{"visibility": "public"})
 }
