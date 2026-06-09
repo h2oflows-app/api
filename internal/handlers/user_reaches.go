@@ -149,6 +149,8 @@ type userReachSummary struct {
 	Visibility       string     `json:"visibility"`
 	IsPrivate        bool       `json:"is_private"` // backward compat; derived from Visibility
 	DeletedAt        *time.Time `json:"deleted_at"`
+	ForkCount        int        `json:"fork_count"`
+	IsFork           bool       `json:"is_fork"`
 	AuthorHandle     *string    `json:"author_handle"`
 	IsOfficial       bool       `json:"is_official"`
 }
@@ -369,7 +371,8 @@ func (h *UserReachHandler) MapAll(w http.ResponseWriter, r *http.Request) {
 // Same shape as MapAll. Public endpoint — no auth required.
 func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.db.Query(r.Context(), `
-		WITH cluster_groups AS (
+		WITH geo_clusters AS (
+			-- Geometry-based clustering: same COMID + within 1mi at put-in and take-out.
 			SELECT a.id AS run_id, MIN(b.id::text) AS cluster_id
 			FROM user_reaches a
 			JOIN user_reaches b ON (
@@ -381,6 +384,27 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 			)
 			WHERE a.visibility = 'public' AND a.deleted_at IS NULL
 			GROUP BY a.id
+		),
+		cluster_groups AS (
+			-- Lineage-first clustering: forks under public parent; fall back to geo. (V10)
+			SELECT ur.id AS run_id,
+				COALESCE(
+					CASE
+						WHEN ur.forked_from_user_reach_id IS NOT NULL
+						  AND EXISTS(
+							SELECT 1 FROM user_reaches p
+							WHERE p.id = ur.forked_from_user_reach_id
+							  AND p.visibility = 'public' AND p.deleted_at IS NULL
+						  )
+						THEN ur.forked_from_user_reach_id::text
+						ELSE NULL
+					END,
+					gc.cluster_id,
+					ur.id::text
+				) AS cluster_id
+			FROM user_reaches ur
+			LEFT JOIN geo_clusters gc ON gc.run_id = ur.id
+			WHERE ur.visibility = 'public' AND ur.deleted_at IS NULL
 		)
 		SELECT
 			ur.id, ur.slug, ur.name, ur.river_name,
@@ -401,6 +425,10 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 			up.handle AS author_handle,
 			(up.owner_id IS NULL) AS is_official,
 			COALESCE(cgrp.cluster_id, ur.id::text) AS cluster_id,
+			(ur.forked_from_user_reach_id IS NOT NULL) AS is_fork,
+			(SELECT COUNT(*)::int FROM user_reaches f
+			 WHERE f.forked_from_user_reach_id = ur.id
+			   AND f.visibility = 'public' AND f.deleted_at IS NULL) AS fork_count,
 			-- Bayesian rank: (C*prior + votes)/(C + votes)*100. C=5. (V19)
 			ROUND(
 				(5.0 * ur.completeness_score + COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0)::float)
@@ -451,6 +479,8 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 		AuthorHandle *string  `json:"author_handle"`
 		IsOfficial   bool     `json:"is_official"`
 		ClusterID    string   `json:"cluster_id"`
+		IsFork       bool     `json:"is_fork"`
+		ForkCount    int      `json:"fork_count"`
 		RankScore    int      `json:"rank_score"`
 	}
 	type feature struct {
@@ -474,6 +504,8 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 			authorHandle           *string
 			isOfficial             bool
 			clusterID              string
+			isFork                 bool
+			forkCount              int
 			rankScore              int
 		)
 		if err := rows.Scan(
@@ -482,7 +514,7 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 			&putInLng, &putInLat, &takeOutLng, &takeOutLat,
 			&currentCFS, &flowStatus, &gaugeID, &classMax,
 			&authorHandle, &isOfficial,
-			&clusterID, &rankScore,
+			&clusterID, &isFork, &forkCount, &rankScore,
 		); err != nil {
 			continue
 		}
@@ -519,6 +551,8 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 				AuthorHandle: authorHandle,
 				IsOfficial:   isOfficial,
 				ClusterID:    clusterID,
+				IsFork:       isFork,
+				ForkCount:    forkCount,
 				RankScore:    rankScore,
 			},
 		})
@@ -2074,7 +2108,10 @@ func (h *UserReachHandler) ListCommunity(w http.ResponseWriter, r *http.Request)
 			cg.name AS custom_gauge_name,
 			ur.visibility,
 			up.handle AS author_handle,
-			(up.owner_id IS NULL) AS is_official
+			(up.owner_id IS NULL) AS is_official,
+			(SELECT COUNT(*)::int FROM user_reaches f
+			 WHERE f.forked_from_user_reach_id = ur.id
+			   AND f.visibility = 'public' AND f.deleted_at IS NULL) AS fork_count
 		FROM user_reaches ur
 		LEFT JOIN rivers rv ON rv.id = ur.river_id
 		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
@@ -2099,6 +2136,7 @@ func (h *UserReachHandler) ListCommunity(w http.ResponseWriter, r *http.Request)
 		) fr
 		WHERE ur.visibility = 'public' AND ur.deleted_at IS NULL
 		  AND ur.completeness_score >= 0.2
+		  AND ur.forked_from_user_reach_id IS NULL
 		  AND ($1 = '%%' OR ur.name ILIKE $1 OR ur.river_name ILIKE $1)
 		ORDER BY
 			(5.0 * ur.completeness_score + COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0)::float)
@@ -2124,7 +2162,7 @@ func (h *UserReachHandler) ListCommunity(w http.ResponseWriter, r *http.Request)
 			&s.CurrentCFS, &s.LastReadAt,
 			&s.FlowStatus, &s.FlowBand,
 			&s.GaugeID, &s.CustomGaugeID, &s.CustomGaugeSlug, &s.CustomGaugeName,
-			&s.Visibility, &s.AuthorHandle, &s.IsOfficial,
+			&s.Visibility, &s.AuthorHandle, &s.IsOfficial, &s.ForkCount,
 		); err == nil {
 			s.IsPrivate = s.Visibility != "public"
 			items = append(items, s)
