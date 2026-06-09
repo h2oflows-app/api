@@ -1067,8 +1067,8 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Note      *string   `json:"note"`
 		ClassMin  *float64  `json:"class_min"`
 		ClassMax  *float64  `json:"class_max"`
-		// is_private kept for backward compat; maps to visibility column
-		IsPrivate bool      `json:"is_private"`
+		// is_private kept for backward compat; nil (absent) = private by default (V1)
+		IsPrivate *bool     `json:"is_private"`
 		FlowBands *FlowBands `json:"flow_bands"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -1116,8 +1116,9 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 		slug = fmt.Sprintf("%s-%d", baseSlug, i)
 	}
 
+	// V1: default private; is_private=false (explicit) → public for backward compat
 	createVisibility := "private"
-	if !body.IsPrivate {
+	if body.IsPrivate != nil && !*body.IsPrivate {
 		createVisibility = "public"
 	}
 
