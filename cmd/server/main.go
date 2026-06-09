@@ -266,6 +266,7 @@ func main() {
 		r.Get("/user-runs/map/community", userReaches.MapCommunity)
 		r.Post("/user-runs/{runId}/fork", userReaches.ForkUserRun)
 		r.Post("/user-runs/{runId}/add-to-dashboard", watchlist.AddReference)
+		r.Post("/user-runs/{runId}/adopt", userReaches.Adopt)
 		r.Get("/user-runs/{runId}", userReaches.GetPublic)
 		r.Post("/user-runs/dupe-check", cluster.DupeCheck)
 		r.Get("/user-runs/{runId}/cluster", cluster.ClusterForRun)

@@ -2189,3 +2189,86 @@ func (h *UserReachHandler) Publish(w http.ResponseWriter, r *http.Request) {
 
 	jsonResponse(w, http.StatusOK, map[string]string{"visibility": "public"})
 }
+
+// ── Adopt ─────────────────────────────────────────────────────────────────────
+
+// POST /api/v1/user-runs/{runId}/adopt
+// Transfers a tombstoned run to the caller when caller has an active reference.
+// Preserves votes; un-tombstones; keeps visibility public. (V14)
+func (h *UserReachHandler) Adopt(w http.ResponseWriter, r *http.Request) {
+	callerID, ok := h.ownerID(r)
+	if !ok {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	runID := chi.URLParam(r, "runId")
+	ctx := r.Context()
+
+	// Verify run is tombstoned.
+	var curOwnerID, slug string
+	var deletedAt *string
+	if err := h.db.QueryRow(ctx,
+		`SELECT owner_id::text, slug, deleted_at::text FROM user_reaches WHERE id = $1`,
+		runID,
+	).Scan(&curOwnerID, &slug, &deletedAt); err != nil {
+		errorResponse(w, http.StatusNotFound, "run not found")
+		return
+	}
+	if deletedAt == nil {
+		errorResponse(w, http.StatusConflict, "run is not tombstoned; cannot adopt live run")
+		return
+	}
+	if curOwnerID == callerID {
+		errorResponse(w, http.StatusConflict, "already own this run")
+		return
+	}
+
+	// Verify caller has active reference to this run. (V14)
+	var hasRef bool
+	if err := h.db.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM user_watchlists WHERE user_id = $1 AND referenced_user_reach_id = $2::uuid)`,
+		callerID, runID,
+	).Scan(&hasRef); err != nil || !hasRef {
+		errorResponse(w, http.StatusForbidden, "must have run on your dashboard to adopt it")
+		return
+	}
+
+	// Ensure slug is unique in adopter's namespace; re-slug if conflict.
+	finalSlug := slug
+	var conflict string
+	if err := h.db.QueryRow(ctx,
+		`SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2`,
+		callerID, slug,
+	).Scan(&conflict); err == nil {
+		// Conflict — append suffix until unique.
+		base := slug
+		for i := 2; i <= 20; i++ {
+			candidate := fmt.Sprintf("%s-%d", base, i)
+			if e := h.db.QueryRow(ctx,
+				`SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2`,
+				callerID, candidate,
+			).Scan(&conflict); e != nil {
+				finalSlug = candidate
+				break
+			}
+		}
+	}
+
+	// Transfer ownership; un-tombstone; record adoption. Votes preserved in run_upvotes.
+	_, err := h.db.Exec(ctx, `
+		UPDATE user_reaches
+		SET owner_id               = $2::uuid,
+		    slug                   = $3,
+		    adopted_from_owner_id  = $4::uuid,
+		    deleted_at             = NULL,
+		    visibility             = 'public',
+		    updated_at             = NOW()
+		WHERE id = $1
+	`, runID, callerID, finalSlug, curOwnerID)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "adopt failed")
+		return
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]string{"id": runID, "slug": finalSlug})
+}
