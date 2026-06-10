@@ -45,9 +45,9 @@ rm "$DUMP"
 # Supabase project (separate UUID space). Suffixing their handles means a QA
 # user can claim any name without colliding with seed data. left(handle,26)
 # keeps the result under the 30-char handle CHECK constraint.
-echo "▶ Freeing seeded handles (append -stg)..."
+echo "▶ Freeing seeded handles (append -stg, preserve h2oflows)..."
 $STG_DC exec -T postgres-stg psql -U "$DB" -d "$DB" -c \
-  "UPDATE user_profiles SET handle = left(handle, 26) || '-stg' WHERE handle !~ '-stg\$';"
+  "UPDATE user_profiles SET handle = left(handle, 26) || '-stg' WHERE handle !~ '-stg\$' AND handle != 'h2oflows';"
 
 echo "▶ Restarting api-stg (re-runs migrations on seeded DB)..."
 $STG_DC up -d api-stg

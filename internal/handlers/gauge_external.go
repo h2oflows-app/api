@@ -177,7 +177,7 @@ func (h *GaugeExternalHandler) AddExternal(w http.ResponseWriter, r *http.Reques
 	if body.DashboardID == nil {
 		var dbID string
 		if err := h.db.QueryRow(r.Context(),
-			`SELECT id FROM user_dashboards WHERE user_id = $1 ORDER BY position LIMIT 1`,
+			`SELECT id FROM user_dashboards WHERE owner_id = $1 ORDER BY position LIMIT 1`,
 			ownerID,
 		).Scan(&dbID); err == nil {
 			body.DashboardID = &dbID
