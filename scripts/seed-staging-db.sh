@@ -40,6 +40,15 @@ cat "$DUMP" | $STG_DC exec -T postgres-stg pg_restore -U "$DB" -d "$DB" --no-own
 
 rm "$DUMP"
 
+# Free up seeded handles for QA signups. Seeded user_profiles are orphans in
+# staging — keyed by PROD Supabase UUIDs that don't exist in the staging
+# Supabase project (separate UUID space). Suffixing their handles means a QA
+# user can claim any name without colliding with seed data. left(handle,26)
+# keeps the result under the 30-char handle CHECK constraint.
+echo "▶ Freeing seeded handles (append -stg)..."
+$STG_DC exec -T postgres-stg psql -U "$DB" -d "$DB" -c \
+  "UPDATE user_profiles SET handle = left(handle, 26) || '-stg' WHERE handle !~ '-stg\$';"
+
 echo "▶ Restarting api-stg (re-runs migrations on seeded DB)..."
 $STG_DC up -d api-stg
 
