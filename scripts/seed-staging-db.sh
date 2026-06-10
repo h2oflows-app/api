@@ -24,8 +24,14 @@ echo "▶ Dumping prod database..."
 $PROD_DC exec -T postgres pg_dump -U "$DB" -Fc "$DB" > "$DUMP"
 echo "  dump: $DUMP ($(du -sh "$DUMP" | cut -f1))"
 
+# api-stg holds an open connection to the staging DB — stop it so DROP DATABASE
+# isn't blocked ("database is being accessed by other users").
+echo "▶ Stopping api-stg (releases DB connections)..."
+$STG_DC stop api-stg 2>/dev/null || true
+
 echo "▶ Recreating staging database..."
-$STG_DC exec -T postgres-stg psql -U "$DB" -d postgres -c "DROP DATABASE IF EXISTS $DB;"
+# WITH (FORCE) terminates any stray backend (Postgres 13+) as a backstop.
+$STG_DC exec -T postgres-stg psql -U "$DB" -d postgres -c "DROP DATABASE IF EXISTS $DB WITH (FORCE);"
 $STG_DC exec -T postgres-stg psql -U "$DB" -d postgres -c "CREATE DATABASE $DB;"
 
 echo "▶ Restoring into staging..."
@@ -33,5 +39,8 @@ cat "$DUMP" | $STG_DC exec -T postgres-stg pg_restore -U "$DB" -d "$DB" --no-own
   | grep "^pg_restore: error" || true
 
 rm "$DUMP"
-echo "✓ Staging DB seeded from prod. Restart api-stg to re-run migrations:"
-echo "  $STG_DC up -d api-stg"
+
+echo "▶ Restarting api-stg (re-runs migrations on seeded DB)..."
+$STG_DC up -d api-stg
+
+echo "✓ Staging DB seeded from prod and api-stg restarted."
