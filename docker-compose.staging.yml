@@ -4,14 +4,12 @@ services:
   postgres-stg:
     build: ./infra/postgres
     restart: unless-stopped
-    environment:
-      POSTGRES_USER:     ${POSTGRES_USER:-h2oflows}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB:       ${POSTGRES_DB:-h2oflows}
+    # .env.staging must contain: POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB
+    env_file: .env.staging
     volumes:
       - postgres_stg_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-h2oflows}"]
+      test: ["CMD-SHELL", "pg_isready -U h2oflows"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -21,11 +19,10 @@ services:
     image: ghcr.io/h2oflows-app/api:staging
     pull_policy: always
     restart: unless-stopped
+    # .env.staging must contain: DATABASE_URL (full URL), ANTHROPIC_API_KEY,
+    #   VOYAGE_API_KEY, SUPABASE_JWKS_URL
+    env_file: .env.staging
     environment:
-      DATABASE_URL:       postgres://${POSTGRES_USER:-h2oflows}:${POSTGRES_PASSWORD}@postgres-stg:5432/${POSTGRES_DB:-h2oflows}?sslmode=disable
-      ANTHROPIC_API_KEY:  ${ANTHROPIC_API_KEY}
-      VOYAGE_API_KEY:     ${VOYAGE_API_KEY}
-      SUPABASE_JWKS_URL:  ${SUPABASE_JWKS_URL}
       # Poller disabled on staging — avoids double-polling USGS/DWR. 1y interval = effectively off.
       USGS_POLL_INTERVAL: "8760h"
       DWR_POLL_INTERVAL:  "8760h"
