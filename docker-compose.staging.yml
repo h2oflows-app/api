@@ -1,0 +1,49 @@
+name: h2oflows-staging
+
+services:
+  postgres-stg:
+    build: ./infra/postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-h2oflows}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB:       ${POSTGRES_DB:-h2oflows}
+    volumes:
+      - postgres_stg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-h2oflows}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api-stg:
+    # Built + pushed by .github/workflows/deploy-staging.yml — never built on the box.
+    image: ghcr.io/h2oflows-app/api:staging
+    pull_policy: always
+    restart: unless-stopped
+    environment:
+      DATABASE_URL:       postgres://${POSTGRES_USER:-h2oflows}:${POSTGRES_PASSWORD}@postgres-stg:5432/${POSTGRES_DB:-h2oflows}?sslmode=disable
+      ANTHROPIC_API_KEY:  ${ANTHROPIC_API_KEY}
+      VOYAGE_API_KEY:     ${VOYAGE_API_KEY}
+      SUPABASE_JWKS_URL:  ${SUPABASE_JWKS_URL}
+      # Poller disabled on staging — avoids double-polling USGS/DWR. 1y interval = effectively off.
+      USGS_POLL_INTERVAL: "8760h"
+      DWR_POLL_INTERVAL:  "8760h"
+      APP_PORT:           "8080"
+      APP_DOMAIN:         h2oflows.app
+    depends_on:
+      postgres-stg:
+        condition: service_healthy
+    networks:
+      - default
+      - edge
+
+networks:
+  # Shared external network so the prod Caddy can reverse-proxy api-stg.
+  # Created once by scripts/ec2-staging-setup.sh: `docker network create h2oedge`
+  edge:
+    external: true
+    name: h2oedge
+
+volumes:
+  postgres_stg_data:

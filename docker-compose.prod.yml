@@ -43,6 +43,15 @@ services:
       - caddy_config:/config
     depends_on:
       - api
+    networks:
+      - default
+      - edge
+
+networks:
+  # Shared with the staging stack so this Caddy can reach api-stg. Created by ec2-staging-setup.sh.
+  edge:
+    external: true
+    name: h2oedge
 
 volumes:
   postgres_data:
