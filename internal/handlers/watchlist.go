@@ -169,12 +169,24 @@ func (h *WatchlistHandler) Add(w http.ResponseWriter, r *http.Request) {
 				`SELECT id FROM reaches WHERE slug = $1`, *body.ReachSlug,
 			).Scan(&curatedID)
 			if cErr == nil {
-				_, newSlug, fErr := forkCuratedReachTx(r.Context(), tx, userID, *body.ReachSlug)
-				if fErr != nil {
-					errorResponse(w, http.StatusInternalServerError, "fork failed: "+fErr.Error())
-					return
+				// Check if user already has a fork of this curated reach — reuse it
+				// rather than creating a second fork (fork slug differs from source slug,
+				// so the ownErr check above misses it and double-forks on re-add).
+				var existingForkSlug string
+				existingForkErr := tx.QueryRow(r.Context(),
+					`SELECT slug FROM user_reaches WHERE owner_id = $1 AND forked_from_reach_id = $2::uuid LIMIT 1`,
+					userID, curatedID,
+				).Scan(&existingForkSlug)
+				if existingForkErr == nil {
+					finalReachSlug = &existingForkSlug
+				} else {
+					_, newSlug, fErr := forkCuratedReachTx(r.Context(), tx, userID, *body.ReachSlug)
+					if fErr != nil {
+						errorResponse(w, http.StatusInternalServerError, "fork failed: "+fErr.Error())
+						return
+					}
+					finalReachSlug = &newSlug
 				}
-				finalReachSlug = &newSlug
 			}
 			// else: slug is for another user's user_reaches — leave as-is; insert will
 			// either fail FK or pin a reference. (No cross-user fork via watchlist yet.)
