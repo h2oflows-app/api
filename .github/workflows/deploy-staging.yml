@@ -71,8 +71,8 @@ jobs:
           key: ${{ secrets.STAGING_SSH_KEY }}
           script: |
             cd /home/ubuntu/h2oflows
-            docker compose -f docker-compose.staging.yml pull api-stg
-            docker compose -f docker-compose.staging.yml up -d
+            docker compose -f docker-compose.staging.yml --env-file .env.staging pull api-stg
+            docker compose -f docker-compose.staging.yml --env-file .env.staging up -d
 
   down:
     needs: decide
@@ -87,4 +87,4 @@ jobs:
           key: ${{ secrets.STAGING_SSH_KEY }}
           script: |
             cd /home/ubuntu/h2oflows
-            docker compose -f docker-compose.staging.yml down
+            docker compose -f docker-compose.staging.yml --env-file .env.staging down

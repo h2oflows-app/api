@@ -6,7 +6,9 @@
 set -euo pipefail
 
 PROD_DC="docker compose -f docker-compose.prod.yml"
-STG_DC="docker compose -f docker-compose.staging.yml"
+# --env-file .env.staging is required: docker compose otherwise interpolates
+# ${...} from the default .env (the PROD file), pulling prod creds/JWKS into staging.
+STG_DC="docker compose -f docker-compose.staging.yml --env-file .env.staging"
 DB=h2oflows
 DUMP="/tmp/h2oflows-stg-seed-$(date +%Y%m%d-%H%M%S).dump"
 
