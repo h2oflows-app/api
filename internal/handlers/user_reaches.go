@@ -141,6 +141,9 @@ type userReachSummary struct {
 	FlowBand    *string    `json:"flow_band"`
 	FlowStatus  string     `json:"flow_status"`
 	GaugeID          *string    `json:"gauge_id"`
+	GaugeExternalID  *string    `json:"gauge_external_id"`
+	GaugeSource      *string    `json:"gauge_source"`
+	GaugeName        *string    `json:"gauge_name"`
 	CustomGaugeID    *string    `json:"custom_gauge_id"`
 	CustomGaugeSlug  *string    `json:"custom_gauge_slug"`
 	CustomGaugeName  *string    `json:"custom_gauge_name"`
@@ -597,6 +600,9 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			END AS flow_status,
 			fr.band_label AS flow_band,
 			ur.primary_gauge_id::text AS gauge_id,
+			g.external_id AS gauge_external_id,
+			g.source AS gauge_source,
+			g.name AS gauge_name,
 			ur.custom_gauge_id::text AS custom_gauge_id,
 			cg.slug AS custom_gauge_slug,
 			cg.name AS custom_gauge_name,
@@ -604,6 +610,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			up.handle AS author_handle
 		FROM user_reaches ur
 		LEFT JOIN rivers rv ON rv.id = ur.river_id
+		LEFT JOIN gauges g ON g.id = ur.primary_gauge_id
 		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
 		LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
 		LEFT JOIN LATERAL (
@@ -644,6 +651,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			&s.ClassMin, &s.ClassMax,
 			&s.CurrentCFS, &s.LastReadAt,
 			&s.FlowStatus, &s.FlowBand, &s.GaugeID,
+			&s.GaugeExternalID, &s.GaugeSource, &s.GaugeName,
 			&s.CustomGaugeID, &s.CustomGaugeSlug, &s.CustomGaugeName,
 			&s.Visibility, &s.AuthorHandle,
 		); err == nil {
