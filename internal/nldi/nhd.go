@@ -204,7 +204,8 @@ func NHDLookupByName(ctx context.Context, name string) ([]NHDNameResult, error) 
 	if err != nil {
 		return nil, err
 	}
-	normInput := normalizeRiverName(name)
+	// Only normalize the NHD name — our DB names never include type suffixes.
+	normInput := strings.ToLower(strings.TrimSpace(name))
 	var matched []NHDNameResult
 	for _, c := range candidates {
 		if normalizeRiverName(c.Name) == normInput {
