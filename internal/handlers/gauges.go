@@ -741,6 +741,7 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			ctx_reach.common_name            AS context_reach_common_name,
 			ctx_reach.full_name              AS context_reach_full_name,
 			ctx_reach.river_name             AS context_reach_river_name,
+			ctx_reach.river_id               AS context_reach_river_id,
 			ctx_reach.basin_group            AS context_reach_basin_group,
 			ctx_reach.center_lng             AS context_reach_center_lng,
 			ctx_reach.river_order            AS context_reach_river_order,
@@ -756,7 +757,7 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			-- Resolve the context reach: curated reaches first, user reaches as fallback.
 			-- Use the requested slug if provided; else first alphabetical match per table.
 			SELECT common_name, full_name, river_name, basin_group, center_lng,
-			       state_abbr, river_order, author_handle
+			       state_abbr, river_order, author_handle, river_id
 			FROM (
 				SELECT
 					COALESCE(rctx.common_name, rctx.name) AS common_name,
@@ -776,6 +777,7 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 					COALESCE(rctx.state_abbr, rctx_rv.state_abbr) AS state_abbr,
 					rctx.river_order,
 					NULL::text AS author_handle,
+					rctx_rv.id::text AS river_id,
 					0 AS _prio
 				FROM reaches rctx
 				LEFT JOIN rivers rctx_rv ON rctx_rv.id = rctx.river_id
@@ -794,6 +796,7 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 					ur_rv.state_abbr,
 					NULL::smallint AS river_order,
 					up.handle AS author_handle,
+					ur_rv.id::text AS river_id,
 					1 AS _prio
 				FROM user_reaches ur
 				LEFT JOIN rivers ur_rv ON ur_rv.id = ur.river_id
@@ -865,6 +868,7 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			contextReachCommonName  *string
 			contextReachFullName    *string
 			contextReachRiverName   *string
+			contextReachRiverID     *string
 			contextReachBasinGroup  *string
 			contextReachCenterLng      *float64
 			contextReachRiverOrder     *int16
@@ -881,7 +885,7 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			&reachNamesRaw, &reachSlugsRaw, &reachCommonNamesRaw,
 			&reachRelationship, &lastReadingAt,
 			&lng, &lat, &stateAbbr, &basinName, &watershedName,
-			&contextReachCommonName, &contextReachFullName, &contextReachRiverName, &contextReachBasinGroup, &contextReachCenterLng, &contextReachRiverOrder, &contextReachAuthorHandle,
+			&contextReachCommonName, &contextReachFullName, &contextReachRiverName, &contextReachRiverID, &contextReachBasinGroup, &contextReachCenterLng, &contextReachRiverOrder, &contextReachAuthorHandle,
 			&currentCFS, &flowStatus, &flowBandLabel,
 			&pollHealth, &lastPollSuccessAt,
 		); err != nil {
@@ -917,6 +921,7 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 				"context_reach_common_name":   contextReachCommonName,
 				"context_reach_full_name":     contextReachFullName,
 				"context_reach_river_name":    contextReachRiverName,
+				"context_reach_river_id":      contextReachRiverID,
 				"context_reach_basin_group":   contextReachBasinGroup,
 				"context_reach_center_lng":    contextReachCenterLng,
 				"context_reach_river_order":   contextReachRiverOrder,
