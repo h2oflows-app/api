@@ -127,6 +127,7 @@ type userReachSummary struct {
 	Slug        string     `json:"slug"`
 	Name        string     `json:"name"`
 	LongName    *string    `json:"long_name"`
+	RiverID     *string    `json:"river_id"`
 	RiverName   *string    `json:"river_name"`
 	StateAbbr   *string    `json:"state_abbr"`
 	BasinGroup  *string    `json:"basin_group"`
@@ -583,7 +584,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.db.Query(r.Context(), `
 		SELECT
 			ur.id, ur.slug, ur.name, ur.long_name, ur.river_name,
-			rv.state_abbr, rv.basin AS basin_group,
+			rv.id::text AS river_id, rv.state_abbr, rv.basin AS basin_group,
 			ST_X(ur.put_in::geometry)    AS put_in_lng,
 			ST_Y(ur.put_in::geometry)    AS put_in_lat,
 			ST_X(ur.take_out::geometry)  AS take_out_lng,
@@ -645,7 +646,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 		var s userReachSummary
 		if err := rows.Scan(
 			&s.ID, &s.Slug, &s.Name, &s.LongName, &s.RiverName,
-			&s.StateAbbr, &s.BasinGroup,
+			&s.RiverID, &s.StateAbbr, &s.BasinGroup,
 			&s.PutInLng, &s.PutInLat, &s.TakeOutLng, &s.TakeOutLat,
 			&s.Note, &s.CreatedAt,
 			&s.ClassMin, &s.ClassMax,
