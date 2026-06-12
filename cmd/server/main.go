@@ -262,6 +262,7 @@ func main() {
 		r.Get("/users/{handle}", userProfiles.GetProfile)
 		r.Get("/users/{handle}/runs/map/all", userProfiles.MapAllByHandle)
 		r.Get("/users/{handle}/runs/{slug}", userReaches.GetPublicByHandle)
+		r.Get("/users/{handle}/runs/{slug}/flow-ranges", userReaches.GetPublicFlowRangesByHandle)
 
 		r.Get("/user-runs/community", userReaches.ListCommunity)
 		r.Get("/user-runs/map/community", userReaches.MapCommunity)

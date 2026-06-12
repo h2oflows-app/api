@@ -252,7 +252,6 @@ func (h *AdminHandler) DeleteRiver(w http.ResponseWriter, r *http.Request) {
 func (h *AdminHandler) UpdateRiver(w http.ResponseWriter, r *http.Request) {
 	slug := chi.URLParam(r, "riverSlug")
 	var body struct {
-		GnisID    *string `json:"gnis_id"`
 		Basin     *string `json:"basin"`
 		StateAbbr *string `json:"state_abbr"`
 	}
@@ -260,8 +259,8 @@ func (h *AdminHandler) UpdateRiver(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	if body.GnisID == nil && body.Basin == nil && body.StateAbbr == nil {
-		errorResponse(w, http.StatusBadRequest, "at least one of gnis_id, basin, or state_abbr is required")
+	if body.Basin == nil && body.StateAbbr == nil {
+		errorResponse(w, http.StatusBadRequest, "at least one of basin or state_abbr is required")
 		return
 	}
 	if body.StateAbbr != nil {
@@ -271,11 +270,10 @@ func (h *AdminHandler) UpdateRiver(w http.ResponseWriter, r *http.Request) {
 
 	tag, err := h.db.Exec(r.Context(), `
 		UPDATE rivers
-		SET gnis_id    = COALESCE($2, gnis_id),
-		    basin      = COALESCE($3, basin),
-		    state_abbr = COALESCE($4, state_abbr)
+		SET basin      = COALESCE($2, basin),
+		    state_abbr = COALESCE($3, state_abbr)
 		WHERE slug = $1
-	`, slug, body.GnisID, body.Basin, body.StateAbbr)
+	`, slug, body.Basin, body.StateAbbr)
 	if err != nil || tag.RowsAffected() == 0 {
 		errorResponse(w, http.StatusNotFound, "river not found")
 		return

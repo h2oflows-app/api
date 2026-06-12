@@ -1632,6 +1632,54 @@ func (h *UserReachHandler) GetFlowRanges(w http.ResponseWriter, r *http.Request)
 	jsonResponse(w, http.StatusOK, fb)
 }
 
+// GET /api/v1/users/{handle}/runs/{slug}/flow-ranges
+// Public flow ranges for a public user run, resolved by owner handle + slug.
+// No auth — used by the gauge graph to color another user's (or one's own)
+// run in reach mode. Slug alone is ambiguous across users, so handle scopes it.
+func (h *UserReachHandler) GetPublicFlowRangesByHandle(w http.ResponseWriter, r *http.Request) {
+	handle := chi.URLParam(r, "handle")
+	slug := chi.URLParam(r, "slug")
+
+	var reachID string
+	if err := h.db.QueryRow(r.Context(), `
+		SELECT ur.id
+		FROM user_reaches ur
+		JOIN user_profiles up ON up.owner_id = ur.owner_id
+		WHERE LOWER(up.handle) = LOWER($1)
+		  AND ur.slug = $2
+		  AND ur.visibility = 'public'
+		  AND ur.deleted_at IS NULL
+	`, handle, slug).Scan(&reachID); err != nil {
+		errorResponse(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	var fb FlowBands
+	if err := h.db.QueryRow(r.Context(),
+		`SELECT base_label, base_color FROM user_reaches WHERE id = $1`, reachID,
+	).Scan(&fb.BaseLabel, &fb.BaseColor); err != nil {
+		errorResponse(w, http.StatusInternalServerError, "query failed")
+		return
+	}
+	rows, _ := h.db.Query(r.Context(), `
+		SELECT value, label, color
+		FROM user_reach_flow_ranges
+		WHERE user_reach_id = $1
+		ORDER BY value ASC
+	`, reachID)
+	fb.Thresholds = make([]FlowBandThreshold, 0)
+	if rows != nil {
+		defer rows.Close()
+		for rows.Next() {
+			var t FlowBandThreshold
+			if rows.Scan(&t.Value, &t.Label, &t.Color) == nil {
+				fb.Thresholds = append(fb.Thresholds, t)
+			}
+		}
+	}
+	jsonResponse(w, http.StatusOK, fb)
+}
+
 // PUT /api/v1/me/reaches/{slug}/flow-ranges
 func (h *UserReachHandler) SetFlowRanges(w http.ResponseWriter, r *http.Request) {
 	ownerID, ok := h.ownerID(r)
