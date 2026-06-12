@@ -662,6 +662,103 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, items)
 }
 
+// ── ReferencedRuns ────────────────────────────────────────────────────────────
+
+// GET /api/v1/me/referenced-runs?dashboard_id={id}
+// Returns summaries of OTHER users' public runs the caller has referenced onto a
+// dashboard (referenced_user_reach_id rows). Same shape as List, but author_handle
+// is the original owner — these render read-only on the dashboard.
+func (h *UserReachHandler) ReferencedRuns(w http.ResponseWriter, r *http.Request) {
+	callerID, ok := h.ownerID(r)
+	if !ok {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	dashboardID := r.URL.Query().Get("dashboard_id")
+
+	// $2 dashboard filter is optional — NULL means all of the caller's references.
+	var dashPtr *string
+	if dashboardID != "" {
+		dashPtr = &dashboardID
+	}
+
+	rows, err := h.db.Query(r.Context(), `
+		SELECT
+			ur.id, ur.slug, ur.name, ur.long_name, ur.river_name,
+			rv.state_abbr, rv.basin AS basin_group,
+			COALESCE(lr.value, cg.last_value_cfs) AS current_cfs,
+			COALESCE(lr.timestamp, cg.last_value_at) AS last_reading_at,
+			CASE
+				WHEN fr.band_color IS NULL        THEN 'unknown'
+				WHEN fr.band_color LIKE 'red%'    THEN 'caution'
+				WHEN fr.band_color LIKE 'blue%'   THEN 'flood'
+				ELSE                                   'runnable'
+			END AS flow_status,
+			fr.band_label AS flow_band,
+			ur.primary_gauge_id::text AS gauge_id,
+			g.external_id AS gauge_external_id,
+			g.source AS gauge_source,
+			g.name AS gauge_name,
+			ur.custom_gauge_id::text AS custom_gauge_id,
+			cg.slug AS custom_gauge_slug,
+			cg.name AS custom_gauge_name,
+			up.handle AS author_handle
+		FROM user_watchlists w
+		JOIN user_reaches ur ON ur.id = w.referenced_user_reach_id
+		LEFT JOIN rivers rv ON rv.id = ur.river_id
+		LEFT JOIN gauges g ON g.id = ur.primary_gauge_id
+		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
+		LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
+		LEFT JOIN LATERAL (
+			SELECT value, timestamp FROM gauge_readings
+			WHERE gauge_id = ur.primary_gauge_id
+			  AND timestamp > NOW() - INTERVAL '48 hours'
+			ORDER BY timestamp DESC LIMIT 1
+		) lr ON TRUE
+		LEFT JOIN LATERAL (
+			SELECT label, color FROM user_reach_flow_ranges
+			WHERE user_reach_id = ur.id
+			  AND COALESCE(lr.value, cg.last_value_cfs) >= value
+			ORDER BY value DESC
+			LIMIT 1
+		) thresh ON TRUE,
+		LATERAL (
+			SELECT
+				COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END) AS band_label,
+				COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END) AS band_color
+		) fr
+		WHERE w.user_id = $1
+		  AND w.referenced_user_reach_id IS NOT NULL
+		  AND ($2::uuid IS NULL OR w.dashboard_id = $2::uuid)
+		  AND ur.visibility = 'public'
+		  AND ur.deleted_at IS NULL
+		ORDER BY ur.name
+	`, callerID, dashPtr)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "query failed")
+		return
+	}
+	defer rows.Close()
+
+	items := make([]userReachSummary, 0)
+	for rows.Next() {
+		var s userReachSummary
+		if err := rows.Scan(
+			&s.ID, &s.Slug, &s.Name, &s.LongName, &s.RiverName,
+			&s.StateAbbr, &s.BasinGroup,
+			&s.CurrentCFS, &s.LastReadAt,
+			&s.FlowStatus, &s.FlowBand, &s.GaugeID,
+			&s.GaugeExternalID, &s.GaugeSource, &s.GaugeName,
+			&s.CustomGaugeID, &s.CustomGaugeSlug, &s.CustomGaugeName,
+			&s.AuthorHandle,
+		); err == nil {
+			s.Visibility = "public"
+			items = append(items, s)
+		}
+	}
+	jsonResponse(w, http.StatusOK, items)
+}
+
 // ── Get ──────────────────────────────────────────────────────────────────────
 
 // GET /api/v1/me/reaches/{slug}
