@@ -141,6 +141,9 @@ type userReachSummary struct {
 	FlowBand    *string    `json:"flow_band"`
 	FlowStatus  string     `json:"flow_status"`
 	GaugeID          *string    `json:"gauge_id"`
+	GaugeExternalID  *string    `json:"gauge_external_id"`
+	GaugeSource      *string    `json:"gauge_source"`
+	GaugeName        *string    `json:"gauge_name"`
 	CustomGaugeID    *string    `json:"custom_gauge_id"`
 	CustomGaugeSlug  *string    `json:"custom_gauge_slug"`
 	CustomGaugeName  *string    `json:"custom_gauge_name"`
@@ -597,6 +600,9 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			END AS flow_status,
 			fr.band_label AS flow_band,
 			ur.primary_gauge_id::text AS gauge_id,
+			g.external_id AS gauge_external_id,
+			g.source AS gauge_source,
+			g.name AS gauge_name,
 			ur.custom_gauge_id::text AS custom_gauge_id,
 			cg.slug AS custom_gauge_slug,
 			cg.name AS custom_gauge_name,
@@ -604,6 +610,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			up.handle AS author_handle
 		FROM user_reaches ur
 		LEFT JOIN rivers rv ON rv.id = ur.river_id
+		LEFT JOIN gauges g ON g.id = ur.primary_gauge_id
 		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
 		LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
 		LEFT JOIN LATERAL (
@@ -644,10 +651,108 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			&s.ClassMin, &s.ClassMax,
 			&s.CurrentCFS, &s.LastReadAt,
 			&s.FlowStatus, &s.FlowBand, &s.GaugeID,
+			&s.GaugeExternalID, &s.GaugeSource, &s.GaugeName,
 			&s.CustomGaugeID, &s.CustomGaugeSlug, &s.CustomGaugeName,
 			&s.Visibility, &s.AuthorHandle,
 		); err == nil {
 			s.IsPrivate = s.Visibility != "public"
+			items = append(items, s)
+		}
+	}
+	jsonResponse(w, http.StatusOK, items)
+}
+
+// ── ReferencedRuns ────────────────────────────────────────────────────────────
+
+// GET /api/v1/me/referenced-runs?dashboard_id={id}
+// Returns summaries of OTHER users' public runs the caller has referenced onto a
+// dashboard (referenced_user_reach_id rows). Same shape as List, but author_handle
+// is the original owner — these render read-only on the dashboard.
+func (h *UserReachHandler) ReferencedRuns(w http.ResponseWriter, r *http.Request) {
+	callerID, ok := h.ownerID(r)
+	if !ok {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	dashboardID := r.URL.Query().Get("dashboard_id")
+
+	// $2 dashboard filter is optional — NULL means all of the caller's references.
+	var dashPtr *string
+	if dashboardID != "" {
+		dashPtr = &dashboardID
+	}
+
+	rows, err := h.db.Query(r.Context(), `
+		SELECT
+			ur.id, ur.slug, ur.name, ur.long_name, ur.river_name,
+			rv.state_abbr, rv.basin AS basin_group,
+			COALESCE(lr.value, cg.last_value_cfs) AS current_cfs,
+			COALESCE(lr.timestamp, cg.last_value_at) AS last_reading_at,
+			CASE
+				WHEN fr.band_color IS NULL        THEN 'unknown'
+				WHEN fr.band_color LIKE 'red%'    THEN 'caution'
+				WHEN fr.band_color LIKE 'blue%'   THEN 'flood'
+				ELSE                                   'runnable'
+			END AS flow_status,
+			fr.band_label AS flow_band,
+			ur.primary_gauge_id::text AS gauge_id,
+			g.external_id AS gauge_external_id,
+			g.source AS gauge_source,
+			g.name AS gauge_name,
+			ur.custom_gauge_id::text AS custom_gauge_id,
+			cg.slug AS custom_gauge_slug,
+			cg.name AS custom_gauge_name,
+			up.handle AS author_handle
+		FROM user_watchlists w
+		JOIN user_reaches ur ON ur.id = w.referenced_user_reach_id
+		LEFT JOIN rivers rv ON rv.id = ur.river_id
+		LEFT JOIN gauges g ON g.id = ur.primary_gauge_id
+		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
+		LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
+		LEFT JOIN LATERAL (
+			SELECT value, timestamp FROM gauge_readings
+			WHERE gauge_id = ur.primary_gauge_id
+			  AND timestamp > NOW() - INTERVAL '48 hours'
+			ORDER BY timestamp DESC LIMIT 1
+		) lr ON TRUE
+		LEFT JOIN LATERAL (
+			SELECT label, color FROM user_reach_flow_ranges
+			WHERE user_reach_id = ur.id
+			  AND COALESCE(lr.value, cg.last_value_cfs) >= value
+			ORDER BY value DESC
+			LIMIT 1
+		) thresh ON TRUE,
+		LATERAL (
+			SELECT
+				COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END) AS band_label,
+				COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END) AS band_color
+		) fr
+		WHERE w.user_id = $1
+		  AND w.referenced_user_reach_id IS NOT NULL
+		  AND ($2::uuid IS NULL OR w.dashboard_id = $2::uuid)
+		  AND ur.visibility = 'public'
+		  AND ur.deleted_at IS NULL
+		ORDER BY ur.name
+	`, callerID, dashPtr)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "query failed")
+		return
+	}
+	defer rows.Close()
+
+	items := make([]userReachSummary, 0)
+	for rows.Next() {
+		var s userReachSummary
+		if err := rows.Scan(
+			&s.ID, &s.Slug, &s.Name, &s.LongName, &s.RiverName,
+			&s.StateAbbr, &s.BasinGroup,
+			&s.CurrentCFS, &s.LastReadAt,
+			&s.FlowStatus, &s.FlowBand, &s.GaugeID,
+			&s.GaugeExternalID, &s.GaugeSource, &s.GaugeName,
+			&s.CustomGaugeID, &s.CustomGaugeSlug, &s.CustomGaugeName,
+			&s.AuthorHandle,
+		); err == nil {
+			s.Visibility = "public"
 			items = append(items, s)
 		}
 	}
@@ -1498,6 +1603,54 @@ func (h *UserReachHandler) GetFlowRanges(w http.ResponseWriter, r *http.Request)
 	if err := h.db.QueryRow(r.Context(),
 		`SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2`, ownerID, slug).Scan(&reachID); err != nil {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
+		return
+	}
+
+	var fb FlowBands
+	if err := h.db.QueryRow(r.Context(),
+		`SELECT base_label, base_color FROM user_reaches WHERE id = $1`, reachID,
+	).Scan(&fb.BaseLabel, &fb.BaseColor); err != nil {
+		errorResponse(w, http.StatusInternalServerError, "query failed")
+		return
+	}
+	rows, _ := h.db.Query(r.Context(), `
+		SELECT value, label, color
+		FROM user_reach_flow_ranges
+		WHERE user_reach_id = $1
+		ORDER BY value ASC
+	`, reachID)
+	fb.Thresholds = make([]FlowBandThreshold, 0)
+	if rows != nil {
+		defer rows.Close()
+		for rows.Next() {
+			var t FlowBandThreshold
+			if rows.Scan(&t.Value, &t.Label, &t.Color) == nil {
+				fb.Thresholds = append(fb.Thresholds, t)
+			}
+		}
+	}
+	jsonResponse(w, http.StatusOK, fb)
+}
+
+// GET /api/v1/users/{handle}/runs/{slug}/flow-ranges
+// Public flow ranges for a public user run, resolved by owner handle + slug.
+// No auth — used by the gauge graph to color another user's (or one's own)
+// run in reach mode. Slug alone is ambiguous across users, so handle scopes it.
+func (h *UserReachHandler) GetPublicFlowRangesByHandle(w http.ResponseWriter, r *http.Request) {
+	handle := chi.URLParam(r, "handle")
+	slug := chi.URLParam(r, "slug")
+
+	var reachID string
+	if err := h.db.QueryRow(r.Context(), `
+		SELECT ur.id
+		FROM user_reaches ur
+		JOIN user_profiles up ON up.owner_id = ur.owner_id
+		WHERE LOWER(up.handle) = LOWER($1)
+		  AND ur.slug = $2
+		  AND ur.visibility = 'public'
+		  AND ur.deleted_at IS NULL
+	`, handle, slug).Scan(&reachID); err != nil {
+		errorResponse(w, http.StatusNotFound, "run not found")
 		return
 	}
 

@@ -208,6 +208,7 @@ func main() {
 		r.Post("/me/reaches", userReaches.Create)
 		r.Post("/me/reaches/import", userReaches.Import)
 		r.Get("/me/reaches/map/all", userReaches.MapAll)
+		r.Get("/me/referenced-runs", userReaches.ReferencedRuns)
 		r.Get("/me/reaches/{slug}", userReaches.Get)
 		r.Patch("/me/reaches/{slug}", userReaches.Update)
 		r.Delete("/me/reaches/{slug}", userReaches.Delete)
@@ -261,6 +262,7 @@ func main() {
 		r.Get("/users/{handle}", userProfiles.GetProfile)
 		r.Get("/users/{handle}/runs/map/all", userProfiles.MapAllByHandle)
 		r.Get("/users/{handle}/runs/{slug}", userReaches.GetPublicByHandle)
+		r.Get("/users/{handle}/runs/{slug}/flow-ranges", userReaches.GetPublicFlowRangesByHandle)
 
 		r.Get("/user-runs/community", userReaches.ListCommunity)
 		r.Get("/user-runs/map/community", userReaches.MapCommunity)
