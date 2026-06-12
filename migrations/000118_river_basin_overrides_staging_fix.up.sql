@@ -13,4 +13,4 @@ CREATE TABLE IF NOT EXISTS user_river_basin_overrides (
     UNIQUE (user_id, river_id)
 );
 
-CREATE INDEX IF NOT EXISTS ON user_river_basin_overrides (user_id);
+CREATE INDEX IF NOT EXISTS urbo_user_id_idx ON user_river_basin_overrides (user_id);
