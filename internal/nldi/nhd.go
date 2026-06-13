@@ -99,17 +99,36 @@ type NHDNameResult struct {
 	HUC8   string // first 8 chars of reachcode, may be empty
 }
 
-// NHDLookupByName queries NHD layer 6 for flowlines whose gnis_name matches
-// name (case-insensitive). Returns all distinct GNIS IDs found — callers check
-// for uniqueness: 1 result = safe to backfill, >1 = ambiguous, 0 = no match.
-func NHDLookupByName(ctx context.Context, name string) ([]NHDNameResult, error) {
-	escaped := strings.ReplaceAll(name, "'", "''")
+// riverSuffixes are stripped (lowercase, longest-first) when normalizing names
+// for fuzzy matching between our rivers table and NHD gnis_name.
+var riverSuffixes = []string{
+	" reservoir", " slough", " stream", " branch", " gulch",
+	" river", " creek", " canal", " bayou", " ditch", " wash",
+	" draw", " fork", " lake", " run",
+}
+
+// normalizeRiverName lowercases, trims, and strips common geographic suffixes
+// so "Cache La Poudre" matches "Cache la Poudre River".
+func normalizeRiverName(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	for _, sfx := range riverSuffixes {
+		if strings.HasSuffix(s, sfx) {
+			s = strings.TrimSuffix(s, sfx)
+			break
+		}
+	}
+	return strings.TrimSpace(s)
+}
+
+// nhdFetchByWhere executes a single NHD layer-6 query with the given WHERE
+// clause and returns de-duplicated NHDNameResults.
+func nhdFetchByWhere(ctx context.Context, where string) ([]NHDNameResult, error) {
 	params := url.Values{
-		"where":           {fmt.Sprintf("UPPER(gnis_name) = UPPER('%s')", escaped)},
-		"outFields":       {"gnis_id,gnis_name,reachcode"},
-		"returnGeometry":  {"false"},
-		"resultRecordCount": {"10"},
-		"f":               {"json"},
+		"where":             {where},
+		"outFields":         {"gnis_id,gnis_name,reachcode"},
+		"returnGeometry":    {"false"},
+		"resultRecordCount": {"50"},
+		"f":                 {"json"},
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, nhdArcGISURL+"?"+params.Encode(), nil)
 	if err != nil {
@@ -157,6 +176,43 @@ func NHDLookupByName(ctx context.Context, name string) ([]NHDNameResult, error) 
 		out = append(out, v)
 	}
 	return out, nil
+}
+
+// NHDLookupByName queries NHD layer 6 for flowlines matching name.
+// Strategy:
+//  1. Exact case-insensitive match on gnis_name.
+//  2. If no results, LIKE query on gnis_name LIKE '%name%', then filter
+//     candidates whose normalized name (suffixes stripped) equals the
+//     normalized input — handles "Cache La Poudre" ↔ "Cache la Poudre River".
+//
+// Returns all distinct GNIS IDs found — callers check for uniqueness:
+// 1 result = safe to backfill, >1 = ambiguous, 0 = no match.
+func NHDLookupByName(ctx context.Context, name string) ([]NHDNameResult, error) {
+	escaped := strings.ReplaceAll(name, "'", "''")
+
+	// Pass 1: exact match.
+	exact, err := nhdFetchByWhere(ctx, fmt.Sprintf("UPPER(gnis_name) = UPPER('%s')", escaped))
+	if err != nil {
+		return nil, err
+	}
+	if len(exact) > 0 {
+		return exact, nil
+	}
+
+	// Pass 2: LIKE fallback, then normalize-filter.
+	candidates, err := nhdFetchByWhere(ctx, fmt.Sprintf("UPPER(gnis_name) LIKE UPPER('%%%s%%')", escaped))
+	if err != nil {
+		return nil, err
+	}
+	// Only normalize the NHD name — our DB names never include type suffixes.
+	normInput := strings.ToLower(strings.TrimSpace(name))
+	var matched []NHDNameResult
+	for _, c := range candidates {
+		if normalizeRiverName(c.Name) == normInput {
+			matched = append(matched, c)
+		}
+	}
+	return matched, nil
 }
 
 // GNISLookupResult holds the coordinate and HUC8 derived from an NHD GNIS ID query.
