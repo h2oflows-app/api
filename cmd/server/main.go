@@ -128,6 +128,7 @@ func main() {
 	preferences   := handlers.NewPreferencesHandler(pool, devFallbackID)
 	profile       := handlers.NewProfileHandler(pool, devFallbackID)
 	dashboards    := handlers.NewDashboardHandler(pool, devFallbackID)
+	basinOverrides := handlers.NewBasinOverrideHandler(pool, devFallbackID)
 	ogh           := handlers.NewOGHandler(pool)
 	var importEmbedder *ai.Embedder
 	if cfg.VoyageAPIKey != "" {
@@ -367,6 +368,9 @@ func main() {
 		r.Post("/me/reports/{slug}/aw-sync", reports.AWSync)
 		r.Get("/me/preferences", preferences.Get)
 		r.Patch("/me/preferences", preferences.Update)
+		r.Get("/me/river-basin-overrides", basinOverrides.List)
+		r.Put("/me/rivers/{riverID}/basin-override", basinOverrides.Upsert)
+		r.Delete("/me/rivers/{riverID}/basin-override", basinOverrides.Delete)
 		r.Get("/me/profile", profile.Get)
 		r.Patch("/me/profile", profile.Update)
 		r.Post("/me/profile/suggest", profile.Suggest)
