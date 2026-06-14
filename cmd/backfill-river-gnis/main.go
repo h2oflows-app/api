@@ -38,7 +38,9 @@ import (
 type riverRow struct {
 	ID     string
 	Name   string
-	GnisID string // non-empty only for pass-2 rows
+	GnisID string  // non-empty only for pass-2 rows
+	Lat    float64 // centroid of associated reaches (0 if none)
+	Lng    float64
 }
 
 func main() {
@@ -113,6 +115,28 @@ func runPass1Loop(ctx context.Context, pool *pgxpool.Pool, todo []riverRow, dryR
 	for i, r := range todo {
 		time.Sleep(time.Duration(rateMs) * time.Millisecond)
 		matches, err := nldi.NHDLookupByName(ctx, r.Name)
+
+		// Spatial fallback: when name lookup errors, returns 0 results, or is
+		// ambiguous (>1), and we have a reach centroid, query NHD by point.
+		if r.Lat != 0 && r.Lng != 0 && (err != nil || len(matches) != 1) {
+			sName, sGNIS, sErr := nldi.NHDStreamNameAt(ctx, r.Lat, r.Lng)
+			if sErr == nil && sGNIS != "" && nldi.NamesMatch(sName, r.Name) {
+				resolved := nldi.NHDNameResult{GnisID: sGNIS, Name: sName}
+				if len(matches) > 1 {
+					// Prefer the ambiguous candidate whose GNIS matches spatial result.
+					for _, m := range matches {
+						if m.GnisID == sGNIS {
+							resolved = m
+							break
+						}
+					}
+				}
+				matches = []nldi.NHDNameResult{resolved}
+				err = nil
+				log.Printf("    ↳ spatial fallback → gnis=%s %q", sGNIS, sName)
+			}
+		}
+
 		results = append(results, result{river: r, matches: matches, lookupErr: err})
 		status := fmt.Sprintf("%d matches", len(matches))
 		if err != nil {
@@ -241,7 +265,16 @@ func runPass2Loop(ctx context.Context, pool *pgxpool.Pool, todo []riverRow, dryR
 }
 
 func loadNullGNIS(ctx context.Context, pool *pgxpool.Pool) ([]riverRow, error) {
-	rows, err := pool.Query(ctx, `SELECT id, name FROM rivers WHERE gnis_id IS NULL ORDER BY name`)
+	rows, err := pool.Query(ctx, `
+		SELECT r.id, r.name,
+		       COALESCE(AVG(ST_Y(ur.put_in::geometry)), 0) AS lat,
+		       COALESCE(AVG(ST_X(ur.put_in::geometry)), 0) AS lng
+		FROM   rivers r
+		LEFT   JOIN user_reaches ur ON ur.river_id = r.id
+		WHERE  r.gnis_id IS NULL
+		GROUP  BY r.id, r.name
+		ORDER  BY r.name
+	`)
 	if err != nil {
 		return nil, err
 	}
@@ -249,7 +282,7 @@ func loadNullGNIS(ctx context.Context, pool *pgxpool.Pool) ([]riverRow, error) {
 	var out []riverRow
 	for rows.Next() {
 		var r riverRow
-		if err := rows.Scan(&r.ID, &r.Name); err != nil {
+		if err := rows.Scan(&r.ID, &r.Name, &r.Lat, &r.Lng); err != nil {
 			return nil, err
 		}
 		out = append(out, r)

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // FirstCoord returns the first [lng, lat] pair from a GeoJSON geometry, or nil
@@ -120,9 +121,33 @@ func normalizeRiverName(s string) string {
 	return strings.TrimSpace(s)
 }
 
-// nhdFetchByWhere executes a single NHD layer-6 query with the given WHERE
-// clause and returns de-duplicated NHDNameResults.
+// NamesMatch reports whether two river names refer to the same waterway by
+// comparing their normalized forms (suffixes stripped from both sides).
+// Used to verify spatial-fallback results against the DB river name.
+func NamesMatch(a, b string) bool {
+	return normalizeRiverName(a) == normalizeRiverName(b)
+}
+
+// nhdFetchByWhere executes an NHD layer-6 query with retry (3 attempts, 2s backoff).
 func nhdFetchByWhere(ctx context.Context, where string) ([]NHDNameResult, error) {
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt*2) * time.Second)
+		}
+		results, err := nhdFetchByWhereOnce(ctx, where)
+		if err == nil {
+			return results, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+// nhdFetchByWhereOnce executes a single NHD layer-6 query with the given WHERE
+// clause and returns de-duplicated NHDNameResults.
+func nhdFetchByWhereOnce(ctx context.Context, where string) ([]NHDNameResult, error) {
 	params := url.Values{
 		"where":             {where},
 		"outFields":         {"gnis_id,gnis_name,reachcode"},
