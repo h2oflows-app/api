@@ -16,11 +16,11 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
-	gauge "github.com/h2oflow/h2oflow/apps/api/internal/gaugecore"
 	"github.com/h2oflow/h2oflow/apps/api/internal/ai"
 	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
 	"github.com/h2oflow/h2oflow/apps/api/internal/config"
 	"github.com/h2oflow/h2oflow/apps/api/internal/db"
+	gauge "github.com/h2oflow/h2oflow/apps/api/internal/gaugecore"
 	"github.com/h2oflow/h2oflow/apps/api/internal/handlers"
 	"github.com/h2oflow/h2oflow/apps/api/internal/poller"
 )
@@ -102,45 +102,34 @@ func main() {
 		devFallbackID = "dev-user"
 	}
 
-	gauges      := handlers.NewGaugeHandler(pool, enricher).WithPoller(p)
-	gaugeExt    := handlers.NewGaugeExternalHandler(pool, gauge.NewUSGSSource(cfg.USGSAPIKey))
-	reaches     := handlers.NewReachHandler(pool, asker).WithPoller(p)
-	watchlist   := handlers.NewWatchlistHandler(pool)
-	admin       := handlers.NewAdminHandler(pool).WithPoller(p)
+	gauges := handlers.NewGaugeHandler(pool, enricher).WithPoller(p)
+	gaugeExt := handlers.NewGaugeExternalHandler(pool, gauge.NewUSGSSource(cfg.USGSAPIKey))
+	reaches := handlers.NewReachHandler(pool, asker).WithPoller(p)
+	watchlist := handlers.NewWatchlistHandler(pool)
+	admin := handlers.NewAdminHandler(pool).WithPoller(p)
 	corrections := handlers.NewCorrectionsHandler(pool)
-	userReaches  := handlers.NewUserReachHandler(pool, devFallbackID)
+	userReaches := handlers.NewUserReachHandler(pool, devFallbackID)
 	customGauges := handlers.NewCustomGaugeHandler(pool, devFallbackID)
-	nldiH    := handlers.NewNLDIHandler(pool).WithAnthropicKey(cfg.AnthropicAPIKey).WithCacheWarmer(func() { reaches.WarmCache(context.Background()) })
+	nldiH := handlers.NewNLDIHandler(pool).WithAnthropicKey(cfg.AnthropicAPIKey).WithCacheWarmer(func() { reaches.WarmCache(context.Background()) })
 	// Warm the reach map cache immediately, then refresh every poll cycle.
 	reaches.WarmCache(context.Background())
 	reaches.StartCacheRefresh(pollerCtx, pollInterval.USGS)
-	trips         := handlers.NewTripHandler(pool, describer)
+	trips := handlers.NewTripHandler(pool, describer)
 	contributions := handlers.NewContributionHandler(pool)
-	reports        := handlers.NewReportHandler(pool, devFallbackID)
-	flowProposals      := handlers.NewFlowProposalHandler(pool, devFallbackID)
-	flowBandOverrides  := handlers.NewFlowBandOverrideHandler(pool, devFallbackID)
-	cluster        := handlers.NewClusterHandler(pool, devFallbackID)
-	upvote         := handlers.NewUpvoteHandler(pool, devFallbackID)
-	meGauges       := handlers.NewUserGaugesHandler(pool, devFallbackID).WithPoller(p)
-	userProfiles   := handlers.NewUserProfileHandler(pool)
-	moderation     := handlers.NewModerationHandler(pool, devFallbackID)
-	discover       := handlers.NewDiscoverHandler(pool)
-	preferences   := handlers.NewPreferencesHandler(pool, devFallbackID)
-	profile       := handlers.NewProfileHandler(pool, devFallbackID)
-	dashboards    := handlers.NewDashboardHandler(pool, devFallbackID)
+	reports := handlers.NewReportHandler(pool, devFallbackID)
+	flowProposals := handlers.NewFlowProposalHandler(pool, devFallbackID)
+	flowBandOverrides := handlers.NewFlowBandOverrideHandler(pool, devFallbackID)
+	cluster := handlers.NewClusterHandler(pool, devFallbackID)
+	upvote := handlers.NewUpvoteHandler(pool, devFallbackID)
+	meGauges := handlers.NewUserGaugesHandler(pool, devFallbackID).WithPoller(p)
+	userProfiles := handlers.NewUserProfileHandler(pool)
+	moderation := handlers.NewModerationHandler(pool, devFallbackID)
+	discover := handlers.NewDiscoverHandler(pool)
+	preferences := handlers.NewPreferencesHandler(pool, devFallbackID)
+	profile := handlers.NewProfileHandler(pool, devFallbackID)
+	dashboards := handlers.NewDashboardHandler(pool, devFallbackID)
 	basinOverrides := handlers.NewBasinOverrideHandler(pool, devFallbackID)
-	ogh           := handlers.NewOGHandler(pool)
-	var importEmbedder *ai.Embedder
-	if cfg.VoyageAPIKey != "" {
-		importEmbedder = ai.NewEmbedder(cfg.VoyageAPIKey)
-	}
-	imports := &handlers.Import{
-		Pool:              pool,
-		CacheWarmer:       func() { reaches.WarmCache(context.Background()) },
-		CenterlineFetcher: reaches.BackgroundFetchCenterline,
-		Embedder:          importEmbedder,
-		MetadataSyncer:    func() { p.SyncMetadataNow(context.Background()) },
-	}
+	ogh := handlers.NewOGHandler(pool)
 	// LoadAppRoles queries user_roles for the authenticated user on each request.
 	// Runs after Optional/Required so the user ID is already in context.
 	loadAppRoles := auth.LoadAppRoles(func(r *http.Request, userID string) ([]string, error) {
@@ -226,13 +215,13 @@ func main() {
 		r.Get("/me/reaches/{slug}/reports", reports.ListByUserReach)
 		r.Get("/me/reaches/{slug}/flow-proposals", flowProposals.ListForOwnRun)
 		r.Post("/me/reaches/{slug}/flow-proposals", flowProposals.UpsertForOwnRun)
-		r.Get("/me/reaches/{slug}/flow-band-override",    flowBandOverrides.GetOwn)
-		r.Put("/me/reaches/{slug}/flow-band-override",    flowBandOverrides.UpsertOwn)
+		r.Get("/me/reaches/{slug}/flow-band-override", flowBandOverrides.GetOwn)
+		r.Put("/me/reaches/{slug}/flow-band-override", flowBandOverrides.UpsertOwn)
 		r.Delete("/me/reaches/{slug}/flow-band-override", flowBandOverrides.DeleteOwn)
 
 		r.Get("/me/gauges", meGauges.List)
 		r.Post("/me/gauges/{id}/refresh", meGauges.Refresh)
-			r.Post("/me/gauges/add-external", gaugeExt.AddExternal)
+		r.Post("/me/gauges/add-external", gaugeExt.AddExternal)
 
 		// /me/runs/{slug} — user-facing aliases for /me/reaches/{slug}
 		r.Get("/me/runs", userReaches.List)
@@ -291,19 +280,17 @@ func main() {
 		// Data admin routes — require data_admin or site_admin role.
 		r.Group(func(r chi.Router) {
 			r.Use(auth.RequireDataAdmin)
-			r.Put("/reaches/{slug}/flow-ranges", reaches.SetFlowRanges)
-			r.Delete("/reaches/{slug}", reaches.Delete)
-			r.Post("/reaches/{slug}/fetch-centerline", reaches.FetchCenterline)
-			r.Delete("/reaches/{slug}/centerline", reaches.ClearCenterline)
-			r.Post("/import/kmz", imports.ImportKMZ)
+			// NOTE: curated-reach authoring/editing surface removed in runs-unify 3.3
+			// (h2oflows now authors via the /me run flow + ?as=h2oflows override).
+			// Rivers-management reads/writes (unassigned, grouped, auto-river, river
+			// assign, /admin/rivers CRUD, reorder, gnis-lookup) are intentionally
+			// retained here and flip as one unit in Phase 4.
 			r.Get("/admin/reaches/unassigned", admin.ListUnassignedReaches)
 			r.Get("/admin/reaches/grouped", admin.GroupedReaches)
-			r.Post("/admin/reaches/{slug}/auto-river", admin.AutoAssignRiver)
-			r.Put("/admin/reaches/{slug}/river", admin.AssignReachToRiver)
 			r.Get("/admin/rivers", admin.ListRivers)
 			r.Get("/admin/rivers/{riverSlug}", admin.GetRiver)
 			r.Post("/admin/rivers", admin.CreateRiver)
-				r.Delete("/admin/rivers/{riverSlug}", admin.DeleteRiver)
+			r.Delete("/admin/rivers/{riverSlug}", admin.DeleteRiver)
 			r.Post("/admin/rivers/{riverSlug}/reorder-reaches", admin.ReorderReachesForRiver)
 			r.Get("/admin/river-corrections", corrections.ListRiverCorrections)
 			r.Patch("/admin/river-corrections/{id}", corrections.ReviewRiverCorrection)
@@ -322,17 +309,8 @@ func main() {
 			r.Get("/admin/nldi/river-name", nldiH.RiverName)
 			r.Get("/admin/nldi/preview-centerline", nldiH.PreviewCenterline)
 			r.Get("/admin/nldi/nearby-gauges", nldiH.NearbyGauges)
-			r.Put("/admin/reaches/{slug}/primary-gauge", nldiH.SetPrimaryGauge)
-				r.Delete("/admin/reaches/{slug}/primary-gauge", nldiH.ClearPrimaryGauge)
-			r.Post("/admin/reaches", nldiH.CreateReach)
-			r.Get("/admin/reaches/{slug}", nldiH.GetAdminReach)
-			r.Post("/admin/reaches/{slug}/generate-description", nldiH.GenerateDescription)
-			r.Patch("/admin/reaches/{slug}", nldiH.PatchReach)
-			r.Put("/admin/reaches/{slug}/meta", nldiH.UpdateReachMeta)
-			r.Post("/admin/reaches/{slug}/nldi-centerline", nldiH.UpdateReachCenterline)
-			r.Post("/admin/reaches/{slug}/nldi-centerline-by-comid", nldiH.UpdateReachCenterlineByComID)
-			r.Get("/admin/reaches/flow-band-override-queue",      flowBandOverrides.AdminQueue)
-			r.Get("/admin/reaches/{slug}/flow-band-overrides",    flowBandOverrides.AdminListForReach)
+			r.Get("/admin/reaches/flow-band-override-queue", flowBandOverrides.AdminQueue)
+			r.Get("/admin/reaches/{slug}/flow-band-overrides", flowBandOverrides.AdminListForReach)
 			r.Post("/admin/reaches/{slug}/apply-override-median", flowBandOverrides.AdminApplyMedian)
 		})
 
