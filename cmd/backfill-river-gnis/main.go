@@ -265,15 +265,27 @@ func runPass2Loop(ctx context.Context, pool *pgxpool.Pool, todo []riverRow, dryR
 }
 
 func loadNullGNIS(ctx context.Context, pool *pgxpool.Pool) ([]riverRow, error) {
+	// Pick one real anchor point per river (a curated reach start_point or user
+	// reach put_in) to disambiguate name collisions (e.g. two "Clear Creek"
+	// rivers) via a point-based NHD lookup. A single actual anchor is always on
+	// the river's flowline; an averaged centroid can land off-line on a winding
+	// reach and miss NHD's proximity buffer.
 	rows, err := pool.Query(ctx, `
-		SELECT r.id, r.name,
-		       COALESCE(AVG(ST_Y(ur.put_in::geometry)), 0) AS lat,
-		       COALESCE(AVG(ST_X(ur.put_in::geometry)), 0) AS lng
+		WITH pts AS (
+			SELECT river_id, start_point::geometry AS geom
+			FROM   reaches      WHERE river_id IS NOT NULL AND start_point IS NOT NULL
+			UNION ALL
+			SELECT river_id, put_in::geometry      AS geom
+			FROM   user_reaches WHERE river_id IS NOT NULL AND put_in      IS NOT NULL
+		)
+		SELECT DISTINCT ON (r.id)
+		       r.id, r.name,
+		       COALESCE(ST_Y(p.geom), 0) AS lat,
+		       COALESCE(ST_X(p.geom), 0) AS lng
 		FROM   rivers r
-		LEFT   JOIN user_reaches ur ON ur.river_id = r.id
+		LEFT   JOIN pts p ON p.river_id = r.id
 		WHERE  r.gnis_id IS NULL
-		GROUP  BY r.id, r.name
-		ORDER  BY r.name
+		ORDER  BY r.id, ST_Y(p.geom)
 	`)
 	if err != nil {
 		return nil, err
