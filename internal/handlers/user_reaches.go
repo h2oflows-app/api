@@ -119,44 +119,65 @@ func (h *UserReachHandler) ownerID(r *http.Request) (string, bool) {
 	return "", false
 }
 
+// h2oflowsSentinelOwnerID is the owner_id of the h2oflows curator account
+// (seeded by mig 105). Runs owned by it are official curator content.
+const h2oflowsSentinelOwnerID = "00000000-0000-0000-0000-000000000001"
+
+// authorOwnerID resolves the owner a run is authored under. When the request
+// carries ?as=h2oflows AND the caller has data_admin rights, the run is
+// authored as the h2oflows curator (official content); otherwise it is owned by
+// the authenticated user. Returns ("", false) when unauthenticated.
+//
+// The bool second return reports whether the run is being authored as h2oflows,
+// so callers can force official/public visibility.
+func (h *UserReachHandler) authorOwnerID(r *http.Request) (ownerID string, asH2oflows bool, ok bool) {
+	id, ok := h.ownerID(r)
+	if !ok {
+		return "", false, false
+	}
+	if r.URL.Query().Get("as") == "h2oflows" && auth.IsDataAdminFromContext(r.Context()) {
+		return h2oflowsSentinelOwnerID, true, true
+	}
+	return id, false, true
+}
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
-
 type userReachSummary struct {
-	ID          string     `json:"id"`
-	Slug        string     `json:"slug"`
-	Name        string     `json:"name"`
-	LongName    *string    `json:"long_name"`
-	RiverID     *string    `json:"river_id"`
-	RiverName   *string    `json:"river_name"`
-	StateAbbr   *string    `json:"state_abbr"`
-	BasinGroup  *string    `json:"basin_group"`
-	PutInLng    float64    `json:"put_in_lng"`
-	PutInLat    float64    `json:"put_in_lat"`
-	TakeOutLng  float64    `json:"take_out_lng"`
-	TakeOutLat  float64    `json:"take_out_lat"`
-	Note        *string    `json:"note"`
-	ClassMin    *float64   `json:"class_min"`
-	ClassMax    *float64   `json:"class_max"`
-	CurrentCFS  *float64   `json:"current_cfs"`
-	FlowBand    *string    `json:"flow_band"`
-	FlowStatus  string     `json:"flow_status"`
-	GaugeID          *string    `json:"gauge_id"`
-	GaugeExternalID  *string    `json:"gauge_external_id"`
-	GaugeSource      *string    `json:"gauge_source"`
-	GaugeName        *string    `json:"gauge_name"`
-	CustomGaugeID    *string    `json:"custom_gauge_id"`
-	CustomGaugeSlug  *string    `json:"custom_gauge_slug"`
-	CustomGaugeName  *string    `json:"custom_gauge_name"`
-	LastReadAt       *time.Time `json:"last_reading_at"`
-	CreatedAt        time.Time  `json:"created_at"`
-	Visibility       string     `json:"visibility"`
-	IsPrivate        bool       `json:"is_private"` // backward compat; derived from Visibility
-	DeletedAt        *time.Time `json:"deleted_at"`
-	ForkCount        int        `json:"fork_count"`
-	IsFork           bool       `json:"is_fork"`
-	AuthorHandle     *string    `json:"author_handle"`
-	IsOfficial       bool       `json:"is_official"`
+	ID              string     `json:"id"`
+	Slug            string     `json:"slug"`
+	Name            string     `json:"name"`
+	LongName        *string    `json:"long_name"`
+	RiverID         *string    `json:"river_id"`
+	RiverName       *string    `json:"river_name"`
+	StateAbbr       *string    `json:"state_abbr"`
+	BasinGroup      *string    `json:"basin_group"`
+	PutInLng        float64    `json:"put_in_lng"`
+	PutInLat        float64    `json:"put_in_lat"`
+	TakeOutLng      float64    `json:"take_out_lng"`
+	TakeOutLat      float64    `json:"take_out_lat"`
+	Note            *string    `json:"note"`
+	ClassMin        *float64   `json:"class_min"`
+	ClassMax        *float64   `json:"class_max"`
+	CurrentCFS      *float64   `json:"current_cfs"`
+	FlowBand        *string    `json:"flow_band"`
+	FlowStatus      string     `json:"flow_status"`
+	GaugeID         *string    `json:"gauge_id"`
+	GaugeExternalID *string    `json:"gauge_external_id"`
+	GaugeSource     *string    `json:"gauge_source"`
+	GaugeName       *string    `json:"gauge_name"`
+	CustomGaugeID   *string    `json:"custom_gauge_id"`
+	CustomGaugeSlug *string    `json:"custom_gauge_slug"`
+	CustomGaugeName *string    `json:"custom_gauge_name"`
+	LastReadAt      *time.Time `json:"last_reading_at"`
+	CreatedAt       time.Time  `json:"created_at"`
+	Visibility      string     `json:"visibility"`
+	IsPrivate       bool       `json:"is_private"` // backward compat; derived from Visibility
+	DeletedAt       *time.Time `json:"deleted_at"`
+	ForkCount       int        `json:"fork_count"`
+	IsFork          bool       `json:"is_fork"`
+	AuthorHandle    *string    `json:"author_handle"`
+	IsOfficial      bool       `json:"is_official"`
 }
 
 type userReachRapid struct {
@@ -182,31 +203,31 @@ type userReachAccessPoint struct {
 
 type userReachDetail struct {
 	userReachSummary
-	RiverSlug       *string              `json:"river_slug"`
-	RiverStateAbbr  *string              `json:"river_state_abbr"`
-	RiverBasin      *string              `json:"river_basin"`
-	UpComID          *string              `json:"up_comid"`
-	DownComID        *string              `json:"down_comid"`
-	Centerline       *json.RawMessage     `json:"centerline"`
-	GaugeID               *string              `json:"gauge_id"`
-	GaugeName             *string              `json:"gauge_name"`
-	GaugeSource           *string              `json:"gauge_source"`
-	GaugeExternalID       *string              `json:"gauge_external_id"`
-	GaugePollHealth       *string              `json:"gauge_poll_health"`
-	GaugeLastPollSuccess  *time.Time           `json:"gauge_last_poll_success_at"`
-	CustomGaugeID         *string              `json:"custom_gauge_id"`
-	CustomGaugeName       *string              `json:"custom_gauge_name"`
-	ForkedFromSlug          *string    `json:"forked_from_slug"`
-	ForkedFromName          *string    `json:"forked_from_name"`
-	OriginalAuthorHandle    *string    `json:"original_author_handle"`
-	OriginalForkedAt        *time.Time `json:"original_forked_at"`
-	LastModifiedAfterForkAt *time.Time `json:"last_modified_after_fork_at"`
-	FlowBands             FlowBands              `json:"flow_bands"`
-	Rapids                []userReachRapid       `json:"rapids"`
-	AccessPoints          []userReachAccessPoint `json:"access_points"`
-	UpvoteCount           int                    `json:"upvote_count"`
-	UserUpvoted           bool                   `json:"user_upvoted"`
-	IsOwn                 bool                   `json:"is_own"`
+	RiverSlug               *string                `json:"river_slug"`
+	RiverStateAbbr          *string                `json:"river_state_abbr"`
+	RiverBasin              *string                `json:"river_basin"`
+	UpComID                 *string                `json:"up_comid"`
+	DownComID               *string                `json:"down_comid"`
+	Centerline              *json.RawMessage       `json:"centerline"`
+	GaugeID                 *string                `json:"gauge_id"`
+	GaugeName               *string                `json:"gauge_name"`
+	GaugeSource             *string                `json:"gauge_source"`
+	GaugeExternalID         *string                `json:"gauge_external_id"`
+	GaugePollHealth         *string                `json:"gauge_poll_health"`
+	GaugeLastPollSuccess    *time.Time             `json:"gauge_last_poll_success_at"`
+	CustomGaugeID           *string                `json:"custom_gauge_id"`
+	CustomGaugeName         *string                `json:"custom_gauge_name"`
+	ForkedFromSlug          *string                `json:"forked_from_slug"`
+	ForkedFromName          *string                `json:"forked_from_name"`
+	OriginalAuthorHandle    *string                `json:"original_author_handle"`
+	OriginalForkedAt        *time.Time             `json:"original_forked_at"`
+	LastModifiedAfterForkAt *time.Time             `json:"last_modified_after_fork_at"`
+	FlowBands               FlowBands              `json:"flow_bands"`
+	Rapids                  []userReachRapid       `json:"rapids"`
+	AccessPoints            []userReachAccessPoint `json:"access_points"`
+	UpvoteCount             int                    `json:"upvote_count"`
+	UserUpvoted             bool                   `json:"user_upvoted"`
+	IsOwn                   bool                   `json:"is_own"`
 }
 
 // ── MapAll ────────────────────────────────────────────────────────────────────
@@ -300,17 +321,17 @@ func (h *UserReachHandler) MapAll(w http.ResponseWriter, r *http.Request) {
 	features := make([]feature, 0)
 	for rows.Next() {
 		var (
-			id, slug, name  string
-			riverName       *string
-			centerlineJSON  *string
-			putInLng, putInLat   float64
+			id, slug, name         string
+			riverName              *string
+			centerlineJSON         *string
+			putInLng, putInLat     float64
 			takeOutLng, takeOutLat float64
-			currentCFS      *float64
-			flowStatus      string
-			gaugeID         *string
-			classMax        *float64
-			upvoteCount     int64
-			authorHandle    *string
+			currentCFS             *float64
+			flowStatus             string
+			gaugeID                *string
+			classMax               *float64
+			upvoteCount            int64
+			authorHandle           *string
 		)
 		if err := rows.Scan(
 			&id, &slug, &name, &riverName,
@@ -328,7 +349,7 @@ func (h *UserReachHandler) MapAll(w http.ResponseWriter, r *http.Request) {
 		} else {
 			// Synthesize a 2-point LineString from put_in → take_out.
 			type lineString struct {
-				Type        string      `json:"type"`
+				Type        string       `json:"type"`
 				Coordinates [][2]float64 `json:"coordinates"`
 			}
 			raw, _ := json.Marshal(lineString{
@@ -342,18 +363,18 @@ func (h *UserReachHandler) MapAll(w http.ResponseWriter, r *http.Request) {
 			Type:     "Feature",
 			Geometry: geom,
 			Properties: featureProps{
-				ID:          id,
-				Slug:        slug,
-				Name:        name,
-				RiverName:   riverName,
-				CommonName:  nil,
-				ClassMax:    classMax,
-				FlowStatus:  flowStatus,
-				CurrentCFS:  currentCFS,
-				GaugeID:     gaugeID,
+				ID:           id,
+				Slug:         slug,
+				Name:         name,
+				RiverName:    riverName,
+				CommonName:   nil,
+				ClassMax:     classMax,
+				FlowStatus:   flowStatus,
+				CurrentCFS:   currentCFS,
+				GaugeID:      gaugeID,
 				IsUserReach:  true,
 				AuthorHandle: authorHandle,
-				UpvoteCount: upvoteCount,
+				UpvoteCount:  upvoteCount,
 			},
 		})
 	}
@@ -945,7 +966,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 // Canonical public lookup by author handle + run slug. Auth optional.
 func (h *UserReachHandler) GetPublicByHandle(w http.ResponseWriter, r *http.Request) {
 	handle := chi.URLParam(r, "handle")
-	slug   := chi.URLParam(r, "slug")
+	slug := chi.URLParam(r, "slug")
 	callerID, _ := h.ownerID(r)
 
 	var runID string
@@ -965,7 +986,7 @@ func (h *UserReachHandler) GetPublicByHandle(w http.ResponseWriter, r *http.Requ
 // Public: returns detail for any non-private user reach by UUID.
 // Auth optional — when present, populates user_upvoted.
 func (h *UserReachHandler) GetPublic(w http.ResponseWriter, r *http.Request) {
-	runID    := chi.URLParam(r, "runId")
+	runID := chi.URLParam(r, "runId")
 	callerID, _ := h.ownerID(r)
 	h.getPublicByID(w, r, runID, callerID)
 }
@@ -1151,7 +1172,7 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 
 // POST /api/v1/me/reaches
 func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
-	ownerID, ok := h.ownerID(r)
+	ownerID, asH2oflows, ok := h.authorOwnerID(r)
 	if !ok {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
 		return
@@ -1162,19 +1183,19 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Lng float64 `json:"lng"`
 	}
 	var body struct {
-		Name      string    `json:"name"`
-		LongName  *string   `json:"long_name"`
-		RiverName string    `json:"river_name"`
-		GnisID    string    `json:"gnis_id"`
-		PutIn     latLng    `json:"put_in"`
-		TakeOut   latLng    `json:"take_out"`
-		UpComID   string    `json:"up_comid"`
-		DownComID string    `json:"down_comid"`
-		Note      *string   `json:"note"`
-		ClassMin  *float64  `json:"class_min"`
-		ClassMax  *float64  `json:"class_max"`
+		Name      string   `json:"name"`
+		LongName  *string  `json:"long_name"`
+		RiverName string   `json:"river_name"`
+		GnisID    string   `json:"gnis_id"`
+		PutIn     latLng   `json:"put_in"`
+		TakeOut   latLng   `json:"take_out"`
+		UpComID   string   `json:"up_comid"`
+		DownComID string   `json:"down_comid"`
+		Note      *string  `json:"note"`
+		ClassMin  *float64 `json:"class_min"`
+		ClassMax  *float64 `json:"class_max"`
 		// is_private kept for backward compat; nil (absent) = private by default (V1)
-		IsPrivate *bool     `json:"is_private"`
+		IsPrivate *bool      `json:"is_private"`
 		FlowBands *FlowBands `json:"flow_bands"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -1222,9 +1243,13 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 		slug = fmt.Sprintf("%s-%d", baseSlug, i)
 	}
 
-	// V1: default private; is_private=false (explicit) → public for backward compat
+	// V1: default private; is_private=false (explicit) → public for backward compat.
+	// h2oflows curator content is always public (mig 109).
 	createVisibility := "private"
 	if body.IsPrivate != nil && !*body.IsPrivate {
+		createVisibility = "public"
+	}
+	if asH2oflows {
 		createVisibility = "public"
 	}
 
@@ -1683,7 +1708,7 @@ func (h *UserReachHandler) GetPublicFlowRangesByHandle(w http.ResponseWriter, r 
 
 // PUT /api/v1/me/reaches/{slug}/flow-ranges
 func (h *UserReachHandler) SetFlowRanges(w http.ResponseWriter, r *http.Request) {
-	ownerID, ok := h.ownerID(r)
+	ownerID, _, ok := h.authorOwnerID(r)
 	if !ok {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
 		return
@@ -1759,7 +1784,7 @@ func (h *UserReachHandler) ClearGauge(w http.ResponseWriter, r *http.Request) {
 // Body: { "up_comid": "...", "down_comid": "...", "start_lat": ..., ... }
 // Delegates to the NLDI handler's centerline fetch logic via internal fetch.
 func (h *UserReachHandler) SetCenterline(w http.ResponseWriter, r *http.Request) {
-	ownerID, ok := h.ownerID(r)
+	ownerID, _, ok := h.authorOwnerID(r)
 	if !ok {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
 		return
@@ -1817,11 +1842,12 @@ func (h *UserReachHandler) ClearCenterline(w http.ResponseWriter, r *http.Reques
 
 // PUT /api/v1/me/reaches/{slug}/gauge
 // Body (pick one):
-//   { "gauge_id": "<uuid>" }
-//   { "custom_gauge_id": "<uuid>" }
-//   { "external_id": "...", "source": "...", "name": "...", "lat": 0.0, "lng": 0.0 }
+//
+//	{ "gauge_id": "<uuid>" }
+//	{ "custom_gauge_id": "<uuid>" }
+//	{ "external_id": "...", "source": "...", "name": "...", "lat": 0.0, "lng": 0.0 }
 func (h *UserReachHandler) SetGauge(w http.ResponseWriter, r *http.Request) {
-	ownerID, ok := h.ownerID(r)
+	ownerID, _, ok := h.authorOwnerID(r)
 	if !ok {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
 		return
