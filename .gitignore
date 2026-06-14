@@ -43,3 +43,6 @@ Thumbs.db
 # Project decisions log — local only
 DECISIONS.md
 .mcp.json
+
+# compiled cmd binaries
+/backfill-river-gnis
