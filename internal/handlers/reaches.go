@@ -6,16 +6,14 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
 	"github.com/h2oflow/h2oflow/apps/api/internal/ai"
+	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
 	"github.com/h2oflow/h2oflow/apps/api/internal/elevation"
-	"github.com/h2oflow/h2oflow/apps/api/internal/kmlimport"
 	"github.com/h2oflow/h2oflow/apps/api/internal/osm"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -24,7 +22,7 @@ import (
 // Used for both /reaches/map/all (GeoJSON) and /reaches (list JSON).
 type jsonCache struct {
 	mu       sync.RWMutex
-	payload  []byte    // marshalled JSON
+	payload  []byte // marshalled JSON
 	warmedAt time.Time
 }
 
@@ -45,11 +43,11 @@ func (c *jsonCache) get() ([]byte, bool) {
 }
 
 type statsCache struct {
-	mu        sync.Mutex
-	cachedAt  time.Time
-	reaches   int
-	rivers    int
-	reports   int
+	mu       sync.Mutex
+	cachedAt time.Time
+	reaches  int
+	rivers   int
+	reports  int
 }
 
 func (c *statsCache) get(ttl time.Duration) (reaches, rivers, reports int, ok bool) {
@@ -79,8 +77,8 @@ type gaugeFetcher interface {
 type ReachHandler struct {
 	db        *pgxpool.Pool
 	asker     *ai.ReachAsker
-	cache     *jsonCache // /reaches/map/all GeoJSON
-	listCache *jsonCache // /reaches lightweight JSON
+	cache     *jsonCache   // /reaches/map/all GeoJSON
+	listCache *jsonCache   // /reaches lightweight JSON
 	poller    gaugeFetcher // nil = on-demand fetching disabled
 	sc        statsCache
 }
@@ -447,23 +445,23 @@ func (h *ReachHandler) queryAllFeatures(ctx context.Context) ([]Feature, error) 
 	features := make([]Feature, 0)
 	for rows.Next() {
 		var (
-			id, name, slug                    string
-			riverName, commonName             *string
-			putInName, takeOutName            *string
-			classMin, classMax                *float64
-			character                         *string
-			lengthMi                          *float64
-			centerlineJSON                    []byte
-			putInLng, putInLat                *float64
-			takeOutLng, takeOutLat            *float64
-			currentCFS                        *float64
-			lastReadingAt                     *time.Time
-			flowLabel, gaugeID                *string
-			reachRelationship                 *string
-			gaugeTrusted                      *bool
-			gaugeNotes                        *string
-			infoLinks                         []byte
-			flowStatus                        string
+			id, name, slug         string
+			riverName, commonName  *string
+			putInName, takeOutName *string
+			classMin, classMax     *float64
+			character              *string
+			lengthMi               *float64
+			centerlineJSON         []byte
+			putInLng, putInLat     *float64
+			takeOutLng, takeOutLat *float64
+			currentCFS             *float64
+			lastReadingAt          *time.Time
+			flowLabel, gaugeID     *string
+			reachRelationship      *string
+			gaugeTrusted           *bool
+			gaugeNotes             *string
+			infoLinks              []byte
+			flowStatus             string
 		)
 		if err := rows.Scan(
 			&id, &name, &slug,
@@ -498,7 +496,7 @@ func (h *ReachHandler) queryAllFeatures(ctx context.Context) ([]Feature, error) 
 				"flow_label": flowLabel, "gauge_id": gaugeID,
 				"flow_status": flowStatus, "flow_color": flowColor(flowStatus),
 				"reach_relationship": reachRelationship,
-				"gauge_trusted": gaugeTrusted, "gauge_notes": gaugeNotes,
+				"gauge_trusted":      gaugeTrusted, "gauge_notes": gaugeNotes,
 				"info_links": rawJSON(infoLinks),
 			},
 		})
@@ -771,9 +769,9 @@ func (h *ReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 	reach.IsOfficial = (reachAuthorID == nil)
 
 	// Ensure arrays serialize as [] not null when empty
-	reach.Rapids   = make([]rapidRow, 0)
-	reach.Access   = make([]accessRow, 0)
-	reach.Gauges   = make([]gaugeSnippet, 0)
+	reach.Rapids = make([]rapidRow, 0)
+	reach.Access = make([]accessRow, 0)
+	reach.Gauges = make([]gaugeSnippet, 0)
 
 	// Primary gauge goes in Gauges[0] if it exists
 	if reach.Gauge.ID != nil {
@@ -1001,41 +999,41 @@ func (h *ReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 // ---- Response types ---------------------------------------------------------
 
 type reachDetail struct {
-	ID                      string          `json:"id"`
-	Slug                    string          `json:"slug"`
-	Name                    string          `json:"name"`
-	RiverName               *string         `json:"river_name"`
-	CommonName              *string         `json:"common_name"`
-	PutInName               *string         `json:"put_in_name"`
-	TakeOutName             *string         `json:"take_out_name"`
-	PutInLat                *float64        `json:"put_in_lat"`
-	PutInLng                *float64        `json:"put_in_lng"`
-	TakeOutLat              *float64        `json:"take_out_lat"`
-	TakeOutLng              *float64        `json:"take_out_lng"`
-	Region                  *string         `json:"region"`
-	ClassMin                *float64        `json:"class_min"`
-	ClassMax                *float64        `json:"class_max"`
-	ClassHardest            *float64        `json:"class_hardest"`
-	Character               *string         `json:"character"`
-	LengthMi                *float64        `json:"length_mi"`
-	GradientFPM             *float64        `json:"gradient_fpm"`
-	Description             *string         `json:"description"`
-	DescriptionSource       *string         `json:"description_source"`
-	DescriptionConfidence   *int            `json:"description_ai_confidence"`
-	DescriptionVerified     bool            `json:"description_verified"`
-	AWReachID               *string         `json:"aw_reach_id"`
-	WatershedName           *string         `json:"watershed_name"`
-	PermitRequired          bool            `json:"permit_required"`
-	MultiDayDays            int             `json:"multi_day_days"`
-	Centerline              rawGeometry     `json:"centerline"`
-	CenterlineSource        string          `json:"centerline_source"`
-	Gauge                   gaugeSnippet    `json:"gauge"`
-	Gauges                  []gaugeSnippet  `json:"gauges"`
-	Rapids                  []rapidRow      `json:"rapids"`
-	Access                  []accessRow     `json:"access"`
-	Related                 []relatedReach  `json:"related"`
-	IsOfficial              bool            `json:"is_official"`
-	AuthorHandle            *string         `json:"author_handle"`
+	ID                    string         `json:"id"`
+	Slug                  string         `json:"slug"`
+	Name                  string         `json:"name"`
+	RiverName             *string        `json:"river_name"`
+	CommonName            *string        `json:"common_name"`
+	PutInName             *string        `json:"put_in_name"`
+	TakeOutName           *string        `json:"take_out_name"`
+	PutInLat              *float64       `json:"put_in_lat"`
+	PutInLng              *float64       `json:"put_in_lng"`
+	TakeOutLat            *float64       `json:"take_out_lat"`
+	TakeOutLng            *float64       `json:"take_out_lng"`
+	Region                *string        `json:"region"`
+	ClassMin              *float64       `json:"class_min"`
+	ClassMax              *float64       `json:"class_max"`
+	ClassHardest          *float64       `json:"class_hardest"`
+	Character             *string        `json:"character"`
+	LengthMi              *float64       `json:"length_mi"`
+	GradientFPM           *float64       `json:"gradient_fpm"`
+	Description           *string        `json:"description"`
+	DescriptionSource     *string        `json:"description_source"`
+	DescriptionConfidence *int           `json:"description_ai_confidence"`
+	DescriptionVerified   bool           `json:"description_verified"`
+	AWReachID             *string        `json:"aw_reach_id"`
+	WatershedName         *string        `json:"watershed_name"`
+	PermitRequired        bool           `json:"permit_required"`
+	MultiDayDays          int            `json:"multi_day_days"`
+	Centerline            rawGeometry    `json:"centerline"`
+	CenterlineSource      string         `json:"centerline_source"`
+	Gauge                 gaugeSnippet   `json:"gauge"`
+	Gauges                []gaugeSnippet `json:"gauges"`
+	Rapids                []rapidRow     `json:"rapids"`
+	Access                []accessRow    `json:"access"`
+	Related               []relatedReach `json:"related"`
+	IsOfficial            bool           `json:"is_official"`
+	AuthorHandle          *string        `json:"author_handle"`
 }
 
 type gaugeSnippet struct {
@@ -1168,139 +1166,6 @@ func (h *ReachHandler) GetFlowRanges(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, fb)
 }
 
-// SetFlowRanges handles PUT /api/v1/reaches/{slug}/flow-ranges (admin/curated).
-// Accepts FlowBands shape: {base_label, base_color, thresholds:[{value,label,color}]}.
-func (h *ReachHandler) SetFlowRanges(w http.ResponseWriter, r *http.Request) {
-	slug := chi.URLParam(r, "slug")
-
-	var body FlowBands
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		errorResponse(w, http.StatusBadRequest, "invalid JSON")
-		return
-	}
-	if msg := validateFlowBands(body); msg != "" {
-		errorResponse(w, http.StatusBadRequest, msg)
-		return
-	}
-
-	var reachID string
-	var gaugeID *string
-	err := h.db.QueryRow(r.Context(),
-		`SELECT id, primary_gauge_id::text FROM reaches WHERE slug = $1`, slug,
-	).Scan(&reachID, &gaugeID)
-	if err != nil {
-		errorResponse(w, http.StatusNotFound, "reach not found")
-		return
-	}
-
-	ctx := r.Context()
-	_, err = h.db.Exec(ctx,
-		`UPDATE reaches SET base_label = $1, base_color = $2 WHERE id = $3`,
-		body.BaseLabel, body.BaseColor, reachID,
-	)
-	if err != nil {
-		errorResponse(w, http.StatusInternalServerError, "update failed: "+err.Error())
-		return
-	}
-
-	_, _ = h.db.Exec(ctx, `DELETE FROM flow_ranges WHERE reach_id = $1`, reachID)
-	for _, t := range body.Thresholds {
-		_, err := h.db.Exec(ctx, `
-			INSERT INTO flow_ranges (gauge_id, reach_id, label, value, color, data_source, verified)
-			VALUES ($1, $2, $3, $4, $5, 'manual', true)
-		`, gaugeID, reachID, t.Label, t.Value, t.Color)
-		if err != nil {
-			errorResponse(w, http.StatusInternalServerError, "insert failed: "+err.Error())
-			return
-		}
-	}
-
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// FetchCenterline handles POST /api/v1/reaches/{slug}/fetch-centerline
-//
-// Queries the Overpass API for the longest river/stream waterway within a
-// ±0.05° bounding box around a centre point, stores it as the reach's
-// centerline, and returns the GeoJSON geometry.
-//
-// Centre point resolution order:
-//  1. lat/lng query params (explicit override)
-//  2. reach put_in / take_out midpoint
-//  3. access point coordinates (put_in / take_out types from reach_access)
-//  4. primary gauge location
-func (h *ReachHandler) FetchCenterline(w http.ResponseWriter, r *http.Request) {
-	slug := chi.URLParam(r, "slug")
-
-	// Parse optional explicit lat/lng override from query string.
-	var explicitLat, explicitLng *float64
-	if latStr := r.URL.Query().Get("lat"); latStr != "" {
-		if v, err := strconv.ParseFloat(latStr, 64); err == nil {
-			explicitLat = &v
-		}
-	}
-	if lngStr := r.URL.Query().Get("lng"); lngStr != "" {
-		if v, err := strconv.ParseFloat(lngStr, 64); err == nil {
-			explicitLng = &v
-		}
-	}
-
-	lineJSON, reachID, fetchErr := h.fetchCenterlineCore(r.Context(), slug, explicitLng, explicitLat)
-	if fetchErr != nil {
-		switch fetchErr.code {
-		case fetchErrNotFound:
-			errorResponse(w, http.StatusNotFound, fetchErr.msg)
-		case fetchErrNoLocation:
-			errorResponse(w, http.StatusBadRequest, fetchErr.msg)
-		case fetchErrOSM:
-			errorResponse(w, http.StatusBadGateway, fetchErr.msg)
-		default:
-			errorResponse(w, http.StatusInternalServerError, fetchErr.msg)
-		}
-		return
-	}
-
-	// Return the computed length alongside the geometry so the frontend can
-	// display it immediately without a separate reach reload.
-	var lengthMi *float64
-	_ = h.db.QueryRow(r.Context(), `SELECT length_mi FROM reaches WHERE id = $1`, reachID).Scan(&lengthMi)
-
-	// Rewarm the map cache so the reach appears on the map immediately.
-	go h.WarmCache(context.Background())
-	// Best-effort: snap put-in/take-out to NHD ComIDs and store them.
-	// Only writes if put_in_comid is currently NULL; never overwrites NLDI data.
-	go func() { _ = kmlimport.SnapReachComIDs(context.Background(), h.db, slug) }()
-
-	jsonResponse(w, http.StatusOK, map[string]any{
-		"centerline": rawGeometry([]byte(lineJSON)),
-		"length_mi":  lengthMi,
-	})
-}
-
-// BackgroundFetchCenterline triggers an automatic centerline fetch for the given
-// slug in a background goroutine. Retries up to 4 times with exponential backoff
-// (0s, 2m, 10m, 30m) to handle transient Overpass API rate limits (HTTP 403/429).
-// Safe to call from an HTTP handler or after a KML import without blocking.
-func (h *ReachHandler) BackgroundFetchCenterline(slug string) {
-	go func() {
-		delays := []time.Duration{0, 2 * time.Minute, 10 * time.Minute, 30 * time.Minute}
-		for i, delay := range delays {
-			if delay > 0 {
-				time.Sleep(delay)
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-			_, _, err := h.fetchCenterlineCore(ctx, slug, nil, nil)
-			cancel()
-			if err == nil {
-				go h.WarmCache(context.Background())
-				return
-			}
-			log.Printf("centerline auto-fetch [%s] attempt %d/%d: %s", slug, i+1, len(delays), err.msg)
-		}
-		log.Printf("centerline auto-fetch [%s]: all attempts failed, manual re-fetch required", slug)
-	}()
-}
-
 // fetchErrCode classifies errors from fetchCenterlineCore for HTTP response mapping.
 type fetchErrCode int
 
@@ -1323,13 +1188,13 @@ func (e *fetchCenterlineError) Error() string { return e.msg }
 // Returns the stored GeoJSON line string and the reach's internal ID on success.
 func (h *ReachHandler) fetchCenterlineCore(ctx context.Context, slug string, explicitLng, explicitLat *float64) (lineJSON, reachID string, ferr *fetchCenterlineError) {
 	var (
-		putInLng     *float64
-		putInLat     *float64
-		takeOutLng   *float64
-		takeOutLat   *float64
-		gaugeLng     *float64
-		gaugeLat     *float64
-		riverName    *string
+		putInLng   *float64
+		putInLat   *float64
+		takeOutLng *float64
+		takeOutLat *float64
+		gaugeLng   *float64
+		gaugeLat   *float64
+		riverName  *string
 	)
 	err := h.db.QueryRow(ctx, `
 		SELECT r.id,
@@ -1525,38 +1390,6 @@ func (h *ReachHandler) fetchCenterlineCore(ctx context.Context, slug string, exp
 	}()
 
 	return lineJSON, reachID, nil
-}
-
-// Delete handles DELETE /api/v1/reaches/{slug}
-// Permanently removes the reach and all cascading child records (rapids,
-// access points, conditions, embeddings, reach_relationships).
-// Gauges linked to this reach have their reach_id set to NULL by FK cascade.
-func (h *ReachHandler) Delete(w http.ResponseWriter, r *http.Request) {
-	slug := chi.URLParam(r, "slug")
-	tag, err := h.db.Exec(r.Context(), `DELETE FROM reaches WHERE slug = $1`, slug)
-	if err != nil {
-		errorResponse(w, http.StatusInternalServerError, "delete failed")
-		return
-	}
-	if tag.RowsAffected() == 0 {
-		errorResponse(w, http.StatusNotFound, "reach not found")
-		return
-	}
-	// Rewarm map cache so the deleted reach disappears from the map immediately.
-	go h.WarmCache(context.Background())
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// ClearCenterline handles DELETE /api/v1/reaches/{slug}/centerline
-// Nulls out the stored centerline so it can be re-fetched from OSM.
-func (h *ReachHandler) ClearCenterline(w http.ResponseWriter, r *http.Request) {
-	slug := chi.URLParam(r, "slug")
-	_, err := h.db.Exec(r.Context(), `UPDATE reaches SET centerline = NULL WHERE slug = $1`, slug)
-	if err != nil {
-		errorResponse(w, http.StatusInternalServerError, "failed to clear centerline")
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
 }
 
 // --- Helpers ----------------------------------------------------------------

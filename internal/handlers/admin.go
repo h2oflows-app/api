@@ -10,11 +10,11 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
+	gauge "github.com/h2oflow/h2oflow/apps/api/internal/gaugecore"
 	"github.com/h2oflow/h2oflow/apps/api/internal/kmlimport"
 	"github.com/h2oflow/h2oflow/apps/api/internal/nldi"
-	gauge "github.com/h2oflow/h2oflow/apps/api/internal/gaugecore"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // adminPoller is the subset of poller.Poller used by admin gauge actions.
@@ -278,116 +278,6 @@ func riverMetaFromGNIS(ctx context.Context, gnisID string) (stateAbbr, basin, hu
 	return
 }
 
-// AutoAssignRiver upserts a river by GNIS ID (preferred) or name, then links
-// the reach to it. Called after the admin fetches the river name from NLDI.
-// POST /api/v1/admin/reaches/{slug}/auto-river
-func (h *AdminHandler) AutoAssignRiver(w http.ResponseWriter, r *http.Request) {
-	reachSlug := chi.URLParam(r, "slug")
-	var body struct {
-		RiverName string `json:"river_name"`
-		GnisID    string `json:"gnis_id"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		errorResponse(w, http.StatusBadRequest, "invalid JSON")
-		return
-	}
-	body.RiverName = strings.TrimSpace(body.RiverName)
-	body.GnisID = strings.TrimSpace(body.GnisID)
-	if body.RiverName == "" {
-		errorResponse(w, http.StatusBadRequest, "river_name is required")
-		return
-	}
-
-	ctx := r.Context()
-	riverSlug := kmlimport.Slugify(body.RiverName)
-
-	var riverID, riverName, riverSlugOut string
-	var riverGnisID *string
-
-	// Look up existing river: prefer gnis_id match, fall back to name match.
-	// This avoids INSERT conflicts when the river already exists under either key.
-	if body.GnisID != "" {
-		_ = h.db.QueryRow(ctx,
-			`SELECT id, name, slug, gnis_id FROM rivers WHERE gnis_id = $1`,
-			body.GnisID).Scan(&riverID, &riverName, &riverSlugOut, &riverGnisID)
-	}
-	if riverID == "" {
-		_ = h.db.QueryRow(ctx,
-			`SELECT id, name, slug, gnis_id FROM rivers WHERE lower(name) = lower($1) LIMIT 1`,
-			body.RiverName).Scan(&riverID, &riverName, &riverSlugOut, &riverGnisID)
-	}
-	// When no GNIS ID from client, try a name-based NHD lookup as fallback.
-	// A unique match (exactly 1 result) is safe to use; ambiguous = skip.
-	if body.GnisID == "" {
-		if results, err := nldi.NHDLookupByName(ctx, body.RiverName); err == nil && len(results) == 1 {
-			body.GnisID = results[0].GnisID
-		}
-	}
-
-	if riverID != "" {
-		// River exists — backfill gnis_id and geo metadata when missing.
-		gnisForMeta := body.GnisID
-		if gnisForMeta == "" && riverGnisID != nil {
-			gnisForMeta = *riverGnisID
-		}
-		if gnisForMeta != "" {
-			var existingState *string
-			_ = h.db.QueryRow(ctx, `SELECT state_abbr FROM rivers WHERE id = $1`, riverID).Scan(&existingState)
-			if existingState == nil {
-				stateAbbr, basin, huc8 := riverMetaFromGNIS(ctx, gnisForMeta)
-				_, _ = h.db.Exec(ctx, `
-					UPDATE rivers SET
-						gnis_id    = COALESCE(gnis_id,    $2),
-						state_abbr = COALESCE(state_abbr, NULLIF($3,'')),
-						basin      = COALESCE(basin,      NULLIF($4,'')),
-						huc8       = COALESCE(huc8,       NULLIF($5,''))
-					WHERE id = $1
-				`, riverID, gnisForMeta, stateAbbr, basin, huc8)
-				if riverGnisID == nil {
-					g := gnisForMeta
-					riverGnisID = &g
-				}
-			} else if riverGnisID == nil && body.GnisID != "" {
-				_, _ = h.db.Exec(ctx, `UPDATE rivers SET gnis_id = $1 WHERE id = $2`, body.GnisID, riverID)
-				g := body.GnisID
-				riverGnisID = &g
-			}
-		}
-	} else {
-		// Insert a new river, auto-filling geo meta from GNIS ID when present.
-		var gnisParam interface{}
-		var stateAbbr, basin, huc8 string
-		if body.GnisID != "" {
-			gnisParam = body.GnisID
-			stateAbbr, basin, huc8 = riverMetaFromGNIS(ctx, body.GnisID)
-		}
-		if err := h.db.QueryRow(ctx, `
-			INSERT INTO rivers (slug, name, gnis_id, state_abbr, basin, huc8)
-			VALUES ($1, $2, $3, NULLIF($4,''), NULLIF($5,''), NULLIF($6,''))
-			RETURNING id, name, slug, gnis_id
-		`, riverSlug, body.RiverName, gnisParam, stateAbbr, basin, huc8).Scan(&riverID, &riverName, &riverSlugOut, &riverGnisID); err != nil {
-			errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("insert river: %v", err))
-			return
-		}
-	}
-
-	// Link the reach and keep river_name text in sync.
-	_, err := h.db.Exec(ctx, `
-		UPDATE reaches SET river_id = $1, river_name = $2 WHERE slug = $3
-	`, riverID, riverName, reachSlug)
-	if err != nil {
-		errorResponse(w, http.StatusInternalServerError, "assign river failed")
-		return
-	}
-
-	jsonResponse(w, http.StatusOK, map[string]any{
-		"river_id":   riverID,
-		"river_name": riverName,
-		"river_slug": riverSlugOut,
-		"gnis_id":    riverGnisID,
-	})
-}
-
 // ListUnassignedReaches returns reaches that have no river association.
 // GET /api/v1/admin/reaches/unassigned
 func (h *AdminHandler) ListUnassignedReaches(w http.ResponseWriter, r *http.Request) {
@@ -461,11 +351,11 @@ func (h *AdminHandler) GroupedReaches(w http.ResponseWriter, r *http.Request) {
 		HasCenterline bool    `json:"has_centerline"`
 	}
 	type RiverGroup struct {
-		RiverID   string     `json:"river_id"`
-		RiverSlug string     `json:"river_slug"`
-		RiverName string     `json:"river_name"`
-		RiverBasin string    `json:"river_basin"`
-		Reaches   []ReachRow `json:"reaches"`
+		RiverID    string     `json:"river_id"`
+		RiverSlug  string     `json:"river_slug"`
+		RiverName  string     `json:"river_name"`
+		RiverBasin string     `json:"river_basin"`
+		Reaches    []ReachRow `json:"reaches"`
 	}
 	type StateGroup struct {
 		State  string       `json:"state"`
@@ -506,11 +396,11 @@ func (h *AdminHandler) GroupedReaches(w http.ResponseWriter, r *http.Request) {
 			ri = len(groups[si].Rivers)
 			riverIndex[state][riverID] = ri
 			groups[si].Rivers = append(groups[si].Rivers, RiverGroup{
-				RiverID:   riverID,
-				RiverSlug: riverSlug,
-				RiverName: riverName,
+				RiverID:    riverID,
+				RiverSlug:  riverSlug,
+				RiverName:  riverName,
 				RiverBasin: riverBasin,
-				Reaches:   []ReachRow{},
+				Reaches:    []ReachRow{},
 			})
 		}
 
@@ -521,37 +411,15 @@ func (h *AdminHandler) GroupedReaches(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, groups)
 }
 
-// AssignReachToRiver sets reaches.river_id.
-// PUT /api/v1/admin/reaches/{slug}/river
-func (h *AdminHandler) AssignReachToRiver(w http.ResponseWriter, r *http.Request) {
-	reachSlug := chi.URLParam(r, "slug")
-	var body struct {
-		RiverID *string `json:"river_id"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		errorResponse(w, http.StatusBadRequest, "invalid JSON")
-		return
-	}
-
-	_, err := h.db.Exec(r.Context(), `
-		UPDATE reaches SET river_id = $2 WHERE slug = $1
-	`, reachSlug, body.RiverID)
-	if err != nil {
-		errorResponse(w, http.StatusInternalServerError, "update failed")
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
 // ── User Roles ────────────────────────────────────────────────────────────────
 
 type userRoleRow struct {
-	ID        string  `json:"id"`
-	UserID    string  `json:"user_id"`
-	Email     *string `json:"email"`
-	Role      string  `json:"role"`
-	RiverID   *string `json:"river_id"`
-	RiverName *string `json:"river_name"`
+	ID        string    `json:"id"`
+	UserID    string    `json:"user_id"`
+	Email     *string   `json:"email"`
+	Role      string    `json:"role"`
+	RiverID   *string   `json:"river_id"`
+	RiverName *string   `json:"river_name"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -820,13 +688,13 @@ func (h *AdminHandler) ReorderReachesForRiver(w http.ResponseWriter, r *http.Req
 //	offset=      pagination offset
 func (h *AdminHandler) ListAdminGauges(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	search     := q.Get("q")
-	source     := q.Get("source")
+	search := q.Get("q")
+	source := q.Get("source")
 	pollHealth := q.Get("poll_health")
-	status     := q.Get("status")
-	orphaned   := q.Get("orphaned") == "true"
+	status := q.Get("status")
+	orphaned := q.Get("orphaned") == "true"
 	showRetired := q.Get("show_retired") == "true"
-	limit  := clampInt(parseIntOr(q.Get("limit"), 50), 1, 200)
+	limit := clampInt(parseIntOr(q.Get("limit"), 50), 1, 200)
 	offset := max(parseIntOr(q.Get("offset"), 0), 0)
 
 	args := []any{}
@@ -912,24 +780,24 @@ func (h *AdminHandler) ListAdminGauges(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type gaugeRow struct {
-		ID                    string     `json:"id"`
-		ExternalID            string     `json:"external_id"`
-		Source                string     `json:"source"`
-		Name                  string     `json:"name"`
-		Status                string     `json:"status"`
-		AutoManaged           bool       `json:"auto_managed"`
-		PollHealth            string     `json:"poll_health"`
-		ConsecutiveFailures   int        `json:"consecutive_poll_failures"`
-		LastReadingAt         *time.Time `json:"last_reading_at"`
-		LastPollSuccessAt     *time.Time `json:"last_poll_success_at"`
-		LastPollFailureAt     *time.Time `json:"last_poll_failure_at"`
-		SeasonalStartMMDD     *string    `json:"seasonal_start_mmdd"`
-		SeasonalEndMMDD       *string    `json:"seasonal_end_mmdd"`
-		StateAbbr                *string    `json:"state_abbr"`
-		LastReadingCfs           *float64   `json:"last_reading_cfs"`
-		PollIntervalSeconds      *int       `json:"poll_interval_seconds"`
-		DetectedIntervalSeconds  *int       `json:"detected_interval_seconds"`
-		ReachCount               int        `json:"reach_count"`
+		ID                      string     `json:"id"`
+		ExternalID              string     `json:"external_id"`
+		Source                  string     `json:"source"`
+		Name                    string     `json:"name"`
+		Status                  string     `json:"status"`
+		AutoManaged             bool       `json:"auto_managed"`
+		PollHealth              string     `json:"poll_health"`
+		ConsecutiveFailures     int        `json:"consecutive_poll_failures"`
+		LastReadingAt           *time.Time `json:"last_reading_at"`
+		LastPollSuccessAt       *time.Time `json:"last_poll_success_at"`
+		LastPollFailureAt       *time.Time `json:"last_poll_failure_at"`
+		SeasonalStartMMDD       *string    `json:"seasonal_start_mmdd"`
+		SeasonalEndMMDD         *string    `json:"seasonal_end_mmdd"`
+		StateAbbr               *string    `json:"state_abbr"`
+		LastReadingCfs          *float64   `json:"last_reading_cfs"`
+		PollIntervalSeconds     *int       `json:"poll_interval_seconds"`
+		DetectedIntervalSeconds *int       `json:"detected_interval_seconds"`
+		ReachCount              int        `json:"reach_count"`
 	}
 
 	gauges := make([]gaugeRow, 0)
