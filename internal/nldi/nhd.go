@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // FirstCoord returns the first [lng, lat] pair from a GeoJSON geometry, or nil
@@ -120,14 +121,38 @@ func normalizeRiverName(s string) string {
 	return strings.TrimSpace(s)
 }
 
-// nhdFetchByWhere executes a single NHD layer-6 query with the given WHERE
-// clause and returns de-duplicated NHDNameResults.
+// NamesMatch reports whether two river names refer to the same waterway by
+// comparing their normalized forms (suffixes stripped from both sides).
+// Used to verify spatial-fallback results against the DB river name.
+func NamesMatch(a, b string) bool {
+	return normalizeRiverName(a) == normalizeRiverName(b)
+}
+
+// nhdFetchByWhere executes an NHD layer-6 query with retry (3 attempts, 2s backoff).
 func nhdFetchByWhere(ctx context.Context, where string) ([]NHDNameResult, error) {
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt*2) * time.Second)
+		}
+		results, err := nhdFetchByWhereOnce(ctx, where)
+		if err == nil {
+			return results, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+// nhdFetchByWhereOnce executes a single NHD layer-6 query with the given WHERE
+// clause and returns de-duplicated NHDNameResults.
+func nhdFetchByWhereOnce(ctx context.Context, where string) ([]NHDNameResult, error) {
 	params := url.Values{
 		"where":             {where},
 		"outFields":         {"gnis_id,gnis_name,reachcode"},
 		"returnGeometry":    {"false"},
-		"resultRecordCount": {"50"},
+		"resultRecordCount": {"200"},
 		"f":                 {"json"},
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, nhdArcGISURL+"?"+params.Encode(), nil)
@@ -190,16 +215,18 @@ func nhdFetchByWhere(ctx context.Context, where string) ([]NHDNameResult, error)
 func NHDLookupByName(ctx context.Context, name string) ([]NHDNameResult, error) {
 	escaped := strings.ReplaceAll(name, "'", "''")
 
-	// Pass 1: exact match.
-	exact, err := nhdFetchByWhere(ctx, fmt.Sprintf("UPPER(gnis_name) = UPPER('%s')", escaped))
-	if err != nil {
-		return nil, err
-	}
-	if len(exact) > 0 {
+	// Pass 1: exact match. Fast when it hits, but a zero-result UPPER() equality
+	// scan can hang server-side (e.g. "Cache La Poudre", which NHD stores as
+	// "Cache la Poudre River"). Bound it tightly and treat any error as "no
+	// exact match" — the LIKE fallback below covers it.
+	exactCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	exact, err := nhdFetchByWhereOnce(exactCtx, fmt.Sprintf("UPPER(gnis_name) = UPPER('%s')", escaped))
+	cancel()
+	if err == nil && len(exact) > 0 {
 		return exact, nil
 	}
 
-	// Pass 2: LIKE fallback, then normalize-filter.
+	// Pass 2: LIKE fallback (retried for transient failures), then normalize-filter.
 	candidates, err := nhdFetchByWhere(ctx, fmt.Sprintf("UPPER(gnis_name) LIKE UPPER('%%%s%%')", escaped))
 	if err != nil {
 		return nil, err

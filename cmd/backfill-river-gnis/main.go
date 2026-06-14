@@ -38,7 +38,9 @@ import (
 type riverRow struct {
 	ID     string
 	Name   string
-	GnisID string // non-empty only for pass-2 rows
+	GnisID string  // non-empty only for pass-2 rows
+	Lat    float64 // centroid of associated reaches (0 if none)
+	Lng    float64
 }
 
 func main() {
@@ -113,6 +115,28 @@ func runPass1Loop(ctx context.Context, pool *pgxpool.Pool, todo []riverRow, dryR
 	for i, r := range todo {
 		time.Sleep(time.Duration(rateMs) * time.Millisecond)
 		matches, err := nldi.NHDLookupByName(ctx, r.Name)
+
+		// Spatial fallback: when name lookup errors, returns 0 results, or is
+		// ambiguous (>1), and we have a reach centroid, query NHD by point.
+		if r.Lat != 0 && r.Lng != 0 && (err != nil || len(matches) != 1) {
+			sName, sGNIS, sErr := nldi.NHDStreamNameAt(ctx, r.Lat, r.Lng)
+			if sErr == nil && sGNIS != "" && nldi.NamesMatch(sName, r.Name) {
+				resolved := nldi.NHDNameResult{GnisID: sGNIS, Name: sName}
+				if len(matches) > 1 {
+					// Prefer the ambiguous candidate whose GNIS matches spatial result.
+					for _, m := range matches {
+						if m.GnisID == sGNIS {
+							resolved = m
+							break
+						}
+					}
+				}
+				matches = []nldi.NHDNameResult{resolved}
+				err = nil
+				log.Printf("    ↳ spatial fallback → gnis=%s %q", sGNIS, sName)
+			}
+		}
+
 		results = append(results, result{river: r, matches: matches, lookupErr: err})
 		status := fmt.Sprintf("%d matches", len(matches))
 		if err != nil {
@@ -241,7 +265,28 @@ func runPass2Loop(ctx context.Context, pool *pgxpool.Pool, todo []riverRow, dryR
 }
 
 func loadNullGNIS(ctx context.Context, pool *pgxpool.Pool) ([]riverRow, error) {
-	rows, err := pool.Query(ctx, `SELECT id, name FROM rivers WHERE gnis_id IS NULL ORDER BY name`)
+	// Pick one real anchor point per river (a curated reach start_point or user
+	// reach put_in) to disambiguate name collisions (e.g. two "Clear Creek"
+	// rivers) via a point-based NHD lookup. A single actual anchor is always on
+	// the river's flowline; an averaged centroid can land off-line on a winding
+	// reach and miss NHD's proximity buffer.
+	rows, err := pool.Query(ctx, `
+		WITH pts AS (
+			SELECT river_id, start_point::geometry AS geom
+			FROM   reaches      WHERE river_id IS NOT NULL AND start_point IS NOT NULL
+			UNION ALL
+			SELECT river_id, put_in::geometry      AS geom
+			FROM   user_reaches WHERE river_id IS NOT NULL AND put_in      IS NOT NULL
+		)
+		SELECT DISTINCT ON (r.id)
+		       r.id, r.name,
+		       COALESCE(ST_Y(p.geom), 0) AS lat,
+		       COALESCE(ST_X(p.geom), 0) AS lng
+		FROM   rivers r
+		LEFT   JOIN pts p ON p.river_id = r.id
+		WHERE  r.gnis_id IS NULL
+		ORDER  BY r.id, ST_Y(p.geom)
+	`)
 	if err != nil {
 		return nil, err
 	}
@@ -249,7 +294,7 @@ func loadNullGNIS(ctx context.Context, pool *pgxpool.Pool) ([]riverRow, error) {
 	var out []riverRow
 	for rows.Next() {
 		var r riverRow
-		if err := rows.Scan(&r.ID, &r.Name); err != nil {
+		if err := rows.Scan(&r.ID, &r.Name, &r.Lat, &r.Lng); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
