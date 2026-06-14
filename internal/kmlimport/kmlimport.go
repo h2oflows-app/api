@@ -42,9 +42,9 @@ import (
 
 // Result summarises what was imported.
 type Result struct {
-	MapName string                   `json:"map_name"`
-	Reaches map[string]*ReachResult  `json:"reaches"` // keyed by reach slug
-	Log     []string                 `json:"log"`
+	MapName string                  `json:"map_name"`
+	Reaches map[string]*ReachResult `json:"reaches"` // keyed by reach slug
+	Log     []string                `json:"log"`
 }
 
 // ReachResult holds per-reach counts.
@@ -177,8 +177,8 @@ func ParseKMLBytes(data []byte) (*KMLDoc, error) {
 	flattenFolders = func(folders []xmlFolder) []KMLFolder {
 		var out []KMLFolder
 		for _, xf := range folders {
-			hasPins     := len(xf.Placemarks) > 0
-			hasSubs     := len(xf.SubFolders) > 0
+			hasPins := len(xf.Placemarks) > 0
+			hasSubs := len(xf.SubFolders) > 0
 
 			if hasPins {
 				// This folder has placemarks — treat it as a reach folder.
@@ -584,7 +584,6 @@ func (res *Result) reachStats(slug, name string) *ReachResult {
 	return res.Reaches[slug]
 }
 
-
 // updateReachNaming derives put_in_name / take_out_name from the imported access
 // points and updates name = "<put_in_name> to <take_out_name>" on the reach.
 // Uses extreme longitudes as a proxy for upstream/downstream ordering when no
@@ -648,19 +647,18 @@ func slugify(s string) string {
 	return strings.TrimRight(b.String(), "-")
 }
 
-
 // ── Flow range parsing ────────────────────────────────────────────────────────
 
 // flowRangeKeywords maps KML placemark names to flow_ranges label values.
 var flowRangeKeywords = map[string]string{
 	"below":     "low",
-	"too_low":   "low",     // legacy alias
+	"too_low":   "low", // legacy alias
 	"low":       "low",
 	"running":   "running",
 	"med":       "running", // legacy alias
 	"high":      "high",
-	"above":     "high",    // legacy alias
-	"very_high": "high",    // legacy alias
+	"above":     "high", // legacy alias
+	"very_high": "high", // legacy alias
 }
 
 // parseFlowRangePM detects a flow-range metadata placemark and returns the
@@ -1329,6 +1327,79 @@ func SyncCenterlineNLDIByComID(ctx context.Context, pool *pgxpool.Pool, slug str
 	return err
 }
 
+// SyncCenterlineNLDIForUserReach mirrors syncCenterlineNLDI but targets an
+// owner-scoped user_reaches row (runs unification — admin now authors
+// h2oflows-owned user_reaches). user_reaches uses up_comid/down_comid in place
+// of reaches' start_comid/end_comid.
+func SyncCenterlineNLDIForUserReach(ctx context.Context, pool *pgxpool.Pool, ownerID, slug string,
+	putInLon, putInLat, takeOutLon, takeOutLat float64, dryRun bool) error {
+	line, err := fetchNLDIRiverLine(ctx, putInLon, putInLat, takeOutLon, takeOutLat)
+	if err != nil {
+		return fmt.Errorf("nldi fetch: %w", err)
+	}
+	if dryRun {
+		return nil
+	}
+	return updateUserReachCenterline(ctx, pool, ownerID, slug, line,
+		putInLon, putInLat, takeOutLon, takeOutLat)
+}
+
+// SyncCenterlineNLDIByComIDForUserReach mirrors SyncCenterlineNLDIByComID for an
+// owner-scoped user_reaches row.
+func SyncCenterlineNLDIByComIDForUserReach(ctx context.Context, pool *pgxpool.Pool, ownerID, slug string,
+	upComID, downComID string,
+	putInLon, putInLat, takeOutLon, takeOutLat float64, dryRun bool) error {
+	line, err := fetchNLDIRiverLineByComID(ctx, upComID, downComID)
+	if err != nil {
+		return fmt.Errorf("nldi fetch: %w", err)
+	}
+	if dryRun {
+		return nil
+	}
+	return updateUserReachCenterline(ctx, pool, ownerID, slug, line,
+		putInLon, putInLat, takeOutLon, takeOutLat)
+}
+
+// updateUserReachCenterline writes the trimmed centerline, source, ComIDs and
+// length onto the owner's user_reaches row.
+func updateUserReachCenterline(ctx context.Context, pool *pgxpool.Pool, ownerID, slug string,
+	line *nldiCenterline, putInLon, putInLat, takeOutLon, takeOutLat float64) error {
+	_, err := pool.Exec(ctx, `
+		UPDATE user_reaches
+		SET    centerline = (
+			SELECT ST_LineSubstring(
+				line,
+				ST_LineLocatePoint(line, put_pt),
+				ST_LineLocatePoint(line, take_pt)
+			)::geography
+			FROM (
+				SELECT
+					ST_GeomFromGeoJSON($2)                                     AS line,
+					ST_ClosestPoint(ST_GeomFromGeoJSON($2),
+					    ST_SetSRID(ST_MakePoint($3, $4), 4326))                AS put_pt,
+					ST_ClosestPoint(ST_GeomFromGeoJSON($2),
+					    ST_SetSRID(ST_MakePoint($5, $6), 4326))                AS take_pt
+			) sub
+		),
+		       centerline_source = 'nldi',
+		       up_comid          = $7,
+		       down_comid        = $8,
+		       length_mi = ROUND((
+		           ST_Length((
+		               SELECT ST_LineSubstring(
+		                   ST_GeomFromGeoJSON($2),
+		                   ST_LineLocatePoint(ST_GeomFromGeoJSON($2), ST_ClosestPoint(ST_GeomFromGeoJSON($2), ST_SetSRID(ST_MakePoint($3,$4),4326))),
+		                   ST_LineLocatePoint(ST_GeomFromGeoJSON($2), ST_ClosestPoint(ST_GeomFromGeoJSON($2), ST_SetSRID(ST_MakePoint($5,$6),4326)))
+		               )::geography
+		           )) / 1609.344
+		       )::numeric, 2),
+		       updated_at = NOW()
+		WHERE slug = $1 AND owner_id = $9
+	`, slug, line.GeoJSON, putInLon, putInLat, takeOutLon, takeOutLat,
+		line.PutInComID, line.TakeOutComID, ownerID)
+	return err
+}
+
 func sq(x float64) float64 { return x * x }
 
 // ── User-reach KML import ─────────────────────────────────────────────────────
@@ -1340,8 +1411,8 @@ type pinTarget struct {
 	id  string
 }
 
-func curatedTarget(reachID string) pinTarget    { return pinTarget{"reach_id", reachID} }
-func userReachTarget(urID string) pinTarget     { return pinTarget{"user_reach_id", urID} }
+func curatedTarget(reachID string) pinTarget { return pinTarget{"reach_id", reachID} }
+func userReachTarget(urID string) pinTarget  { return pinTarget{"user_reach_id", urID} }
 
 // ImportForUserReach imports all pin placemarks from doc into a single user reach.
 // No folder structure is required — all point placemarks across all folders are

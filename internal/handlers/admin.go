@@ -10,11 +10,11 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
+	gauge "github.com/h2oflow/h2oflow/apps/api/internal/gaugecore"
 	"github.com/h2oflow/h2oflow/apps/api/internal/kmlimport"
 	"github.com/h2oflow/h2oflow/apps/api/internal/nldi"
-	gauge "github.com/h2oflow/h2oflow/apps/api/internal/gaugecore"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // adminPoller is the subset of poller.Poller used by admin gauge actions.
@@ -371,10 +371,18 @@ func (h *AdminHandler) AutoAssignRiver(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Link the reach and keep river_name text in sync.
+	// Link the run and keep river_name text in sync. Runs unification: admin
+	// manages the h2oflows-owned user_reaches twin.
+	var ownerID string
+	if err := h.db.QueryRow(ctx,
+		`SELECT owner_id FROM user_profiles WHERE LOWER(handle) = 'h2oflows' LIMIT 1`,
+	).Scan(&ownerID); err != nil {
+		errorResponse(w, http.StatusInternalServerError, "resolve h2oflows owner: "+err.Error())
+		return
+	}
 	_, err := h.db.Exec(ctx, `
-		UPDATE reaches SET river_id = $1, river_name = $2 WHERE slug = $3
-	`, riverID, riverName, reachSlug)
+		UPDATE user_reaches SET river_id = $1, river_name = $2, updated_at = NOW() WHERE slug = $3 AND owner_id = $4
+	`, riverID, riverName, reachSlug, ownerID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "assign river failed")
 		return
@@ -461,11 +469,11 @@ func (h *AdminHandler) GroupedReaches(w http.ResponseWriter, r *http.Request) {
 		HasCenterline bool    `json:"has_centerline"`
 	}
 	type RiverGroup struct {
-		RiverID   string     `json:"river_id"`
-		RiverSlug string     `json:"river_slug"`
-		RiverName string     `json:"river_name"`
-		RiverBasin string    `json:"river_basin"`
-		Reaches   []ReachRow `json:"reaches"`
+		RiverID    string     `json:"river_id"`
+		RiverSlug  string     `json:"river_slug"`
+		RiverName  string     `json:"river_name"`
+		RiverBasin string     `json:"river_basin"`
+		Reaches    []ReachRow `json:"reaches"`
 	}
 	type StateGroup struct {
 		State  string       `json:"state"`
@@ -506,11 +514,11 @@ func (h *AdminHandler) GroupedReaches(w http.ResponseWriter, r *http.Request) {
 			ri = len(groups[si].Rivers)
 			riverIndex[state][riverID] = ri
 			groups[si].Rivers = append(groups[si].Rivers, RiverGroup{
-				RiverID:   riverID,
-				RiverSlug: riverSlug,
-				RiverName: riverName,
+				RiverID:    riverID,
+				RiverSlug:  riverSlug,
+				RiverName:  riverName,
 				RiverBasin: riverBasin,
-				Reaches:   []ReachRow{},
+				Reaches:    []ReachRow{},
 			})
 		}
 
@@ -533,6 +541,11 @@ func (h *AdminHandler) AssignReachToRiver(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// NOTE: the Rivers-management admin tab (GetRiver/GroupedReaches reads +
+	// this assign + ReorderReachesForRiver) still operates on legacy `reaches`.
+	// It flips to user_reaches as a unit in Phase 4 (read collapse) to avoid
+	// intra-tab read/write drift. The RunAuthor/RunEditor authoring flow is
+	// already fully on user_reaches.
 	_, err := h.db.Exec(r.Context(), `
 		UPDATE reaches SET river_id = $2 WHERE slug = $1
 	`, reachSlug, body.RiverID)
@@ -546,12 +559,12 @@ func (h *AdminHandler) AssignReachToRiver(w http.ResponseWriter, r *http.Request
 // ── User Roles ────────────────────────────────────────────────────────────────
 
 type userRoleRow struct {
-	ID        string  `json:"id"`
-	UserID    string  `json:"user_id"`
-	Email     *string `json:"email"`
-	Role      string  `json:"role"`
-	RiverID   *string `json:"river_id"`
-	RiverName *string `json:"river_name"`
+	ID        string    `json:"id"`
+	UserID    string    `json:"user_id"`
+	Email     *string   `json:"email"`
+	Role      string    `json:"role"`
+	RiverID   *string   `json:"river_id"`
+	RiverName *string   `json:"river_name"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -731,6 +744,8 @@ func (h *AdminHandler) ReorderReachesForRiver(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	// NOTE: part of the legacy Rivers-management tab — flips to user_reaches as a
+	// unit in Phase 4 (see AssignReachToRiver).
 	// Detect flow direction: sum (end_lng - start_lng) across reaches with both points.
 	var lngDelta float64
 	_ = h.db.QueryRow(r.Context(), `
@@ -820,13 +835,13 @@ func (h *AdminHandler) ReorderReachesForRiver(w http.ResponseWriter, r *http.Req
 //	offset=      pagination offset
 func (h *AdminHandler) ListAdminGauges(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	search     := q.Get("q")
-	source     := q.Get("source")
+	search := q.Get("q")
+	source := q.Get("source")
 	pollHealth := q.Get("poll_health")
-	status     := q.Get("status")
-	orphaned   := q.Get("orphaned") == "true"
+	status := q.Get("status")
+	orphaned := q.Get("orphaned") == "true"
 	showRetired := q.Get("show_retired") == "true"
-	limit  := clampInt(parseIntOr(q.Get("limit"), 50), 1, 200)
+	limit := clampInt(parseIntOr(q.Get("limit"), 50), 1, 200)
 	offset := max(parseIntOr(q.Get("offset"), 0), 0)
 
 	args := []any{}
@@ -912,24 +927,24 @@ func (h *AdminHandler) ListAdminGauges(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type gaugeRow struct {
-		ID                    string     `json:"id"`
-		ExternalID            string     `json:"external_id"`
-		Source                string     `json:"source"`
-		Name                  string     `json:"name"`
-		Status                string     `json:"status"`
-		AutoManaged           bool       `json:"auto_managed"`
-		PollHealth            string     `json:"poll_health"`
-		ConsecutiveFailures   int        `json:"consecutive_poll_failures"`
-		LastReadingAt         *time.Time `json:"last_reading_at"`
-		LastPollSuccessAt     *time.Time `json:"last_poll_success_at"`
-		LastPollFailureAt     *time.Time `json:"last_poll_failure_at"`
-		SeasonalStartMMDD     *string    `json:"seasonal_start_mmdd"`
-		SeasonalEndMMDD       *string    `json:"seasonal_end_mmdd"`
-		StateAbbr                *string    `json:"state_abbr"`
-		LastReadingCfs           *float64   `json:"last_reading_cfs"`
-		PollIntervalSeconds      *int       `json:"poll_interval_seconds"`
-		DetectedIntervalSeconds  *int       `json:"detected_interval_seconds"`
-		ReachCount               int        `json:"reach_count"`
+		ID                      string     `json:"id"`
+		ExternalID              string     `json:"external_id"`
+		Source                  string     `json:"source"`
+		Name                    string     `json:"name"`
+		Status                  string     `json:"status"`
+		AutoManaged             bool       `json:"auto_managed"`
+		PollHealth              string     `json:"poll_health"`
+		ConsecutiveFailures     int        `json:"consecutive_poll_failures"`
+		LastReadingAt           *time.Time `json:"last_reading_at"`
+		LastPollSuccessAt       *time.Time `json:"last_poll_success_at"`
+		LastPollFailureAt       *time.Time `json:"last_poll_failure_at"`
+		SeasonalStartMMDD       *string    `json:"seasonal_start_mmdd"`
+		SeasonalEndMMDD         *string    `json:"seasonal_end_mmdd"`
+		StateAbbr               *string    `json:"state_abbr"`
+		LastReadingCfs          *float64   `json:"last_reading_cfs"`
+		PollIntervalSeconds     *int       `json:"poll_interval_seconds"`
+		DetectedIntervalSeconds *int       `json:"detected_interval_seconds"`
+		ReachCount              int        `json:"reach_count"`
 	}
 
 	gauges := make([]gaugeRow, 0)

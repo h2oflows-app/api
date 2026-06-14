@@ -10,10 +10,10 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/h2oflow/h2oflow/apps/api/internal/ai"
 	"github.com/h2oflow/h2oflow/apps/api/internal/kmlimport"
 	"github.com/h2oflow/h2oflow/apps/api/internal/nldi"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"log"
 )
 
@@ -39,6 +39,20 @@ func (h *NLDIHandler) warmCache() {
 	if h.cacheWarmer != nil {
 		go h.cacheWarmer()
 	}
+}
+
+// h2oflowsOwnerID resolves the owner_id for the h2oflows account. Admin
+// authoring writes/reads h2oflows-owned user_reaches (runs unification); the
+// legacy /admin/reaches API surface is preserved while the storage moves.
+func (h *NLDIHandler) h2oflowsOwnerID(ctx context.Context) (string, error) {
+	var ownerID string
+	err := h.db.QueryRow(ctx,
+		`SELECT owner_id FROM user_profiles WHERE LOWER(handle) = 'h2oflows' LIMIT 1`,
+	).Scan(&ownerID)
+	if err != nil {
+		return "", fmt.Errorf("resolve h2oflows owner: %w", err)
+	}
+	return ownerID, nil
 }
 
 // WatershedExplorer handles GET /api/v1/admin/nldi/watershed
@@ -119,15 +133,15 @@ func (h *NLDIHandler) WatershedExplorer(w http.ResponseWriter, r *http.Request) 
 // coords are not required here — they come from KML import later, at which
 // point the NLDI centerline is trimmed and stored.
 type createReachRequest struct {
-	Slug           string   `json:"slug"`        // optional — auto-derived from river+name if blank
+	Slug           string   `json:"slug"` // optional — auto-derived from river+name if blank
 	Name           string   `json:"name"`
 	CommonName     string   `json:"common_name"`
 	RiverName      string   `json:"river_name"`
-	UpComID        string   `json:"up_comid"`    // reach-start ComID — required
-	DownComID      string   `json:"down_comid"`  // reach-end ComID — required
-	StartLat       *float64 `json:"start_lat"`   // clicked lat for reach start
+	UpComID        string   `json:"up_comid"`   // reach-start ComID — required
+	DownComID      string   `json:"down_comid"` // reach-end ComID — required
+	StartLat       *float64 `json:"start_lat"`  // clicked lat for reach start
 	StartLng       *float64 `json:"start_lng"`
-	EndLat         *float64 `json:"end_lat"`     // clicked lat for reach end
+	EndLat         *float64 `json:"end_lat"` // clicked lat for reach end
 	EndLng         *float64 `json:"end_lng"`
 	ClassMin       *float64 `json:"class_min"`
 	ClassMax       *float64 `json:"class_max"`
@@ -160,48 +174,72 @@ func (h *NLDIHandler) CreateReach(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// user_reaches requires put_in/take_out (reaches allowed NULL). The NLDI
+	// editor always clicks start/end to derive the ComIDs, so coords are present.
+	if req.StartLat == nil || req.StartLng == nil {
+		errorResponse(w, http.StatusBadRequest, "start_lat/start_lng required")
+		return
+	}
+	if req.EndLat == nil || req.EndLng == nil {
+		errorResponse(w, http.StatusBadRequest, "end_lat/end_lng required")
+		return
+	}
+
 	slug := strings.TrimSpace(req.Slug)
 	if slug == "" {
 		slug = buildSlug(req.RiverName, req.Name)
 	}
 	ctx := r.Context()
 
+	ownerID, err := h.h2oflowsOwnerID(ctx)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
 	days := req.MultiDayDays
 	if days < 1 {
 		days = 1
 	}
 
-	var startPoint, endPoint interface{}
-	if req.StartLat != nil && req.StartLng != nil {
-		startPoint = fmt.Sprintf("SRID=4326;POINT(%f %f)", *req.StartLng, *req.StartLat)
-	}
-	if req.EndLat != nil && req.EndLng != nil {
-		endPoint = fmt.Sprintf("SRID=4326;POINT(%f %f)", *req.EndLng, *req.EndLat)
+	// Name mapping mirrors mig 110's curated→twin copy: short common_name →
+	// user_reaches.name (NOT NULL), full name → long_name.
+	shortName := strings.TrimSpace(req.CommonName)
+	if shortName == "" {
+		shortName = req.Name
 	}
 
+	// Resolve/create the river first so the run is linked at insert time.
+	// resolveOrCreateRiver populates state_abbr/basin/huc8 (user_reaches derives
+	// its state from the joined river, not a per-run column).
+	var riverID *string
+	if rn := strings.TrimSpace(req.RiverName); rn != "" {
+		if rid := resolveOrCreateRiver(ctx, h.db, rn, "", *req.StartLat, *req.StartLng); rid != "" {
+			riverID = &rid
+		}
+	}
+
+	// h2oflows runs are forced public (mig 109).
 	var reachID string
-	err := h.db.QueryRow(ctx, `
-		INSERT INTO reaches (
-			slug, name, common_name, river_name,
-			class_min, class_max,
-			start_comid, end_comid, anchor_comid,
-			start_point, end_point,
-			centerline_source,
-			description, permit_required, multi_day_days
+	err = h.db.QueryRow(ctx, `
+		INSERT INTO user_reaches (
+			owner_id, slug, name, long_name, river_id, river_name,
+			put_in, take_out, up_comid, down_comid, note,
+			class_min, class_max, permit_required, multi_day_days,
+			centerline_source, visibility, published_at
 		) VALUES (
-			$1, $2, NULLIF($3,''), NULLIF($4,''),
-			$5, $6,
-			$7, $8, $7,
-			$9::geography, $10::geography,
-			'nldi',
-			NULLIF($11,''), $12, $13
+			$1, $2, $3, $4, $5, NULLIF($6,''),
+			ST_SetSRID(ST_MakePoint($7, $8), 4326)::geography,
+			ST_SetSRID(ST_MakePoint($9, $10), 4326)::geography,
+			NULLIF($11,''), NULLIF($12,''), NULLIF($13,''),
+			$14, $15, $16, $17,
+			'nldi', 'public'::run_visibility, NOW()
 		)
 		RETURNING id
-	`, slug, req.Name, req.CommonName, req.RiverName,
-		req.ClassMin, req.ClassMax,
-		req.UpComID, req.DownComID,
-		startPoint, endPoint,
-		req.Description, req.PermitRequired, days,
+	`, ownerID, slug, shortName, req.Name, riverID, req.RiverName,
+		*req.StartLng, *req.StartLat, *req.EndLng, *req.EndLat,
+		req.UpComID, req.DownComID, req.Description,
+		req.ClassMin, req.ClassMax, req.PermitRequired, days,
 	).Scan(&reachID)
 	if err != nil {
 		if strings.Contains(err.Error(), "duplicate key") || strings.Contains(err.Error(), "unique constraint") {
@@ -210,28 +248,6 @@ func (h *NLDIHandler) CreateReach(w http.ResponseWriter, r *http.Request) {
 		}
 		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("create reach: %v", err))
 		return
-	}
-
-	// Auto-populate state from put-in coordinates.
-	if req.StartLat != nil && req.StartLng != nil {
-		fillReachState(ctx, h.db, slug, *req.StartLat, *req.StartLng)
-	}
-
-	// Auto-upsert a river record when river_name is provided, then link the reach.
-	// Uses the name+basin unique index to avoid duplicates. Best-effort — a
-	// failure here is silent so the reach is still usable.
-	if req.RiverName != "" {
-		riverSlug := kmlimport.Slugify(req.RiverName)
-		var riverID string
-		_ = h.db.QueryRow(ctx, `
-			INSERT INTO rivers (slug, name)
-			VALUES ($1, $2)
-			ON CONFLICT (lower(name), COALESCE(lower(basin), '')) DO UPDATE SET name = EXCLUDED.name
-			RETURNING id
-		`, riverSlug, req.RiverName).Scan(&riverID)
-		if riverID != "" {
-			h.db.Exec(ctx, `UPDATE reaches SET river_id = $1 WHERE id = $2`, riverID, reachID)
-		}
 	}
 
 	jsonResponse(w, http.StatusCreated, map[string]any{
@@ -263,22 +279,27 @@ func (h *NLDIHandler) GetAdminReach(w http.ResponseWriter, r *http.Request) {
 		primaryGaugeExtID               *string
 		primaryGaugeName                *string
 	)
-	err := h.db.QueryRow(ctx, `
+	ownerID, err := h.h2oflowsOwnerID(ctx)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	err = h.db.QueryRow(ctx, `
 		SELECT
-			r.id, r.name, COALESCE(r.river_name,''), COALESCE(r.common_name,''),
+			r.id, COALESCE(r.long_name, r.name), COALESCE(r.river_name,''), r.name,
 			r.river_id,
-			r.class_min, r.class_max, r.description,
+			r.class_min, r.class_max, r.note,
 			COALESCE(r.permit_required, false), COALESCE(r.multi_day_days, 1),
-			r.start_comid, r.end_comid, r.anchor_comid,
-			ST_X(r.start_point::geometry),  ST_Y(r.start_point::geometry),
-			ST_X(r.end_point::geometry),    ST_Y(r.end_point::geometry),
+			r.up_comid, r.down_comid, r.up_comid,
+			ST_X(r.put_in::geometry),   ST_Y(r.put_in::geometry),
+			ST_X(r.take_out::geometry), ST_Y(r.take_out::geometry),
 			r.primary_gauge_id::text,
 			g.external_id,
 			g.name
-		FROM reaches r
+		FROM user_reaches r
 		LEFT JOIN gauges g ON g.id = r.primary_gauge_id
-		WHERE r.slug = $1
-	`, slug).Scan(
+		WHERE r.slug = $1 AND r.owner_id = $2
+	`, slug, ownerID).Scan(
 		&id, &name, &riverName, &commonName,
 		&riverID,
 		&classMin, &classMax, &description,
@@ -305,25 +326,25 @@ func (h *NLDIHandler) GetAdminReach(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonResponse(w, http.StatusOK, map[string]any{
-		"id":                       id,
-		"slug":                     slug,
-		"name":                     name,
-		"river_name":               riverName,
-		"river_id":                 riverID,
-		"common_name":              commonName,
-		"class_min":                classMin,
-		"class_max":                classMax,
-		"description":              description,
-		"permit_required":          permitRequired,
-		"multi_day_days":           multiDayDays,
-		"start_comid":              putInComID,
-		"end_comid":                takeOutComID,
-		"anchor_comid":             anchorComID,
-		"put_in":                   putIn,
-		"take_out":                 takeOut,
-		"primary_gauge_id":         primaryGaugeID,
+		"id":                        id,
+		"slug":                      slug,
+		"name":                      name,
+		"river_name":                riverName,
+		"river_id":                  riverID,
+		"common_name":               commonName,
+		"class_min":                 classMin,
+		"class_max":                 classMax,
+		"description":               description,
+		"permit_required":           permitRequired,
+		"multi_day_days":            multiDayDays,
+		"start_comid":               putInComID,
+		"end_comid":                 takeOutComID,
+		"anchor_comid":              anchorComID,
+		"put_in":                    putIn,
+		"take_out":                  takeOut,
+		"primary_gauge_id":          primaryGaugeID,
 		"primary_gauge_external_id": primaryGaugeExtID,
-		"primary_gauge_name":       primaryGaugeName,
+		"primary_gauge_name":        primaryGaugeName,
 	})
 }
 
@@ -362,8 +383,8 @@ func (h *NLDIHandler) NearbyGauges(w http.ResponseWriter, r *http.Request) {
 		features []gaugeFeature
 		err      error
 	}
-	dbCh   := make(chan result, 1)
-	dwrCh  := make(chan result, 1)
+	dbCh := make(chan result, 1)
+	dwrCh := make(chan result, 1)
 	nldiCh := make(chan result, 1)
 
 	// 1. Local DB — all seeded gauges within radius.
@@ -524,8 +545,14 @@ func (h *NLDIHandler) SetPrimaryGauge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ownerID, err := h.h2oflowsOwnerID(ctx)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
 	var gaugeID string
-	err := h.db.QueryRow(ctx, `
+	err = h.db.QueryRow(ctx, `
 		INSERT INTO gauges (external_id, source, name, location)
 		VALUES ($1, $2, $3, ST_SetSRID(ST_MakePoint($4, $5), 4326))
 		ON CONFLICT (external_id, source) DO UPDATE
@@ -538,27 +565,15 @@ func (h *NLDIHandler) SetPrimaryGauge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Mirror the native /me run gauge-set path: set primary_gauge_id directly
+	// (the poller polls user_reaches.primary_gauge_id). gauges.reach_id and
+	// gauge_reach_associations are legacy reaches plumbing, not used for runs.
 	var reachID string
 	if err := h.db.QueryRow(ctx, `
-		UPDATE reaches SET primary_gauge_id = $1 WHERE slug = $2 RETURNING id
-	`, gaugeID, slug).Scan(&reachID); err != nil {
+		UPDATE user_reaches SET primary_gauge_id = $1, custom_gauge_id = NULL, updated_at = NOW()
+		WHERE slug = $2 AND owner_id = $3 RETURNING id
+	`, gaugeID, slug, ownerID).Scan(&reachID); err != nil {
 		errorResponse(w, http.StatusNotFound, "reach not found")
-		return
-	}
-
-	if _, err := h.db.Exec(ctx,
-		`UPDATE gauges SET reach_id = $1 WHERE id = $2 AND reach_id IS NULL`,
-		reachID, gaugeID); err != nil {
-		log.Printf("nldi: set gauges.reach_id for %s: %v", gaugeID, err)
-	}
-
-	if _, err := h.db.Exec(ctx, `
-		INSERT INTO gauge_reach_associations (gauge_id, reach_id, relationship)
-		VALUES ($1, $2, 'primary')
-		ON CONFLICT (gauge_id, reach_id) DO NOTHING
-	`, gaugeID, reachID); err != nil {
-		errorResponse(w, http.StatusInternalServerError,
-			fmt.Sprintf("link gauge association: %v", err))
 		return
 	}
 
@@ -586,10 +601,16 @@ func (h *NLDIHandler) SetPrimaryGauge(w http.ResponseWriter, r *http.Request) {
 func (h *NLDIHandler) ClearPrimaryGauge(w http.ResponseWriter, r *http.Request) {
 	slug := chi.URLParam(r, "slug")
 	ctx := r.Context()
+	ownerID, err := h.h2oflowsOwnerID(ctx)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	var reachID string
 	if err := h.db.QueryRow(ctx,
-		`UPDATE reaches SET primary_gauge_id = NULL WHERE slug = $1 RETURNING id`,
-		slug,
+		`UPDATE user_reaches SET primary_gauge_id = NULL, custom_gauge_id = NULL, updated_at = NOW()
+		 WHERE slug = $1 AND owner_id = $2 RETURNING id`,
+		slug, ownerID,
 	).Scan(&reachID); err != nil {
 		errorResponse(w, http.StatusNotFound, "reach not found")
 		return
@@ -630,27 +651,38 @@ func (h *NLDIHandler) UpdateReachMeta(w http.ResponseWriter, r *http.Request) {
 	if s := strings.TrimSpace(req.NewSlug); s != "" {
 		newSlug = s
 	}
+	// user_reaches: name = short (common_name, fallback full), long_name = full.
+	shortName := strings.TrimSpace(req.CommonName)
+	if shortName == "" {
+		shortName = req.Name
+	}
 	ctx := r.Context()
+	ownerID, err := h.h2oflowsOwnerID(ctx)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	tag, err := h.db.Exec(ctx, `
-		UPDATE reaches SET
+		UPDATE user_reaches SET
 			slug            = $1,
 			name            = $2,
-			common_name     = NULLIF($3, ''),
+			long_name       = $3,
 			river_name      = CASE
-			                    WHEN $10::uuid IS NOT NULL
-			                    THEN (SELECT name FROM rivers WHERE id = $10::uuid)
+			                    WHEN $11::uuid IS NOT NULL
+			                    THEN (SELECT name FROM rivers WHERE id = $11::uuid)
 			                    ELSE NULLIF($4, '')
 			                  END,
 			class_min       = $5,
 			class_max       = $6,
 			permit_required = $7,
 			multi_day_days  = $8,
-			river_id        = $10
-		WHERE slug = $9
-	`, newSlug, req.Name, req.CommonName, req.RiverName,
+			river_id        = $11,
+			updated_at      = NOW()
+		WHERE slug = $9 AND owner_id = $10
+	`, newSlug, shortName, req.Name, req.RiverName,
 		req.ClassMin, req.ClassMax,
 		req.PermitRequired, days,
-		slug, req.RiverID,
+		slug, ownerID, req.RiverID,
 	)
 	if err != nil {
 		if strings.Contains(err.Error(), "duplicate key") || strings.Contains(err.Error(), "unique constraint") {
@@ -851,13 +883,18 @@ func (h *NLDIHandler) UpdateReachCenterline(w http.ResponseWriter, r *http.Reque
 
 	ctx := r.Context()
 
+	ownerID, err := h.h2oflowsOwnerID(ctx)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	var reachID string
-	if err := h.db.QueryRow(ctx, `SELECT id FROM reaches WHERE slug = $1`, slug).Scan(&reachID); err != nil {
+	if err := h.db.QueryRow(ctx, `SELECT id FROM user_reaches WHERE slug = $1 AND owner_id = $2`, slug, ownerID).Scan(&reachID); err != nil {
 		errorResponse(w, http.StatusNotFound, fmt.Sprintf("reach %q not found", slug))
 		return
 	}
 
-	if err := kmlimport.SyncCenterlineAt(ctx, h.db, slug, kmlimport.CenterlineNLDI,
+	if err := kmlimport.SyncCenterlineNLDIForUserReach(ctx, h.db, ownerID, slug,
 		req.PutIn.Lng, req.PutIn.Lat, req.TakeOut.Lng, req.TakeOut.Lat, req.DryRun); err != nil {
 		errorResponse(w, http.StatusBadGateway, fmt.Sprintf("nldi centerline: %v", err))
 		return
@@ -868,12 +905,10 @@ func (h *NLDIHandler) UpdateReachCenterline(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	fillReachState(ctx, h.db, slug, req.PutIn.Lat, req.PutIn.Lng)
-
 	var lengthMi *float64
 	var putInComID, takeOutComID *string
 	_ = h.db.QueryRow(ctx, `
-		SELECT length_mi, start_comid, end_comid FROM reaches WHERE id = $1
+		SELECT length_mi, up_comid, down_comid FROM user_reaches WHERE id = $1
 	`, reachID).Scan(&lengthMi, &putInComID, &takeOutComID)
 
 	jsonResponse(w, http.StatusOK, map[string]any{
@@ -921,44 +956,49 @@ func (h *NLDIHandler) UpdateReachCenterlineByComID(w http.ResponseWriter, r *htt
 
 	ctx := r.Context()
 
+	ownerID, err := h.h2oflowsOwnerID(ctx)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	var (
 		reachID                                    string
 		dbStartLng, dbStartLat, dbEndLng, dbEndLat *float64
 	)
-	err := h.db.QueryRow(ctx, `
+	err = h.db.QueryRow(ctx, `
 		SELECT id,
-		       ST_X(start_point::geometry), ST_Y(start_point::geometry),
-		       ST_X(end_point::geometry),   ST_Y(end_point::geometry)
-		FROM reaches WHERE slug = $1
-	`, slug).Scan(&reachID, &dbStartLng, &dbStartLat, &dbEndLng, &dbEndLat)
+		       ST_X(put_in::geometry),  ST_Y(put_in::geometry),
+		       ST_X(take_out::geometry), ST_Y(take_out::geometry)
+		FROM user_reaches WHERE slug = $1 AND owner_id = $2
+	`, slug, ownerID).Scan(&reachID, &dbStartLng, &dbStartLat, &dbEndLng, &dbEndLat)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, fmt.Sprintf("reach %q not found", slug))
 		return
 	}
 
-	// Prefer body-supplied coordinates; fall back to stored start/end point.
+	// Prefer body-supplied coordinates; fall back to stored put_in/take_out.
 	startLng := first(req.StartLng, dbStartLng)
 	startLat := first(req.StartLat, dbStartLat)
-	endLng   := first(req.EndLng,   dbEndLng)
-	endLat   := first(req.EndLat,   dbEndLat)
+	endLng := first(req.EndLng, dbEndLng)
+	endLat := first(req.EndLat, dbEndLat)
 
 	if startLat == nil || startLng == nil || endLat == nil || endLng == nil {
-		errorResponse(w, http.StatusBadRequest, "start and end coordinates are required (provide start_lat/start_lng/end_lat/end_lng or set start_point/end_point on the reach first)")
+		errorResponse(w, http.StatusBadRequest, "start and end coordinates are required (provide start_lat/start_lng/end_lat/end_lng or set put_in/take_out on the reach first)")
 		return
 	}
 
-	// Persist body-supplied coordinates to start_point/end_point if provided.
+	// Persist body-supplied coordinates to put_in/take_out if provided.
 	if req.StartLat != nil && req.StartLng != nil && req.EndLat != nil && req.EndLng != nil && !req.DryRun {
 		_, _ = h.db.Exec(ctx, `
-			UPDATE reaches
-			SET start_point = ST_SetSRID(ST_MakePoint($2, $3), 4326)::geography,
-			    end_point   = ST_SetSRID(ST_MakePoint($4, $5), 4326)::geography
+			UPDATE user_reaches
+			SET put_in   = ST_SetSRID(ST_MakePoint($2, $3), 4326)::geography,
+			    take_out = ST_SetSRID(ST_MakePoint($4, $5), 4326)::geography,
+			    updated_at = NOW()
 			WHERE id = $1
 		`, reachID, *req.StartLng, *req.StartLat, *req.EndLng, *req.EndLat)
-		fillReachState(ctx, h.db, slug, *req.StartLat, *req.StartLng)
 	}
 
-	if err := kmlimport.SyncCenterlineNLDIByComID(ctx, h.db, slug,
+	if err := kmlimport.SyncCenterlineNLDIByComIDForUserReach(ctx, h.db, ownerID, slug,
 		req.UpComID, req.DownComID,
 		*startLng, *startLat, *endLng, *endLat,
 		req.DryRun); err != nil {
@@ -974,7 +1014,7 @@ func (h *NLDIHandler) UpdateReachCenterlineByComID(w http.ResponseWriter, r *htt
 	var lengthMi *float64
 	var startComID, endComID *string
 	_ = h.db.QueryRow(ctx, `
-		SELECT length_mi, start_comid, end_comid FROM reaches WHERE id = $1
+		SELECT length_mi, up_comid, down_comid FROM user_reaches WHERE id = $1
 	`, reachID).Scan(&lengthMi, &startComID, &endComID)
 
 	h.warmCache()
@@ -1008,12 +1048,17 @@ func (h *NLDIHandler) GenerateDescription(w http.ResponseWriter, r *http.Request
 	slug := chi.URLParam(r, "slug")
 	ctx := r.Context()
 
+	ownerID, err := h.h2oflowsOwnerID(ctx)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	var name, riverName, commonName string
 	var classMin, classMax *float64
 	if err := h.db.QueryRow(ctx, `
-		SELECT name, COALESCE(river_name,''), COALESCE(common_name,''), class_min, class_max
-		FROM reaches WHERE slug = $1
-	`, slug).Scan(&name, &riverName, &commonName, &classMin, &classMax); err != nil {
+		SELECT COALESCE(long_name, name), COALESCE(river_name,''), name, class_min, class_max
+		FROM user_reaches WHERE slug = $1 AND owner_id = $2
+	`, slug, ownerID).Scan(&name, &riverName, &commonName, &classMin, &classMax); err != nil {
 		errorResponse(w, http.StatusNotFound, fmt.Sprintf("reach %q not found", slug))
 		return
 	}
@@ -1042,11 +1087,16 @@ func (h *NLDIHandler) PatchReach(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	ownerID, err := h.h2oflowsOwnerID(ctx)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	var setClauses []string
 	var args []any
 	n := 1
 	if req.Description != nil {
-		setClauses = append(setClauses, fmt.Sprintf("description = $%d", n))
+		setClauses = append(setClauses, fmt.Sprintf("note = $%d", n))
 		args = append(args, req.Description)
 		n++
 	}
@@ -1059,9 +1109,10 @@ func (h *NLDIHandler) PatchReach(w http.ResponseWriter, r *http.Request) {
 		jsonResponse(w, http.StatusOK, map[string]any{"slug": slug})
 		return
 	}
-	args = append(args, slug)
+	setClauses = append(setClauses, "updated_at = NOW()")
+	args = append(args, slug, ownerID)
 	tag, err := h.db.Exec(ctx,
-		fmt.Sprintf("UPDATE reaches SET %s WHERE slug = $%d", strings.Join(setClauses, ", "), n),
+		fmt.Sprintf("UPDATE user_reaches SET %s WHERE slug = $%d AND owner_id = $%d", strings.Join(setClauses, ", "), n, n+1),
 		args...,
 	)
 	if err != nil {
@@ -1080,7 +1131,7 @@ func (h *NLDIHandler) PatchReach(w http.ResponseWriter, r *http.Request) {
 // database. When start_lat/start_lng/end_lat/end_lng are provided the line is
 // trimmed via PostGIS ST_LineSubstring to match the exact reach extent.
 func (h *NLDIHandler) PreviewCenterline(w http.ResponseWriter, r *http.Request) {
-	upComID   := r.URL.Query().Get("up_comid")
+	upComID := r.URL.Query().Get("up_comid")
 	downComID := r.URL.Query().Get("down_comid")
 	if upComID == "" || downComID == "" {
 		errorResponse(w, http.StatusBadRequest, "up_comid and down_comid are required")
@@ -1097,8 +1148,8 @@ func (h *NLDIHandler) PreviewCenterline(w http.ResponseWriter, r *http.Request) 
 	if q.Get("start_lat") != "" && q.Get("end_lat") != "" {
 		startLat, e1 := strconv.ParseFloat(q.Get("start_lat"), 64)
 		startLng, e2 := strconv.ParseFloat(q.Get("start_lng"), 64)
-		endLat,   e3 := strconv.ParseFloat(q.Get("end_lat"),   64)
-		endLng,   e4 := strconv.ParseFloat(q.Get("end_lng"),   64)
+		endLat, e3 := strconv.ParseFloat(q.Get("end_lat"), 64)
+		endLng, e4 := strconv.ParseFloat(q.Get("end_lng"), 64)
 		if e1 == nil && e2 == nil && e3 == nil && e4 == nil {
 			if trimmed, err := trimLineGeoJSON(r.Context(), h.db, geojson, startLng, startLat, endLng, endLat); err == nil {
 				geojson = trimmed
@@ -1145,22 +1196,6 @@ func buildSlug(riverName, reachName string) string {
 		return r
 	}
 	return r + "-" + n
-}
-
-// fillReachState queries TIGERweb for the US state at the given coordinate and
-// updates reaches.state_abbr. Best-effort — failures are logged and not fatal.
-func fillReachState(ctx context.Context, db *pgxpool.Pool, reachSlug string, lat, lng float64) {
-	stateAbbr, err := nldi.StateAt(ctx, lat, lng)
-	if err != nil {
-		log.Printf("fillReachState %s: %v", reachSlug, err)
-		return
-	}
-	if stateAbbr == "" {
-		return
-	}
-	if _, err := db.Exec(ctx, `UPDATE reaches SET state_abbr = $1 WHERE slug = $2`, stateAbbr, reachSlug); err != nil {
-		log.Printf("fillReachState %s: update: %v", reachSlug, err)
-	}
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
