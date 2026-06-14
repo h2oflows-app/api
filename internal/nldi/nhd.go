@@ -152,7 +152,7 @@ func nhdFetchByWhereOnce(ctx context.Context, where string) ([]NHDNameResult, er
 		"where":             {where},
 		"outFields":         {"gnis_id,gnis_name,reachcode"},
 		"returnGeometry":    {"false"},
-		"resultRecordCount": {"50"},
+		"resultRecordCount": {"200"},
 		"f":                 {"json"},
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, nhdArcGISURL+"?"+params.Encode(), nil)
@@ -215,16 +215,18 @@ func nhdFetchByWhereOnce(ctx context.Context, where string) ([]NHDNameResult, er
 func NHDLookupByName(ctx context.Context, name string) ([]NHDNameResult, error) {
 	escaped := strings.ReplaceAll(name, "'", "''")
 
-	// Pass 1: exact match.
-	exact, err := nhdFetchByWhere(ctx, fmt.Sprintf("UPPER(gnis_name) = UPPER('%s')", escaped))
-	if err != nil {
-		return nil, err
-	}
-	if len(exact) > 0 {
+	// Pass 1: exact match. Fast when it hits, but a zero-result UPPER() equality
+	// scan can hang server-side (e.g. "Cache La Poudre", which NHD stores as
+	// "Cache la Poudre River"). Bound it tightly and treat any error as "no
+	// exact match" — the LIKE fallback below covers it.
+	exactCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	exact, err := nhdFetchByWhereOnce(exactCtx, fmt.Sprintf("UPPER(gnis_name) = UPPER('%s')", escaped))
+	cancel()
+	if err == nil && len(exact) > 0 {
 		return exact, nil
 	}
 
-	// Pass 2: LIKE fallback, then normalize-filter.
+	// Pass 2: LIKE fallback (retried for transient failures), then normalize-filter.
 	candidates, err := nhdFetchByWhere(ctx, fmt.Sprintf("UPPER(gnis_name) LIKE UPPER('%%%s%%')", escaped))
 	if err != nil {
 		return nil, err
