@@ -164,6 +164,7 @@ func (h *ReachHandler) StartCacheRefresh(ctx context.Context, interval time.Dura
 // markers via the gauge search endpoint instead.
 // mapBaseSQL is the CTE + SELECT + FROM + JOINs shared by the Map handler.
 // The WHERE clause is appended dynamically based on query parameters.
+// runs-unify 5a: reads from user_reaches (sentinel-owned twins); reaches retired.
 const mapBaseSQL = `
 	WITH latest_reading AS (
 		SELECT DISTINCT ON (gauge_id)
@@ -174,18 +175,19 @@ const mapBaseSQL = `
 	)
 	SELECT
 		r.id, r.name, r.slug,
-		r.river_name, r.common_name, r.put_in_name, r.take_out_name,
+		r.river_name, r.long_name AS common_name, NULL::text AS put_in_name, NULL::text AS take_out_name,
 		r.class_min,
 		COALESCE(
-			(SELECT MAX(class_rating) FROM rapids WHERE reach_id = r.id AND class_rating IS NOT NULL),
+			(SELECT MAX(class_rating) FROM rapids WHERE user_reach_id = r.id AND class_rating IS NOT NULL),
 			r.class_max
 		) AS class_max,
-		r.character, r.length_mi,
+		NULL::text AS character,
+		ROUND((ST_Length(r.centerline::geography) / 1609.34)::numeric, 2)::float8 AS length_mi,
 		ST_AsGeoJSON(r.centerline::geometry)::json AS centerline,
-		ST_X(r.start_point::geometry)    AS put_in_lng,
-		ST_Y(r.start_point::geometry)    AS put_in_lat,
-		ST_X(r.end_point::geometry)      AS take_out_lng,
-		ST_Y(r.end_point::geometry)      AS take_out_lat,
+		ST_X(r.put_in::geometry)    AS put_in_lng,
+		ST_Y(r.put_in::geometry)    AS put_in_lat,
+		ST_X(r.take_out::geometry)  AS take_out_lng,
+		ST_Y(r.take_out::geometry)  AS take_out_lat,
 		lr.value                         AS current_cfs,
 		g.last_reading_at,
 		fr.band_label                    AS flow_label,
@@ -200,12 +202,12 @@ const mapBaseSQL = `
 			WHEN fr.band_color LIKE 'blue%'   THEN 'flood'
 			ELSE                                   'runnable'
 		END AS flow_status
-	FROM reaches r
+	FROM user_reaches r
 	LEFT JOIN gauges g ON g.id = r.primary_gauge_id
 	LEFT JOIN latest_reading lr ON lr.gauge_id = g.id
 	LEFT JOIN LATERAL (
-		SELECT label, color FROM flow_ranges
-		WHERE reach_id = r.id
+		SELECT label, color FROM user_reach_flow_ranges
+		WHERE user_reach_id = r.id
 		  AND lr.value >= value
 		ORDER BY value DESC
 		LIMIT 1
@@ -215,6 +217,8 @@ const mapBaseSQL = `
 			COALESCE(thresh.label, CASE WHEN lr.value IS NOT NULL THEN r.base_label END) AS band_label,
 			COALESCE(thresh.color, CASE WHEN lr.value IS NOT NULL THEN r.base_color END) AS band_color
 	) fr
+	WHERE r.owner_id = '00000000-0000-0000-0000-000000000001'
+	  AND r.deleted_at IS NULL
 `
 
 // Map handles GET /api/v1/reaches/map
@@ -236,8 +240,8 @@ func (h *ReachHandler) Map(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build WHERE clause + args dynamically.
-	where := "WHERE r.centerline IS NOT NULL"
+	// mapBaseSQL already includes WHERE owner_id/deleted_at; append extra filters with AND.
+	extraWhere := "AND r.centerline IS NOT NULL"
 	args := make([]any, 0, 5)
 	n := 1
 
@@ -247,7 +251,7 @@ func (h *ReachHandler) Map(w http.ResponseWriter, r *http.Request) {
 			errorResponse(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		where += fmt.Sprintf(
+		extraWhere += fmt.Sprintf(
 			" AND ST_Intersects(r.centerline::geometry, ST_MakeEnvelope($%d, $%d, $%d, $%d, 4326))",
 			n, n+1, n+2, n+3,
 		)
@@ -256,11 +260,11 @@ func (h *ReachHandler) Map(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if riverName != "" {
-		where += fmt.Sprintf(" AND r.river_name ILIKE $%d", n)
+		extraWhere += fmt.Sprintf(" AND r.river_name ILIKE $%d", n)
 		args = append(args, riverName)
 	}
 
-	rows, err := h.db.Query(r.Context(), mapBaseSQL+where, args...)
+	rows, err := h.db.Query(r.Context(), mapBaseSQL+extraWhere, args...)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
 		return
@@ -556,6 +560,7 @@ type reachListItem struct {
 
 // queryAllListItems returns a lightweight slice of all reaches with current
 // flow data. No geometry, no gauge notes/links — just what the browse page needs.
+// runs-unify 5a: reads from user_reaches (sentinel-owned twins); reaches retired.
 func (h *ReachHandler) queryAllListItems(ctx context.Context) ([]reachListItem, error) {
 	rows, err := h.db.Query(ctx, `
 		WITH latest_reading AS (
@@ -569,14 +574,14 @@ func (h *ReachHandler) queryAllListItems(ctx context.Context) ([]reachListItem, 
 			r.slug,
 			r.name,
 			COALESCE(r.river_name, rv.name) AS river_name,
-			r.common_name,
-			r.put_in_name,
-			r.take_out_name,
+			r.long_name AS common_name,
+			NULL::text  AS put_in_name,
+			NULL::text  AS take_out_name,
 			rv.basin,
-			r.state_abbr,
+			rv.state_abbr,
 			r.class_min,
 			COALESCE(
-				(SELECT MAX(class_rating) FROM rapids WHERE reach_id = r.id AND class_rating IS NOT NULL),
+				(SELECT MAX(class_rating) FROM rapids WHERE user_reach_id = r.id AND class_rating IS NOT NULL),
 				r.class_max
 			) AS class_max,
 			lr.value           AS current_cfs,
@@ -592,16 +597,16 @@ func (h *ReachHandler) queryAllListItems(ctx context.Context) ([]reachListItem, 
 				WHEN fr.band_color LIKE 'blue%'   THEN 'flood'
 				ELSE                                   'runnable'
 			END AS flow_status,
-			r.author_id,
+			r.owner_id,
 			up.handle AS author_handle
-		FROM reaches r
+		FROM user_reaches r
 		LEFT JOIN rivers rv ON rv.id = r.river_id
 		LEFT JOIN gauges g ON g.id = r.primary_gauge_id
-		LEFT JOIN user_profiles up ON up.owner_id = r.author_id
+		LEFT JOIN user_profiles up ON up.owner_id = r.owner_id
 		LEFT JOIN latest_reading lr ON lr.gauge_id = g.id
 		LEFT JOIN LATERAL (
-			SELECT label, color FROM flow_ranges
-			WHERE reach_id = r.id
+			SELECT label, color FROM user_reach_flow_ranges
+			WHERE user_reach_id = r.id
 			  AND lr.value >= value
 			ORDER BY value DESC
 			LIMIT 1
@@ -611,10 +616,12 @@ func (h *ReachHandler) queryAllListItems(ctx context.Context) ([]reachListItem, 
 				COALESCE(thresh.label, CASE WHEN lr.value IS NOT NULL THEN r.base_label END) AS band_label,
 				COALESCE(thresh.color, CASE WHEN lr.value IS NOT NULL THEN r.base_color END) AS band_color
 		) fr
+		WHERE r.owner_id = '00000000-0000-0000-0000-000000000001'
+		  AND r.deleted_at IS NULL
 		ORDER BY rv.basin NULLS LAST,
 		         r.river_name NULLS LAST,
 		         g.elevation_ft DESC NULLS LAST,
-		         ST_X(r.start_point::geometry) ASC NULLS LAST
+		         ST_X(r.put_in::geometry) ASC NULLS LAST
 	`)
 	if err != nil {
 		return nil, err
@@ -624,7 +631,7 @@ func (h *ReachHandler) queryAllListItems(ctx context.Context) ([]reachListItem, 
 	items := make([]reachListItem, 0)
 	for rows.Next() {
 		var item reachListItem
-		var authorID *string
+		var ownerID string // always sentinel UUID for this query
 		if err := rows.Scan(
 			&item.Slug, &item.Name,
 			&item.RiverName, &item.CommonName, &item.PutInName, &item.TakeOutName,
@@ -633,11 +640,12 @@ func (h *ReachHandler) queryAllListItems(ctx context.Context) ([]reachListItem, 
 			&item.CurrentCFS, &item.FlowLabel, &item.GaugeID,
 			&item.GaugeExternalID, &item.GaugeSource, &item.GaugeName,
 			&item.GaugeStatus, &item.FlowStatus,
-			&authorID, &item.AuthorHandle,
+			&ownerID, &item.AuthorHandle,
 		); err != nil {
 			continue
 		}
-		item.IsOfficial = (authorID == nil)
+		// Sentinel-owned twins are the curated/official records.
+		item.IsOfficial = (ownerID == "00000000-0000-0000-0000-000000000001")
 		items = append(items, item)
 	}
 	return items, rows.Err()
@@ -765,13 +773,17 @@ type waypointRow struct {
 // GetFlowRanges handles GET /api/v1/reaches/{slug}/flow-ranges
 //
 // Returns flow bands for a reach in the new flexible shape (V15).
+// runs-unify 5a: resolves slug via user_reaches (sentinel-owned twins).
 func (h *ReachHandler) GetFlowRanges(w http.ResponseWriter, r *http.Request) {
 	slug := chi.URLParam(r, "slug")
 
+	var reachID string
 	var fb FlowBands
 	err := h.db.QueryRow(r.Context(),
-		`SELECT base_label, base_color FROM reaches WHERE slug = $1`, slug,
-	).Scan(&fb.BaseLabel, &fb.BaseColor)
+		`SELECT id, base_label, base_color FROM user_reaches
+		 WHERE slug = $1 AND owner_id = '00000000-0000-0000-0000-000000000001'
+		   AND deleted_at IS NULL`, slug,
+	).Scan(&reachID, &fb.BaseLabel, &fb.BaseColor)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "reach not found")
 		return
@@ -779,11 +791,10 @@ func (h *ReachHandler) GetFlowRanges(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := h.db.Query(r.Context(), `
 		SELECT fr.value, fr.label, fr.color
-		FROM flow_ranges fr
-		JOIN reaches rch ON rch.id = fr.reach_id
-		WHERE rch.slug = $1
+		FROM user_reach_flow_ranges fr
+		WHERE fr.user_reach_id = $1
 		ORDER BY fr.value ASC
-	`, slug)
+	`, reachID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
 		return
@@ -1203,7 +1214,8 @@ func (h *ReachHandler) Stats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var reaches, rivers, reports int
-	h.db.QueryRow(r.Context(), `SELECT COUNT(*) FROM reaches`).Scan(&reaches)
+	// runs-unify 5a: count sentinel-owned twins in user_reaches (the curated runs).
+	h.db.QueryRow(r.Context(), `SELECT COUNT(*) FROM user_reaches WHERE owner_id = '00000000-0000-0000-0000-000000000001' AND deleted_at IS NULL`).Scan(&reaches)
 	h.db.QueryRow(r.Context(), `SELECT COUNT(*) FROM rivers`).Scan(&rivers)
 	h.db.QueryRow(r.Context(), `SELECT COUNT(*) FROM reports`).Scan(&reports)
 	h.sc.set(reaches, rivers, reports)

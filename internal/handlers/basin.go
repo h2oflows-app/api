@@ -82,6 +82,9 @@ func (h *ReachHandler) BasinMap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// runs-unify 5a: reaches table retired; all curated runs live in user_reaches.
+	// The former "reaches r" UNION branch is removed — sentinel twins cover curated runs.
+	// The NOT EXISTS (SELECT 1 FROM reaches …) dedup guards are also removed.
 	rows, err := h.db.Query(r.Context(), `
 		WITH latest_reading AS (
 			SELECT DISTINCT ON (gauge_id)
@@ -90,52 +93,6 @@ func (h *ReachHandler) BasinMap(w http.ResponseWriter, r *http.Request) {
 			WHERE timestamp > NOW() - INTERVAL '48 hours'
 			ORDER BY gauge_id, timestamp DESC
 		)
-		SELECT
-			r.slug,
-			r.name,
-			COALESCE(r.river_name, rv.name) AS river_name,
-			r.common_name,
-			r.river_order,
-			r.class_min,
-			COALESCE(
-				(SELECT MAX(class_rating) FROM rapids WHERE reach_id = r.id AND class_rating IS NOT NULL),
-				r.class_max
-			) AS class_max,
-			r.anchor_comid,
-			r.start_comid,
-			r.end_comid,
-			ST_AsGeoJSON(r.centerline::geometry) AS centerline,
-			ST_X(r.start_point::geometry) AS start_lng,
-			ST_Y(r.start_point::geometry) AS start_lat,
-			ST_X(r.end_point::geometry)   AS end_lng,
-			ST_Y(r.end_point::geometry)   AS end_lat,
-			CASE
-				WHEN fr.band_color IS NULL        THEN 'unknown'
-				WHEN fr.band_color LIKE 'red%'    THEN 'caution'
-				WHEN fr.band_color LIKE 'blue%'   THEN 'flood'
-				ELSE                                   'runnable'
-			END AS flow_status
-		FROM reaches r
-		LEFT JOIN rivers rv ON rv.id = r.river_id
-		LEFT JOIN gauges g ON g.id = r.primary_gauge_id
-		LEFT JOIN latest_reading lr ON lr.gauge_id = g.id
-		LEFT JOIN LATERAL (
-			SELECT label, color FROM flow_ranges
-			WHERE reach_id = r.id
-			  AND lr.value >= value
-			ORDER BY value DESC
-			LIMIT 1
-		) thresh ON TRUE,
-		LATERAL (
-			SELECT
-				COALESCE(thresh.label, CASE WHEN lr.value IS NOT NULL THEN r.base_label END) AS band_label,
-				COALESCE(thresh.color, CASE WHEN lr.value IS NOT NULL THEN r.base_color END) AS band_color
-		) fr
-		WHERE r.slug = ANY($1)
-		  AND r.centerline IS NOT NULL
-
-		UNION ALL
-
 		-- User_reaches matched by requested slug list (dashboard gauge contexts).
 		SELECT
 			ur.slug,
@@ -177,9 +134,6 @@ func (h *ReachHandler) BasinMap(w http.ResponseWriter, r *http.Request) {
 		WHERE ur.slug = ANY($1)
 		  AND ur.owner_id = $2
 		  AND ur.centerline IS NOT NULL
-		  AND NOT EXISTS (
-		      SELECT 1 FROM reaches WHERE slug = ur.slug AND centerline IS NOT NULL
-		  )
 
 		UNION ALL
 
@@ -235,9 +189,6 @@ func (h *ReachHandler) BasinMap(w http.ResponseWriter, r *http.Request) {
 		      )),
 		      '[^a-z0-9]+', '-', 'gi'
 		  ))) = $3
-		  AND NOT EXISTS (
-		      SELECT 1 FROM reaches WHERE slug = ur3.slug AND centerline IS NOT NULL
-		  )
 		  AND NOT (ur3.slug = ANY($1))
 
 		ORDER BY river_order ASC NULLS LAST,
@@ -357,15 +308,9 @@ func (h *ReachHandler) BasinNetwork(w http.ResponseWriter, r *http.Request) {
 		lengthKm float64
 	}
 
+	// runs-unify 5a: reaches table retired; all curated runs live in user_reaches.
+	// The former "FROM reaches" UNION branch is removed; NOT EXISTS dedup guards removed.
 	rows, err := h.db.Query(r.Context(), `
-		SELECT
-			start_comid,
-			COALESCE(ST_Length(centerline::geography) / 1000.0, 0) AS length_km
-		FROM reaches
-		WHERE slug = ANY($1) AND start_comid IS NOT NULL
-
-		UNION ALL
-
 		SELECT
 			ur2.up_comid AS start_comid,
 			COALESCE(ST_Length(ur2.centerline::geography) / 1000.0, 0) AS length_km
@@ -373,9 +318,6 @@ func (h *ReachHandler) BasinNetwork(w http.ResponseWriter, r *http.Request) {
 		WHERE ur2.slug = ANY($1)
 		  AND ur2.up_comid IS NOT NULL
 		  AND ur2.owner_id = $2
-		  AND NOT EXISTS (
-		      SELECT 1 FROM reaches WHERE slug = ur2.slug AND start_comid IS NOT NULL
-		  )
 
 		UNION ALL
 
@@ -397,9 +339,6 @@ func (h *ReachHandler) BasinNetwork(w http.ResponseWriter, r *http.Request) {
 		      )),
 		      '[^a-z0-9]+', '-', 'gi'
 		  ))) = $3
-		  AND NOT EXISTS (
-		      SELECT 1 FROM reaches WHERE slug = ur3.slug AND start_comid IS NOT NULL
-		  )
 		  AND NOT (ur3.slug = ANY($1))
 	`, slugs, ownerIDNet, basinSlug)
 	if err != nil {
