@@ -132,7 +132,9 @@ func (h *ReachHandler) BasinMap(w http.ResponseWriter, r *http.Request) {
 				COALESCE(thresh_u.color, CASE WHEN lr_u.value IS NOT NULL THEN ur.base_color END) AS band_color
 		) fr_u
 		WHERE ur.slug = ANY($1)
-		  AND ur.owner_id = $2
+		  -- runs-unify 5a: include the h2oflows sentinel twins (former curated
+		  -- reaches branch) alongside the caller's own runs.
+		  AND (ur.owner_id = $2 OR ur.owner_id = '00000000-0000-0000-0000-000000000001')
 		  AND ur.centerline IS NOT NULL
 
 		UNION ALL
@@ -177,7 +179,7 @@ func (h *ReachHandler) BasinMap(w http.ResponseWriter, r *http.Request) {
 				COALESCE(thresh3.label, CASE WHEN lr3.value IS NOT NULL THEN ur3.base_label END) AS band_label,
 				COALESCE(thresh3.color, CASE WHEN lr3.value IS NOT NULL THEN ur3.base_color END) AS band_color
 		) fr3
-		WHERE ur3.owner_id = $2
+		WHERE (ur3.owner_id = $2 OR ur3.owner_id = '00000000-0000-0000-0000-000000000001')
 		  AND ur3.centerline IS NOT NULL
 		  AND trim('-' FROM lower(regexp_replace(
 		      trim(regexp_replace(
@@ -317,7 +319,7 @@ func (h *ReachHandler) BasinNetwork(w http.ResponseWriter, r *http.Request) {
 		FROM user_reaches ur2
 		WHERE ur2.slug = ANY($1)
 		  AND ur2.up_comid IS NOT NULL
-		  AND ur2.owner_id = $2
+		  AND (ur2.owner_id = $2 OR ur2.owner_id = '00000000-0000-0000-0000-000000000001')
 
 		UNION ALL
 
@@ -327,7 +329,7 @@ func (h *ReachHandler) BasinNetwork(w http.ResponseWriter, r *http.Request) {
 		FROM user_reaches ur3
 		LEFT JOIN rivers rv3 ON rv3.id = ur3.river_id
 		LEFT JOIN gauges g3 ON g3.id = ur3.primary_gauge_id
-		WHERE ur3.owner_id = $2
+		WHERE (ur3.owner_id = $2 OR ur3.owner_id = '00000000-0000-0000-0000-000000000001')
 		  AND ur3.up_comid IS NOT NULL
 		  AND trim('-' FROM lower(regexp_replace(
 		      trim(regexp_replace(
