@@ -1092,7 +1092,7 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 	}
 
 	d.IsPrivate = d.Visibility != "public"
-	d.IsOfficial = (d.AuthorHandle == nil)
+	d.IsOfficial = (authorID == h2oflowsSentinelOwnerID)
 	d.IsOwn = callerID != "" && callerID == authorID
 
 	if geojsonBytes != nil {
