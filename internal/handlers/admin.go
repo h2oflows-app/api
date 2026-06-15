@@ -12,7 +12,6 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
 	gauge "github.com/h2oflow/h2oflow/apps/api/internal/gaugecore"
-	"github.com/h2oflow/h2oflow/apps/api/internal/kmlimport"
 	"github.com/h2oflow/h2oflow/apps/api/internal/nldi"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -165,84 +164,6 @@ func (h *AdminHandler) GetRiver(w http.ResponseWriter, r *http.Request) {
 		rv.Reaches = append(rv.Reaches, re)
 	}
 	jsonResponse(w, http.StatusOK, rv)
-}
-
-// CreateRiver creates a new river from a GNIS ID.
-// POST /api/v1/admin/rivers
-// Only accepts gnis_id — name, state, basin, huc8 are derived from NHD.
-func (h *AdminHandler) CreateRiver(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		GnisID string `json:"gnis_id"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		errorResponse(w, http.StatusBadRequest, "invalid JSON")
-		return
-	}
-	body.GnisID = strings.TrimSpace(body.GnisID)
-	if body.GnisID == "" {
-		errorResponse(w, http.StatusBadRequest, "gnis_id is required")
-		return
-	}
-
-	ctx := r.Context()
-	coord, err := nldi.NHDCoordByGNISID(ctx, body.GnisID)
-	if err != nil {
-		errorResponse(w, http.StatusBadRequest, fmt.Sprintf("GNIS ID not found in NHD: %v", err))
-		return
-	}
-	if coord.Name == "" {
-		errorResponse(w, http.StatusBadRequest, "NHD feature has no GNIS name")
-		return
-	}
-
-	stateAbbr, basin, huc8 := riverMetaFromGNIS(ctx, body.GnisID)
-	slug := kmlimport.Slugify(coord.Name)
-
-	var id string
-	dbErr := h.db.QueryRow(ctx, `
-		INSERT INTO rivers (slug, name, gnis_id, state_abbr, basin, huc8)
-		VALUES ($1, $2, $3, NULLIF($4,''), NULLIF($5,''), NULLIF($6,''))
-		RETURNING id
-	`, slug, coord.Name, body.GnisID, stateAbbr, basin, huc8).Scan(&id)
-	if dbErr != nil {
-		errorResponse(w, http.StatusConflict, "river already exists (GNIS ID or slug conflict)")
-		return
-	}
-	jsonResponse(w, http.StatusCreated, map[string]any{
-		"id":         id,
-		"slug":       slug,
-		"name":       coord.Name,
-		"state_abbr": stateAbbr,
-		"basin":      basin,
-		"huc8":       huc8,
-	})
-}
-
-// DeleteRiver permanently deletes a river and unlinks its reaches.
-// Reaches are NOT deleted — they remain but lose their river association.
-// DELETE /api/v1/admin/rivers/{riverSlug}
-func (h *AdminHandler) DeleteRiver(w http.ResponseWriter, r *http.Request) {
-	slug := chi.URLParam(r, "riverSlug")
-
-	// Unlink reaches first so the FK constraint doesn't block deletion.
-	if _, err := h.db.Exec(r.Context(),
-		`UPDATE reaches SET river_id = NULL WHERE river_id = (SELECT id FROM rivers WHERE slug = $1)`,
-		slug,
-	); err != nil {
-		errorResponse(w, http.StatusInternalServerError, "unlink reaches failed")
-		return
-	}
-
-	tag, err := h.db.Exec(r.Context(), `DELETE FROM rivers WHERE slug = $1`, slug)
-	if err != nil {
-		errorResponse(w, http.StatusInternalServerError, "delete failed")
-		return
-	}
-	if tag.RowsAffected() == 0 {
-		errorResponse(w, http.StatusNotFound, "river not found")
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
 }
 
 // riverMetaFromGNIS resolves a GNIS stream ID to state abbreviation, canonical
@@ -583,93 +504,6 @@ func (h *AdminHandler) GNISLookup(w http.ResponseWriter, r *http.Request) {
 		"lat":        coord.Lat,
 		"lng":        coord.Lng,
 	})
-}
-
-// ReorderReachesForRiver handles POST /api/v1/admin/rivers/{riverSlug}/reorder-reaches
-//
-// Assigns river_order 1..N to all reaches on the river, sorted by start_point
-// longitude. Direction is auto-detected: if the sum of (end_lng - start_lng) across
-// all reaches with both points is positive, the river flows W→E (ASC); otherwise
-// E→W (DESC, e.g. Colorado River flowing toward Utah). Falls back to ASC when
-// no reaches have both endpoints set.
-func (h *AdminHandler) ReorderReachesForRiver(w http.ResponseWriter, r *http.Request) {
-	riverSlug := chi.URLParam(r, "riverSlug")
-	if riverSlug == "" {
-		errorResponse(w, http.StatusBadRequest, "riverSlug required")
-		return
-	}
-
-	// Detect flow direction: sum (end_lng - start_lng) across reaches with both points.
-	var lngDelta float64
-	_ = h.db.QueryRow(r.Context(), `
-		SELECT COALESCE(SUM(
-			ST_X(re.end_point::geometry) - ST_X(re.start_point::geometry)
-		), 0)
-		FROM reaches re
-		JOIN rivers rv ON rv.id = re.river_id
-		WHERE rv.slug = $1
-		  AND re.start_point IS NOT NULL
-		  AND re.end_point IS NOT NULL
-	`, riverSlug).Scan(&lngDelta)
-
-	orderDir := "ASC"
-	if lngDelta < 0 {
-		orderDir = "DESC"
-	}
-
-	rows, err := h.db.Query(r.Context(), fmt.Sprintf(`
-		SELECT re.id
-		FROM reaches re
-		JOIN rivers rv ON rv.id = re.river_id
-		WHERE rv.slug = $1
-		ORDER BY
-			ST_X(re.start_point::geometry) %s NULLS LAST,
-			re.name ASC
-	`, orderDir), riverSlug)
-	if err != nil {
-		errorResponse(w, http.StatusInternalServerError, "query failed")
-		return
-	}
-	defer rows.Close()
-
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err == nil {
-			ids = append(ids, id)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		errorResponse(w, http.StatusInternalServerError, "scan failed")
-		return
-	}
-	if len(ids) == 0 {
-		jsonResponse(w, http.StatusOK, map[string]any{"updated": 0})
-		return
-	}
-
-	tx, err := h.db.Begin(r.Context())
-	if err != nil {
-		errorResponse(w, http.StatusInternalServerError, "tx failed")
-		return
-	}
-	defer tx.Rollback(r.Context())
-
-	for i, id := range ids {
-		if _, err := tx.Exec(r.Context(),
-			`UPDATE reaches SET river_order = $1 WHERE id = $2`,
-			i+1, id,
-		); err != nil {
-			errorResponse(w, http.StatusInternalServerError, "update failed")
-			return
-		}
-	}
-	if err := tx.Commit(r.Context()); err != nil {
-		errorResponse(w, http.StatusInternalServerError, "commit failed")
-		return
-	}
-
-	jsonResponse(w, http.StatusOK, map[string]any{"updated": len(ids)})
 }
 
 // ── Admin gauge management ────────────────────────────────────────────────────

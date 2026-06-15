@@ -287,9 +287,9 @@ func main() {
 			r.Get("/admin/reaches/grouped", admin.GroupedReaches)
 			r.Get("/admin/rivers", admin.ListRivers)
 			r.Get("/admin/rivers/{riverSlug}", admin.GetRiver)
-			r.Post("/admin/rivers", admin.CreateRiver)
-			r.Delete("/admin/rivers/{riverSlug}", admin.DeleteRiver)
-			r.Post("/admin/rivers/{riverSlug}/reorder-reaches", admin.ReorderReachesForRiver)
+			// NOTE: rivers-mgmt writes (CreateRiver/DeleteRiver/ReorderReachesForRiver)
+			// retired in runs-unify 5b — they wrote the legacy reaches table and had
+			// no live UI caller (admin UI only reads GET /admin/rivers).
 			r.Get("/admin/river-corrections", corrections.ListRiverCorrections)
 			r.Patch("/admin/river-corrections/{id}", corrections.ReviewRiverCorrection)
 			r.Get("/admin/moderation/queue", moderation.Queue)
