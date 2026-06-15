@@ -63,7 +63,6 @@ const basinSlugExpr = `trim('-' FROM lower(regexp_replace(
 // The {slug} path param is the normalized basin name.
 func (h *ReachHandler) BasinMap(w http.ResponseWriter, r *http.Request) {
 	basinSlug := chi.URLParam(r, "slug")
-	empty := basinMapResponse{BasinSlug: basinSlug, Reaches: []basinReachItem{}}
 
 	// Ensure a non-nil slice so ANY($1) on an empty list is '{}'::text[], not NULL.
 	slugs := parseSlugsParam(r.URL.Query().Get("slugs"))
@@ -76,11 +75,9 @@ func (h *ReachHandler) BasinMap(w http.ResponseWriter, r *http.Request) {
 		ownerID = &uid
 	}
 
-	// Nothing to do: no slug list and no auth means no user_reaches to scan.
-	if len(slugs) == 0 && ownerID == nil {
-		jsonResponse(w, http.StatusOK, empty)
-		return
-	}
+	// runs-unify 5a: the basin-wide branch returns the h2oflows sentinel twins
+	// (curated runs) regardless of auth/slugs, so there is no early-return — a
+	// public basin page must list curated runs even when unauthenticated.
 
 	// runs-unify 5a: reaches table retired; all curated runs live in user_reaches.
 	// The former "reaches r" UNION branch is removed — sentinel twins cover curated runs.
@@ -300,10 +297,8 @@ func (h *ReachHandler) BasinNetwork(w http.ResponseWriter, r *http.Request) {
 		ownerIDNet = &uid
 	}
 
-	if len(slugs) == 0 && ownerIDNet == nil {
-		jsonResponse(w, http.StatusOK, emptyOK)
-		return
-	}
+	// runs-unify 5a: no early-return — the basin-wide branch returns curated
+	// sentinel twins even when unauthenticated with no slug list.
 
 	type reachAnchor struct {
 		startCID string
