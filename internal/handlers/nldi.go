@@ -535,22 +535,6 @@ func buildSlug(riverName, reachName string) string {
 	return r + "-" + n
 }
 
-// fillReachState queries TIGERweb for the US state at the given coordinate and
-// updates reaches.state_abbr. Best-effort — failures are logged and not fatal.
-func fillReachState(ctx context.Context, db *pgxpool.Pool, reachSlug string, lat, lng float64) {
-	stateAbbr, err := nldi.StateAt(ctx, lat, lng)
-	if err != nil {
-		log.Printf("fillReachState %s: %v", reachSlug, err)
-		return
-	}
-	if stateAbbr == "" {
-		return
-	}
-	if _, err := db.Exec(ctx, `UPDATE reaches SET state_abbr = $1 WHERE slug = $2`, stateAbbr, reachSlug); err != nil {
-		log.Printf("fillReachState %s: update: %v", reachSlug, err)
-	}
-}
-
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
 func parseLatLng(r *http.Request) (lat, lng float64, err error) {
