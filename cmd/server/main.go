@@ -169,11 +169,9 @@ func main() {
 		r.Get("/reaches/basin/{slug}/map", reaches.BasinMap)
 		r.Get("/reaches/basin/{slug}/network", reaches.BasinNetwork)
 		r.Get("/reaches", reaches.List)
-		r.Get("/reaches/{slug}", reaches.Get)
-		r.Get("/reaches/{slug}/conditions", reaches.GetConditions)
-		r.Get("/reaches/{slug}/hazards", reaches.GetHazards)
 		r.Get("/reaches/{slug}/flow-ranges", reaches.GetFlowRanges)
-		r.Post("/reaches/{slug}/ask", reaches.Ask)
+		// NOTE: /reaches/{slug} detail, conditions, hazards, and per-reach ask were
+		// removed in runs-unify 5a — curated detail is served by /users/h2oflows/runs/{slug}.
 		r.Post("/ask", reaches.GlobalAsk)
 		r.Get("/stats", reaches.Stats)
 		r.Get("/discover/runs", discover.ListRuns)

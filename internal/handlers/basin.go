@@ -63,7 +63,6 @@ const basinSlugExpr = `trim('-' FROM lower(regexp_replace(
 // The {slug} path param is the normalized basin name.
 func (h *ReachHandler) BasinMap(w http.ResponseWriter, r *http.Request) {
 	basinSlug := chi.URLParam(r, "slug")
-	empty := basinMapResponse{BasinSlug: basinSlug, Reaches: []basinReachItem{}}
 
 	// Ensure a non-nil slice so ANY($1) on an empty list is '{}'::text[], not NULL.
 	slugs := parseSlugsParam(r.URL.Query().Get("slugs"))
@@ -76,12 +75,13 @@ func (h *ReachHandler) BasinMap(w http.ResponseWriter, r *http.Request) {
 		ownerID = &uid
 	}
 
-	// Nothing to do: no slug list and no auth means no user_reaches to scan.
-	if len(slugs) == 0 && ownerID == nil {
-		jsonResponse(w, http.StatusOK, empty)
-		return
-	}
+	// runs-unify 5a: the basin-wide branch returns the h2oflows sentinel twins
+	// (curated runs) regardless of auth/slugs, so there is no early-return — a
+	// public basin page must list curated runs even when unauthenticated.
 
+	// runs-unify 5a: reaches table retired; all curated runs live in user_reaches.
+	// The former "reaches r" UNION branch is removed — sentinel twins cover curated runs.
+	// The NOT EXISTS (SELECT 1 FROM reaches …) dedup guards are also removed.
 	rows, err := h.db.Query(r.Context(), `
 		WITH latest_reading AS (
 			SELECT DISTINCT ON (gauge_id)
@@ -90,52 +90,6 @@ func (h *ReachHandler) BasinMap(w http.ResponseWriter, r *http.Request) {
 			WHERE timestamp > NOW() - INTERVAL '48 hours'
 			ORDER BY gauge_id, timestamp DESC
 		)
-		SELECT
-			r.slug,
-			r.name,
-			COALESCE(r.river_name, rv.name) AS river_name,
-			r.common_name,
-			r.river_order,
-			r.class_min,
-			COALESCE(
-				(SELECT MAX(class_rating) FROM rapids WHERE reach_id = r.id AND class_rating IS NOT NULL),
-				r.class_max
-			) AS class_max,
-			r.anchor_comid,
-			r.start_comid,
-			r.end_comid,
-			ST_AsGeoJSON(r.centerline::geometry) AS centerline,
-			ST_X(r.start_point::geometry) AS start_lng,
-			ST_Y(r.start_point::geometry) AS start_lat,
-			ST_X(r.end_point::geometry)   AS end_lng,
-			ST_Y(r.end_point::geometry)   AS end_lat,
-			CASE
-				WHEN fr.band_color IS NULL        THEN 'unknown'
-				WHEN fr.band_color LIKE 'red%'    THEN 'caution'
-				WHEN fr.band_color LIKE 'blue%'   THEN 'flood'
-				ELSE                                   'runnable'
-			END AS flow_status
-		FROM reaches r
-		LEFT JOIN rivers rv ON rv.id = r.river_id
-		LEFT JOIN gauges g ON g.id = r.primary_gauge_id
-		LEFT JOIN latest_reading lr ON lr.gauge_id = g.id
-		LEFT JOIN LATERAL (
-			SELECT label, color FROM flow_ranges
-			WHERE reach_id = r.id
-			  AND lr.value >= value
-			ORDER BY value DESC
-			LIMIT 1
-		) thresh ON TRUE,
-		LATERAL (
-			SELECT
-				COALESCE(thresh.label, CASE WHEN lr.value IS NOT NULL THEN r.base_label END) AS band_label,
-				COALESCE(thresh.color, CASE WHEN lr.value IS NOT NULL THEN r.base_color END) AS band_color
-		) fr
-		WHERE r.slug = ANY($1)
-		  AND r.centerline IS NOT NULL
-
-		UNION ALL
-
 		-- User_reaches matched by requested slug list (dashboard gauge contexts).
 		SELECT
 			ur.slug,
@@ -175,11 +129,10 @@ func (h *ReachHandler) BasinMap(w http.ResponseWriter, r *http.Request) {
 				COALESCE(thresh_u.color, CASE WHEN lr_u.value IS NOT NULL THEN ur.base_color END) AS band_color
 		) fr_u
 		WHERE ur.slug = ANY($1)
-		  AND ur.owner_id = $2
+		  -- runs-unify 5a: include the h2oflows sentinel twins (former curated
+		  -- reaches branch) alongside the caller's own runs.
+		  AND (ur.owner_id = $2 OR ur.owner_id = '00000000-0000-0000-0000-000000000001')
 		  AND ur.centerline IS NOT NULL
-		  AND NOT EXISTS (
-		      SELECT 1 FROM reaches WHERE slug = ur.slug AND centerline IS NOT NULL
-		  )
 
 		UNION ALL
 
@@ -223,7 +176,7 @@ func (h *ReachHandler) BasinMap(w http.ResponseWriter, r *http.Request) {
 				COALESCE(thresh3.label, CASE WHEN lr3.value IS NOT NULL THEN ur3.base_label END) AS band_label,
 				COALESCE(thresh3.color, CASE WHEN lr3.value IS NOT NULL THEN ur3.base_color END) AS band_color
 		) fr3
-		WHERE ur3.owner_id = $2
+		WHERE (ur3.owner_id = $2 OR ur3.owner_id = '00000000-0000-0000-0000-000000000001')
 		  AND ur3.centerline IS NOT NULL
 		  AND trim('-' FROM lower(regexp_replace(
 		      trim(regexp_replace(
@@ -235,9 +188,6 @@ func (h *ReachHandler) BasinMap(w http.ResponseWriter, r *http.Request) {
 		      )),
 		      '[^a-z0-9]+', '-', 'gi'
 		  ))) = $3
-		  AND NOT EXISTS (
-		      SELECT 1 FROM reaches WHERE slug = ur3.slug AND centerline IS NOT NULL
-		  )
 		  AND NOT (ur3.slug = ANY($1))
 
 		ORDER BY river_order ASC NULLS LAST,
@@ -347,35 +297,24 @@ func (h *ReachHandler) BasinNetwork(w http.ResponseWriter, r *http.Request) {
 		ownerIDNet = &uid
 	}
 
-	if len(slugs) == 0 && ownerIDNet == nil {
-		jsonResponse(w, http.StatusOK, emptyOK)
-		return
-	}
+	// runs-unify 5a: no early-return — the basin-wide branch returns curated
+	// sentinel twins even when unauthenticated with no slug list.
 
 	type reachAnchor struct {
 		startCID string
 		lengthKm float64
 	}
 
+	// runs-unify 5a: reaches table retired; all curated runs live in user_reaches.
+	// The former "FROM reaches" UNION branch is removed; NOT EXISTS dedup guards removed.
 	rows, err := h.db.Query(r.Context(), `
-		SELECT
-			start_comid,
-			COALESCE(ST_Length(centerline::geography) / 1000.0, 0) AS length_km
-		FROM reaches
-		WHERE slug = ANY($1) AND start_comid IS NOT NULL
-
-		UNION ALL
-
 		SELECT
 			ur2.up_comid AS start_comid,
 			COALESCE(ST_Length(ur2.centerline::geography) / 1000.0, 0) AS length_km
 		FROM user_reaches ur2
 		WHERE ur2.slug = ANY($1)
 		  AND ur2.up_comid IS NOT NULL
-		  AND ur2.owner_id = $2
-		  AND NOT EXISTS (
-		      SELECT 1 FROM reaches WHERE slug = ur2.slug AND start_comid IS NOT NULL
-		  )
+		  AND (ur2.owner_id = $2 OR ur2.owner_id = '00000000-0000-0000-0000-000000000001')
 
 		UNION ALL
 
@@ -385,7 +324,7 @@ func (h *ReachHandler) BasinNetwork(w http.ResponseWriter, r *http.Request) {
 		FROM user_reaches ur3
 		LEFT JOIN rivers rv3 ON rv3.id = ur3.river_id
 		LEFT JOIN gauges g3 ON g3.id = ur3.primary_gauge_id
-		WHERE ur3.owner_id = $2
+		WHERE (ur3.owner_id = $2 OR ur3.owner_id = '00000000-0000-0000-0000-000000000001')
 		  AND ur3.up_comid IS NOT NULL
 		  AND trim('-' FROM lower(regexp_replace(
 		      trim(regexp_replace(
@@ -397,9 +336,6 @@ func (h *ReachHandler) BasinNetwork(w http.ResponseWriter, r *http.Request) {
 		      )),
 		      '[^a-z0-9]+', '-', 'gi'
 		  ))) = $3
-		  AND NOT EXISTS (
-		      SELECT 1 FROM reaches WHERE slug = ur3.slug AND start_comid IS NOT NULL
-		  )
 		  AND NOT (ur3.slug = ANY($1))
 	`, slugs, ownerIDNet, basinSlug)
 	if err != nil {

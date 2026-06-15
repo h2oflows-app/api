@@ -142,30 +142,31 @@ func bandLabelForCFS(cfs float64, baseLabel string, thresholds []FlowBandThresho
 	return &s
 }
 
-// stampCFSAndBand queries the gauge reading nearest to `at` for the reach's
-// primary gauge, then derives the flow band from the reach's flow_ranges.
-func (h *ReportHandler) stampCFSAndBand(ctx context.Context, reachID string, at time.Time) (*float64, *string) {
+// stampCFSAndBand queries the gauge reading nearest to `at` for the user_reach's
+// primary gauge, then derives the flow band from user_reach_flow_ranges.
+// runs-unify 5a: userReachID is a user_reaches.id (sentinel-owned twin).
+func (h *ReportHandler) stampCFSAndBand(ctx context.Context, userReachID string, at time.Time) (*float64, *string) {
 	var cfs float64
 	err := h.db.QueryRow(ctx, `
-		SELECT gr.value_cfs
-		FROM reach_gauges rg
-		JOIN gauge_readings gr ON gr.gauge_id = rg.gauge_id
-		WHERE rg.reach_id = $1 AND rg.is_primary = TRUE
-		ORDER BY ABS(EXTRACT(EPOCH FROM (gr.observed_at - $2::TIMESTAMPTZ))) ASC
+		SELECT gr.value
+		FROM user_reaches ur
+		JOIN gauge_readings gr ON gr.gauge_id = ur.primary_gauge_id
+		WHERE ur.id = $1 AND ur.primary_gauge_id IS NOT NULL
+		ORDER BY ABS(EXTRACT(EPOCH FROM (gr.timestamp - $2::TIMESTAMPTZ))) ASC
 		LIMIT 1
-	`, reachID, at).Scan(&cfs)
+	`, userReachID, at).Scan(&cfs)
 	if err != nil {
 		return nil, nil
 	}
 
 	var baseLabel string
-	_ = h.db.QueryRow(ctx, `SELECT base_label FROM reaches WHERE id = $1`, reachID).Scan(&baseLabel)
+	_ = h.db.QueryRow(ctx, `SELECT base_label FROM user_reaches WHERE id = $1`, userReachID).Scan(&baseLabel)
 	if baseLabel == "" {
 		return &cfs, nil
 	}
 
 	frRows, err := h.db.Query(ctx,
-		`SELECT value, label FROM flow_ranges WHERE reach_id = $1 ORDER BY value ASC`, reachID,
+		`SELECT value, label FROM user_reach_flow_ranges WHERE user_reach_id = $1 ORDER BY value ASC`, userReachID,
 	)
 	if err != nil {
 		return &cfs, nil
@@ -259,10 +260,11 @@ func (h *ReportHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	var reachID string
+	// runs-unify 5a: resolve slug via user_reaches (sentinel-owned twins).
+	var userReachID string
 	if err := h.db.QueryRow(ctx,
-		`SELECT id FROM reaches WHERE slug = $1`, reachSlug,
-	).Scan(&reachID); err != nil {
+		`SELECT id FROM user_reaches WHERE slug = $1 AND owner_id = '00000000-0000-0000-0000-000000000001' AND deleted_at IS NULL`, reachSlug,
+	).Scan(&userReachID); err != nil {
 		errorResponse(w, http.StatusNotFound, "reach not found")
 		return
 	}
@@ -281,7 +283,7 @@ func (h *ReportHandler) Create(w http.ResponseWriter, r *http.Request) {
 	reportSlug = h.uniqueSlug(ctx, ownerID, reportSlug)
 
 	at := reportObservedAt(body.ReportDate, body.ReportTime)
-	cfs, band := h.stampCFSAndBand(ctx, reachID, at)
+	cfs, band := h.stampCFSAndBand(ctx, userReachID, at)
 
 	var reportTimeVal *string
 	if body.ReportTime != "" {
@@ -291,12 +293,12 @@ func (h *ReportHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var id string
 	err = h.db.QueryRow(ctx, `
 		INSERT INTO reports
-			(owner_id, slug, reach_id, name, report_date, report_time,
+			(owner_id, slug, user_reach_id, name, report_date, report_time,
 			 content, paddled, flow_cfs, flow_band)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
 		RETURNING id
 	`,
-		ownerID, reportSlug, reachID, body.Name, body.ReportDate, reportTimeVal,
+		ownerID, reportSlug, userReachID, body.Name, body.ReportDate, reportTimeVal,
 		body.Content, body.Paddled, cfs, band,
 	).Scan(&id)
 	if err != nil {
@@ -315,14 +317,17 @@ func (h *ReportHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 // ── GET /reaches/{slug}/reports ───────────────────────────────────────────────
 
+// runs-unify 5a: resolve slug via user_reaches (sentinel-owned twins) and
+// read reports by user_reach_id — the reports table has both reach_id and
+// user_reach_id columns; curated reach reports now use user_reach_id.
 func (h *ReportHandler) ListByReach(w http.ResponseWriter, r *http.Request) {
 	reachSlug := chi.URLParam(r, "slug")
 	ctx := r.Context()
 
-	var reachID string
+	var userReachID string
 	if err := h.db.QueryRow(ctx,
-		`SELECT id FROM reaches WHERE slug = $1`, reachSlug,
-	).Scan(&reachID); err != nil {
+		`SELECT id FROM user_reaches WHERE slug = $1 AND owner_id = '00000000-0000-0000-0000-000000000001' AND deleted_at IS NULL`, reachSlug,
+	).Scan(&userReachID); err != nil {
 		errorResponse(w, http.StatusNotFound, "reach not found")
 		return
 	}
@@ -341,10 +346,10 @@ func (h *ReportHandler) ListByReach(w http.ResponseWriter, r *http.Request) {
 			       rp.flow_cfs, rp.flow_band, rp.created_at, up.handle
 			FROM reports rp
 			LEFT JOIN user_profiles up ON up.owner_id = rp.owner_id
-			WHERE rp.reach_id = $1 AND rp.report_date < $2::DATE
+			WHERE rp.user_reach_id = $1 AND rp.report_date < $2::DATE
 			ORDER BY rp.report_date DESC, rp.created_at DESC
 			LIMIT $3`
-		args = []any{reachID, cursor, limit + 1}
+		args = []any{userReachID, cursor, limit + 1}
 	} else {
 		query = `
 			SELECT rp.id, rp.slug, rp.name, rp.report_date::TEXT, rp.report_time::TEXT,
@@ -352,10 +357,10 @@ func (h *ReportHandler) ListByReach(w http.ResponseWriter, r *http.Request) {
 			       rp.flow_cfs, rp.flow_band, rp.created_at, up.handle
 			FROM reports rp
 			LEFT JOIN user_profiles up ON up.owner_id = rp.owner_id
-			WHERE rp.reach_id = $1
+			WHERE rp.user_reach_id = $1
 			ORDER BY rp.report_date DESC, rp.created_at DESC
 			LIMIT $2`
-		args = []any{reachID, limit + 1}
+		args = []any{userReachID, limit + 1}
 	}
 
 	rows, err := h.db.Query(ctx, query, args...)
