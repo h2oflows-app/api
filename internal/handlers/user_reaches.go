@@ -448,7 +448,7 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 			ur.primary_gauge_id::text AS gauge_id,
 			ur.class_max,
 			up.handle AS author_handle,
-			(up.owner_id IS NULL) AS is_official,
+			(ur.owner_id = '00000000-0000-0000-0000-000000000001') AS is_official,
 			COALESCE(cgrp.cluster_id, ur.id::text) AS cluster_id,
 			(ur.forked_from_user_reach_id IS NOT NULL) AS is_fork,
 			(SELECT COUNT(*)::int FROM user_reaches f
@@ -1092,7 +1092,7 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 	}
 
 	d.IsPrivate = d.Visibility != "public"
-	d.IsOfficial = (d.AuthorHandle == nil)
+	d.IsOfficial = (authorID == h2oflowsSentinelOwnerID)
 	d.IsOwn = callerID != "" && callerID == authorID
 
 	if geojsonBytes != nil {
@@ -2289,7 +2289,7 @@ func (h *UserReachHandler) ListCommunity(w http.ResponseWriter, r *http.Request)
 			cg.name AS custom_gauge_name,
 			ur.visibility,
 			up.handle AS author_handle,
-			(up.owner_id IS NULL) AS is_official,
+			(ur.owner_id = '00000000-0000-0000-0000-000000000001') AS is_official,
 			(SELECT COUNT(*)::int FROM user_reaches f
 			 WHERE f.forked_from_user_reach_id = ur.id
 			   AND f.visibility = 'public' AND f.deleted_at IS NULL) AS fork_count

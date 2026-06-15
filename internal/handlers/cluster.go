@@ -73,7 +73,9 @@ func (h *ClusterHandler) nearbyRuns(r *http.Request, putInLat, putInLng, takeOut
 			ur.slug,
 			ur.name,
 			up.handle AS author_handle,
-			FALSE AS is_official,
+			-- Official = the h2oflows sentinel owner (runs-unify Phase 4). Curated
+			-- runs are sentinel-owned twins; the legacy reaches branch is retired.
+			(ur.owner_id = '00000000-0000-0000-0000-000000000001') AS is_official,
 			ur.class_min,
 			ur.class_max,
 			ST_X(ur.put_in::geometry)   AS put_in_lng,
@@ -81,7 +83,10 @@ func (h *ClusterHandler) nearbyRuns(r *http.Request, putInLat, putInLng, takeOut
 			ST_X(ur.take_out::geometry) AS take_out_lng,
 			ST_Y(ur.take_out::geometry) AS take_out_lat,
 			(
-				COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0)
+				-- Official h2oflows runs keep the curated baseline boost (was +50 on
+				-- the retired curated branch) so they retain cluster prominence.
+				CASE WHEN ur.owner_id = '00000000-0000-0000-0000-000000000001' THEN 50 ELSE 0 END
+				+ COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0)
 				+ COALESCE((SELECT COUNT(*) FROM reports rp WHERE rp.user_reach_id = ur.id AND rp.deleted_at IS NULL), 0) * 2
 				+ (CASE WHEN ur.centerline IS NOT NULL THEN 1 ELSE 0 END
 				   + CASE WHEN EXISTS(SELECT 1 FROM user_reach_flow_ranges WHERE user_reach_id = ur.id) THEN 1 ELSE 0 END
@@ -96,37 +101,10 @@ func (h *ClusterHandler) nearbyRuns(r *http.Request, putInLat, putInLng, takeOut
 		  AND ST_DWithin(ur.take_out::geography, ST_MakePoint($4, $3)::geography, $5)
 	` + comidFilter
 
-	// Curated reaches — always public.
-	curatedQ := `
-		SELECT
-			r.id::text,
-			r.slug,
-			COALESCE(r.common_name, r.name) AS name,
-			NULL AS author_handle,
-			TRUE AS is_official,
-			r.class_min,
-			r.class_max,
-			ST_X(r.start_point::geometry) AS put_in_lng,
-			ST_Y(r.start_point::geometry) AS put_in_lat,
-			ST_X(r.end_point::geometry)   AS take_out_lng,
-			ST_Y(r.end_point::geometry)   AS take_out_lat,
-			(
-				50
-				+ COALESCE((SELECT COUNT(*) FROM reports rp WHERE rp.reach_id = r.id AND rp.deleted_at IS NULL), 0) * 2
-				+ (CASE WHEN r.centerline IS NOT NULL THEN 1 ELSE 0 END
-				   + CASE WHEN EXISTS(SELECT 1 FROM flow_ranges WHERE reach_id = r.id) THEN 1 ELSE 0 END
-				   + CASE WHEN r.description IS NOT NULL AND char_length(r.description) >= 20 THEN 1 ELSE 0 END) * 5
-			)::int AS rank_score,
-			COALESCE((SELECT COUNT(*) FROM reports rp WHERE rp.reach_id = r.id AND rp.deleted_at IS NULL), 0)::int AS report_count
-		FROM reaches r
-		WHERE ($6 = '' OR r.id::text <> $6)
-		  AND r.start_point IS NOT NULL AND r.end_point IS NOT NULL
-		  AND ST_DWithin(r.start_point::geography, ST_MakePoint($2, $1)::geography, $5)
-		  AND ST_DWithin(r.end_point::geography,   ST_MakePoint($4, $3)::geography, $5)
-	`
-	// Note: curated reaches don't filter by ComID here — start/end proximity is sufficient.
-
-	fullQ := `(` + communityQ + `) UNION ALL (` + curatedQ + `) ORDER BY rank_score DESC LIMIT 20`
+	// Curated reaches now live as sentinel-owned twins inside user_reaches, so the
+	// community query above already covers them — the legacy reaches UNION branch
+	// was retired in runs-unify Phase 4.
+	fullQ := `(` + communityQ + `) ORDER BY rank_score DESC LIMIT 20`
 
 	args := []any{putInLat, putInLng, takeOutLat, takeOutLng, radiusMeters, excludeID}
 	if upComID != "" {

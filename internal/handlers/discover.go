@@ -77,45 +77,15 @@ func (h *DiscoverHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 			fork_count,
 			text_rank
 		FROM (
-			-- curated H2OFlows reaches
-			SELECT
-				r.id::text                          AS id,
-				r.slug                              AS slug,
-				r.name                              AS name,
-				'h2oflows'                          AS handle,
-				TRUE                                AS is_official,
-				r.class_min                         AS class_min,
-				r.class_max                         AS class_max,
-				r.length_mi                         AS length_mi,
-				0::bigint                           AS upvote_count,
-				NULL::timestamptz                   AS last_forked_at,
-				g.name                              AS gauge_name,
-				ST_X(r.start_point::geometry)       AS put_in_lng,
-				ST_Y(r.start_point::geometry)       AS put_in_lat,
-				NULL::text                          AS original_author_handle,
-				0::int                              AS fork_count,
-				CASE
-					WHEN LOWER(r.name) = LOWER($1)              THEN 2
-					WHEN LOWER(r.name) LIKE LOWER($1) || '%'    THEN 1
-					ELSE 0
-				END                                 AS text_rank
-			FROM reaches r
-			LEFT JOIN gauges g ON g.id = r.primary_gauge_id
-			WHERE ($1 = '' OR r.name ILIKE '%' || $1 || '%' OR r.river_name ILIKE '%' || $1 || '%')
-			  AND ($2::float8 IS NULL OR r.class_max >= $2)
-			  AND ($3::float8 IS NULL OR r.class_min <= $3)
-			  AND (NOT $4::bool OR g.id IS NOT NULL)
-			  AND ($5 = '')
-
-			UNION ALL
-
-			-- community user reaches
+			-- All runs live in user_reaches; curated h2oflows runs are sentinel-owned
+			-- twins. Official = the h2oflows sentinel owner (runs-unify Phase 4); the
+			-- legacy reaches UNION branch was retired.
 			SELECT
 				ur.id::text                         AS id,
 				ur.slug                             AS slug,
 				ur.name                             AS name,
 				COALESCE(up.handle, 'h2oflows')     AS handle,
-				(up.owner_id IS NULL)               AS is_official,
+				(ur.owner_id = '00000000-0000-0000-0000-000000000001') AS is_official,
 				ur.class_min                        AS class_min,
 				ur.class_max                        AS class_max,
 				CASE
