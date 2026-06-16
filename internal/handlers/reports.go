@@ -633,22 +633,22 @@ func (h *ReportHandler) Get(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	type detail struct {
-		ID             string   `json:"id"`
-		Slug           string   `json:"slug"`
-		Handle         string   `json:"handle"`
-		Name           string   `json:"name"`
-		ReportDate     string   `json:"report_date"`
-		ReportTime     *string  `json:"report_time,omitempty"`
-		Content        string   `json:"content"`
-		Paddled        bool     `json:"paddled"`
-		FlowCFS        *float64 `json:"flow_cfs,omitempty"`
-		FlowBand       *string  `json:"flow_band,omitempty"`
-		AWsyncedAt     *string  `json:"aw_synced_at,omitempty"`
-		CreatedAt      string   `json:"created_at"`
-		ReachName        string  `json:"reach_name"`
-		ReachSlug        string  `json:"reach_slug"`
-		ReachAuthorHandle *string `json:"reach_author_handle"`
-		IsUserRun        bool    `json:"is_user_run"`
+		ID                string   `json:"id"`
+		Slug              string   `json:"slug"`
+		Handle            string   `json:"handle"`
+		Name              string   `json:"name"`
+		ReportDate        string   `json:"report_date"`
+		ReportTime        *string  `json:"report_time,omitempty"`
+		Content           string   `json:"content"`
+		Paddled           bool     `json:"paddled"`
+		FlowCFS           *float64 `json:"flow_cfs,omitempty"`
+		FlowBand          *string  `json:"flow_band,omitempty"`
+		AWsyncedAt        *string  `json:"aw_synced_at,omitempty"`
+		CreatedAt         string   `json:"created_at"`
+		ReachName         string   `json:"reach_name"`
+		ReachSlug         string   `json:"reach_slug"`
+		ReachAuthorHandle *string  `json:"reach_author_handle"`
+		IsUserRun         bool     `json:"is_user_run"`
 	}
 
 	var d detail
@@ -666,7 +666,7 @@ func (h *ReportHandler) Get(w http.ResponseWriter, r *http.Request) {
 			(rp.user_reach_id IS NOT NULL)    AS is_user_run
 		FROM reports rp
 		LEFT JOIN user_profiles up ON up.owner_id = rp.owner_id
-		LEFT JOIN reaches re ON re.id = rp.reach_id
+		LEFT JOIN user_reaches re ON re.id = rp.user_reach_id
 		LEFT JOIN user_reaches ur ON ur.id = rp.user_reach_id
 		LEFT JOIN user_profiles rup ON rup.owner_id = ur.owner_id
 		WHERE rp.id = $1 AND rp.deleted_at IS NULL
@@ -829,7 +829,7 @@ func (h *ReportHandler) ListMine(w http.ResponseWriter, r *http.Request) {
 			rup.handle                        AS reach_author_handle,
 			up.handle
 		FROM reports rp
-		LEFT JOIN reaches re ON re.id = rp.reach_id
+		LEFT JOIN user_reaches re ON re.id = rp.user_reach_id
 		LEFT JOIN user_reaches ur ON ur.id = rp.user_reach_id
 		LEFT JOIN user_profiles rup ON rup.owner_id = ur.owner_id
 		LEFT JOIN user_profiles up ON up.owner_id = rp.owner_id
@@ -979,4 +979,3 @@ func (h *ReportHandler) CreateForUserReach(w http.ResponseWriter, r *http.Reques
 		"handle": handle,
 	})
 }
-
