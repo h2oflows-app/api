@@ -561,8 +561,8 @@ func (h *GaugeHandler) querySearch(r *http.Request, p searchParams) (interface {
 			SELECT
 				COALESCE(t.label, rch_base.base_label) AS label,
 				CASE
-					WHEN COALESCE(t.color, rch_base.base_color) LIKE 'red%'  THEN 'caution'
-					WHEN COALESCE(t.color, rch_base.base_color) LIKE 'blue%' THEN 'flood'
+					WHEN COALESCE(t.color, rch_base.base_color) LIKE 'red%%'  THEN 'caution'
+					WHEN COALESCE(t.color, rch_base.base_color) LIKE 'blue%%' THEN 'flood'
 					WHEN COALESCE(t.color, rch_base.base_color) IS NOT NULL  THEN 'runnable'
 					ELSE 'unknown'
 				END AS flow_status
