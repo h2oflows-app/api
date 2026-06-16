@@ -145,7 +145,7 @@ func (h *TripHandler) Describe(w http.ResponseWriter, r *http.Request) {
 			COALESCE(re.id::text,   '') AS reach_id,
 			COALESCE(re.name, '') AS reach_name
 		FROM trips t
-		LEFT JOIN reaches re ON re.id = t.reach_id
+		LEFT JOIN user_reaches re ON re.id = t.reach_id
 		WHERE t.id = $1 AND t.device_id = $2
 	`, id, body.DeviceID).Scan(
 		&details.StartCFS, &details.EndCFS, &details.DurationMin, &details.DistanceMi,
@@ -202,7 +202,7 @@ func (h *TripHandler) List(w http.ResponseWriter, r *http.Request) {
 			COALESCE(g.name,  '') AS gauge_name
 		FROM trips t
 		LEFT JOIN gauges  g  ON g.id  = t.gauge_id
-		LEFT JOIN reaches re ON re.id = t.reach_id
+		LEFT JOIN user_reaches re ON re.id = t.reach_id
 		WHERE t.device_id = $1
 		ORDER BY t.started_at DESC
 		LIMIT 100
@@ -252,7 +252,7 @@ func (h *TripHandler) List(w http.ResponseWriter, r *http.Request) {
 //
 // Returns the full trip detail including the GPS track as a GeoJSON LineString.
 func (h *TripHandler) Get(w http.ResponseWriter, r *http.Request) {
-	id       := chi.URLParam(r, "id")
+	id := chi.URLParam(r, "id")
 	deviceID := r.URL.Query().Get("device_id")
 	if deviceID == "" {
 		errorResponse(w, http.StatusBadRequest, "device_id is required")
@@ -298,7 +298,7 @@ func (h *TripHandler) Get(w http.ResponseWriter, r *http.Request) {
 			(SELECT COUNT(*) FROM trip_track_points WHERE trip_id = t.id) AS point_count
 		FROM trips t
 		LEFT JOIN gauges  g  ON g.id  = t.gauge_id
-		LEFT JOIN reaches re ON re.id = t.reach_id
+		LEFT JOIN user_reaches re ON re.id = t.reach_id
 		WHERE t.id = $1 AND t.device_id = $2
 	`, id, deviceID).Scan(
 		&t.ID, &t.StartedAt, &t.EndedAt, &t.DurationMin,

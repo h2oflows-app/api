@@ -153,30 +153,30 @@ func (h *GaugeHandler) Search(w http.ResponseWriter, r *http.Request) {
 			Type:     "Feature",
 			Geometry: PointGeometry{Type: "Point", Coordinates: [2]float64{lng, lat}},
 			Properties: map[string]any{
-				"id":                    id,
-				"external_id":           externalID,
-				"source":                source,
-				"name":                  name,
-				"status":                status,
-				"featured":              featured,
-				"prominence_score":      prominenceScore,
-				"reach_id":              reachID,
-				"reach_name":            combineReachNames(reachNamesRaw),
-				"reach_names":           reachNamesRaw,
-				"reach_slug":            firstOrNil(reachSlugsRaw),
-				"reach_slugs":           reachSlugsRaw,
-				"reach_common_names":    reachCommonNamesRaw,
-				"reach_relationship":    reachRelationship,
-				"last_reading_at":       lastReadingAt,
-				"state_abbr":            stateAbbr,
-				"basin_name":            basinName,
-				"watershed_name":        watershedName,
-				"river_name":            riverName,
-				"current_cfs":           currentCFS,
-				"flow_status":           flowStatus,
-				"flow_band_label":       flowBandLabel,
-				"poll_health":           pollHealth,
-				"last_poll_success_at":  lastPollSuccessAt,
+				"id":                   id,
+				"external_id":          externalID,
+				"source":               source,
+				"name":                 name,
+				"status":               status,
+				"featured":             featured,
+				"prominence_score":     prominenceScore,
+				"reach_id":             reachID,
+				"reach_name":           combineReachNames(reachNamesRaw),
+				"reach_names":          reachNamesRaw,
+				"reach_slug":           firstOrNil(reachSlugsRaw),
+				"reach_slugs":          reachSlugsRaw,
+				"reach_common_names":   reachCommonNamesRaw,
+				"reach_relationship":   reachRelationship,
+				"last_reading_at":      lastReadingAt,
+				"state_abbr":           stateAbbr,
+				"basin_name":           basinName,
+				"watershed_name":       watershedName,
+				"river_name":           riverName,
+				"current_cfs":          currentCFS,
+				"flow_status":          flowStatus,
+				"flow_band_label":      flowBandLabel,
+				"poll_health":          pollHealth,
+				"last_poll_success_at": lastPollSuccessAt,
 			},
 		})
 	}
@@ -287,11 +287,13 @@ func (h *GaugeHandler) GetFlowRanges(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// flow_bands are per-reach. Return bands for the alphabetically-first reach using this gauge.
+	// flow_bands are per-reach. Return bands for the alphabetically-first run using
+	// this gauge (runs-unify 5c: h2oflows twins in user_reaches).
+	const sentinel = `'00000000-0000-0000-0000-000000000001'`
 	var fb FlowBands
 	err := h.db.QueryRow(r.Context(), `
-		SELECT base_label, base_color FROM reaches
-		WHERE primary_gauge_id = $1
+		SELECT base_label, base_color FROM user_reaches
+		WHERE primary_gauge_id = $1 AND owner_id = `+sentinel+` AND deleted_at IS NULL
 		ORDER BY slug LIMIT 1
 	`, gaugeID).Scan(&fb.BaseLabel, &fb.BaseColor)
 	if err != nil {
@@ -301,12 +303,12 @@ func (h *GaugeHandler) GetFlowRanges(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := h.db.Query(r.Context(), `
 		SELECT fr.value, fr.label, fr.color
-		FROM flow_ranges fr
-		JOIN reaches rch ON rch.id = fr.reach_id
-		WHERE rch.primary_gauge_id = $1
+		FROM user_reach_flow_ranges fr
+		JOIN user_reaches rch ON rch.id = fr.user_reach_id
+		WHERE rch.primary_gauge_id = $1 AND rch.owner_id = `+sentinel+` AND rch.deleted_at IS NULL
 		  AND rch.id = (
-			  SELECT id FROM reaches
-			  WHERE primary_gauge_id = $1
+			  SELECT id FROM user_reaches
+			  WHERE primary_gauge_id = $1 AND owner_id = `+sentinel+` AND deleted_at IS NULL
 			  ORDER BY slug LIMIT 1
 		  )
 		ORDER BY fr.value ASC
@@ -451,28 +453,21 @@ func (h *GaugeHandler) querySearch(r *http.Request, p searchParams) (interface {
 			// e.g. searching "Foxton" surfaces PLAGRACO even though its station
 			// name says "North Fork S Platte at Grant", because it has an
 			// upstream_indicator association with the Foxton reach.
+			// runs-unify 5c: gauge↔reach is now derived from user_reaches.primary_gauge_id
+			// (gauge_reach_associations retired). Match runs on this gauge by name/river.
 			textClauses = append(textClauses, fmt.Sprintf(
 				`(g.name ILIKE $%d OR g.external_id ILIKE $%d OR g.source ILIKE $%d
 				  OR similarity(g.name, $%d) > 0.25
 				  OR EXISTS (
-					SELECT 1 FROM gauge_reach_associations gra
-					JOIN reaches ra ON ra.id = gra.reach_id
-					WHERE gra.gauge_id = g.id
-					  AND (ra.name ILIKE $%d
-					    OR ra.common_name ILIKE $%d
-					    OR ra.river_name  ILIKE $%d
-					    OR similarity(ra.name, $%d) > 0.25
-					    OR similarity(COALESCE(ra.common_name, ''), $%d) > 0.25)
-				  )
-				  OR EXISTS (
-					SELECT 1 FROM reaches ra
+					SELECT 1 FROM user_reaches ra
 					WHERE ra.primary_gauge_id = g.id
+					  AND ra.owner_id = '00000000-0000-0000-0000-000000000001' AND ra.deleted_at IS NULL
 					  AND (ra.name ILIKE $%d
-					    OR ra.common_name ILIKE $%d
+					    OR ra.long_name ILIKE $%d
 					    OR ra.river_name  ILIKE $%d
 					    OR similarity(ra.name, $%d) > 0.25
-					    OR similarity(COALESCE(ra.common_name, ''), $%d) > 0.25)
-				  ))`, likeN, likeN, likeN, termN, likeN, likeN, likeN, termN, termN, likeN, likeN, likeN, termN, termN))
+					    OR similarity(COALESCE(ra.long_name, ''), $%d) > 0.25)
+				  ))`, likeN, likeN, likeN, termN, likeN, likeN, likeN, termN, termN))
 		}
 		if len(textClauses) > 0 {
 			where = append(where, "("+strings.Join(textClauses, " OR ")+")")
@@ -515,21 +510,9 @@ func (h *GaugeHandler) querySearch(r *http.Request, p searchParams) (interface {
 		orderBy = fmt.Sprintf("(CASE WHEN g.external_id = ANY($%d) THEN 0 ELSE 1 END), g.prominence_score DESC", hintN)
 	}
 
-	// When a reach-name text search is active, show the relationship for the
-	// matched reach (e.g. "downstream_indicator" when searching "Foxton" and
-	// PLASPLCO is linked as downstream). Falls back to gauges.reach_relationship.
+	// runs-unify 5c: gauge_reach_associations retired — the gauge's stored
+	// reach_relationship is the single source now.
 	reachRelCol := "g.reach_relationship"
-	if qArgN > 0 {
-		// qArgN is the ILIKE arg ($N = '%term%'); the raw-term arg for similarity is qArgN+1.
-		reachRelCol = fmt.Sprintf(`COALESCE(
-				(SELECT gra.relationship FROM gauge_reach_associations gra
-				 JOIN reaches ra ON ra.id = gra.reach_id
-				 WHERE gra.gauge_id = g.id
-				   AND (ra.name ILIKE $%d OR similarity(ra.name, $%d) > 0.25)
-				 LIMIT 1),
-				g.reach_relationship
-			)`, qArgN, qArgN+1)
-	}
 
 	sql := fmt.Sprintf(`
 		SELECT
@@ -541,19 +524,20 @@ func (h *GaugeHandler) querySearch(r *http.Request, p searchParams) (interface {
 			g.featured,
 			g.prominence_score,
 			g.reach_id,
+			-- runs-unify 5c: runs on this gauge = user_reaches.primary_gauge_id (h2oflows twins).
 			ARRAY(
-				SELECT ra.name FROM reaches ra
-				WHERE ra.primary_gauge_id = g.id
+				SELECT ra.name FROM user_reaches ra
+				WHERE ra.primary_gauge_id = g.id AND ra.owner_id = '00000000-0000-0000-0000-000000000001' AND ra.deleted_at IS NULL
 				ORDER BY ra.name LIMIT 4
 			)                  AS reach_names,
 			ARRAY(
-				SELECT ra.slug FROM reaches ra
-				WHERE ra.primary_gauge_id = g.id
+				SELECT ra.slug FROM user_reaches ra
+				WHERE ra.primary_gauge_id = g.id AND ra.owner_id = '00000000-0000-0000-0000-000000000001' AND ra.deleted_at IS NULL
 				ORDER BY ra.name LIMIT 4
 			)                  AS reach_slugs,
 			ARRAY(
-				SELECT COALESCE(ra.common_name, ra.name) FROM reaches ra
-				WHERE ra.primary_gauge_id = g.id
+				SELECT COALESCE(ra.long_name, ra.name) FROM user_reaches ra
+				WHERE ra.primary_gauge_id = g.id AND ra.owner_id = '00000000-0000-0000-0000-000000000001' AND ra.deleted_at IS NULL
 				ORDER BY ra.name LIMIT 4
 			)                  AS reach_common_names,
 			%s                 AS reach_relationship,
@@ -563,8 +547,8 @@ func (h *GaugeHandler) querySearch(r *http.Request, p searchParams) (interface {
 			g.state_abbr,
 			g.basin_name,
 			g.watershed_name,
-			(SELECT ra.river_name FROM reaches ra
-			 WHERE ra.primary_gauge_id = g.id AND ra.river_name IS NOT NULL
+			(SELECT ra.river_name FROM user_reaches ra
+			 WHERE ra.primary_gauge_id = g.id AND ra.owner_id = '00000000-0000-0000-0000-000000000001' AND ra.deleted_at IS NULL AND ra.river_name IS NOT NULL
 			 ORDER BY ra.name LIMIT 1
 			) AS river_name,
 			g.current_cfs,
@@ -577,18 +561,18 @@ func (h *GaugeHandler) querySearch(r *http.Request, p searchParams) (interface {
 			SELECT
 				COALESCE(t.label, rch_base.base_label) AS label,
 				CASE
-					WHEN COALESCE(t.color, rch_base.base_color) LIKE 'red%'  THEN 'caution'
-					WHEN COALESCE(t.color, rch_base.base_color) LIKE 'blue%' THEN 'flood'
+					WHEN COALESCE(t.color, rch_base.base_color) LIKE 'red%%'  THEN 'caution'
+					WHEN COALESCE(t.color, rch_base.base_color) LIKE 'blue%%' THEN 'flood'
 					WHEN COALESCE(t.color, rch_base.base_color) IS NOT NULL  THEN 'runnable'
 					ELSE 'unknown'
 				END AS flow_status
 			FROM (
-				SELECT id, base_label, base_color FROM reaches
-				WHERE primary_gauge_id = g.id ORDER BY slug LIMIT 1
+				SELECT id, base_label, base_color FROM user_reaches
+				WHERE primary_gauge_id = g.id AND owner_id = '00000000-0000-0000-0000-000000000001' AND deleted_at IS NULL ORDER BY slug LIMIT 1
 			) rch_base
 			LEFT JOIN LATERAL (
-				SELECT fr.label, fr.color FROM flow_ranges fr
-				WHERE fr.reach_id = rch_base.id
+				SELECT fr.label, fr.color FROM user_reach_flow_ranges fr
+				WHERE fr.user_reach_id = rch_base.id
 				  AND g.current_cfs >= fr.value
 				ORDER BY fr.value DESC LIMIT 1
 			) t ON TRUE
@@ -717,18 +701,18 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			g.prominence_score,
 			g.reach_id,
 			ARRAY(
-				SELECT ra.name FROM reaches ra
-				WHERE ra.primary_gauge_id = g.id
+				SELECT ra.name FROM user_reaches ra
+				WHERE ra.primary_gauge_id = g.id AND ra.owner_id = '00000000-0000-0000-0000-000000000001' AND ra.deleted_at IS NULL
 				ORDER BY ra.name LIMIT 4
 			)                                AS reach_names,
 			ARRAY(
-				SELECT ra.slug FROM reaches ra
-				WHERE ra.primary_gauge_id = g.id
+				SELECT ra.slug FROM user_reaches ra
+				WHERE ra.primary_gauge_id = g.id AND ra.owner_id = '00000000-0000-0000-0000-000000000001' AND ra.deleted_at IS NULL
 				ORDER BY ra.name LIMIT 4
 			)                                AS reach_slugs,
 			ARRAY(
-				SELECT COALESCE(ra.common_name, ra.name) FROM reaches ra
-				WHERE ra.primary_gauge_id = g.id
+				SELECT COALESCE(ra.long_name, ra.name) FROM user_reaches ra
+				WHERE ra.primary_gauge_id = g.id AND ra.owner_id = '00000000-0000-0000-0000-000000000001' AND ra.deleted_at IS NULL
 				ORDER BY ra.name LIMIT 4
 			)                                AS reach_common_names,
 			g.reach_relationship,
@@ -758,35 +742,9 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			-- Use the requested slug if provided; else first alphabetical match per table.
 			SELECT common_name, full_name, river_name, basin_group, center_lng,
 			       state_abbr, river_order, author_handle, river_id
+			-- runs-unify 5c: context reach resolved from user_reaches (curated
+			-- h2oflows twins prioritised); the legacy reaches branch is retired.
 			FROM (
-				SELECT
-					COALESCE(rctx.common_name, rctx.name) AS common_name,
-					CASE WHEN rctx.put_in_name IS NOT NULL AND rctx.take_out_name IS NOT NULL
-					     THEN rctx.put_in_name || ' to ' || rctx.take_out_name
-					     ELSE NULL END AS full_name,
-					rctx.river_name,
-					COALESCE(rctx_rv.basin, g.watershed_name) AS basin_group,
-					COALESCE(
-					    (SELECT MIN(ST_X(ra.location::geometry))
-					     FROM reach_access ra
-					     WHERE ra.reach_id = rctx.id
-					       AND ra.access_type = 'put_in'
-					       AND ra.location IS NOT NULL),
-					    ST_X(ST_Centroid(rctx.centerline::geometry))
-					) AS center_lng,
-					COALESCE(rctx.state_abbr, rctx_rv.state_abbr) AS state_abbr,
-					rctx.river_order,
-					NULL::text AS author_handle,
-					rctx_rv.id::text AS river_id,
-					0 AS _prio
-				FROM reaches rctx
-				LEFT JOIN rivers rctx_rv ON rctx_rv.id = rctx.river_id
-				WHERE rctx.primary_gauge_id = g.id
-				  AND rctx.slug = COALESCE(
-				      ctx.reach_slug,
-				      (SELECT slug FROM reaches WHERE primary_gauge_id = g.id ORDER BY slug LIMIT 1)
-				  )
-				UNION ALL
 				SELECT
 					ur.name     AS common_name,
 					ur.long_name AS full_name,
@@ -797,11 +755,12 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 					NULL::smallint AS river_order,
 					up.handle AS author_handle,
 					ur_rv.id::text AS river_id,
-					1 AS _prio
+					CASE WHEN ur.owner_id = '00000000-0000-0000-0000-000000000001' THEN 0 ELSE 1 END AS _prio
 				FROM user_reaches ur
 				LEFT JOIN rivers ur_rv ON ur_rv.id = ur.river_id
 				JOIN user_profiles up ON up.owner_id = ur.owner_id
 				WHERE ur.primary_gauge_id = g.id
+				  AND ur.deleted_at IS NULL
 				  AND ur.slug = COALESCE(
 				      ctx.reach_slug,
 				      (SELECT slug FROM user_reaches WHERE primary_gauge_id = g.id ORDER BY slug LIMIT 1)
@@ -820,17 +779,17 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 					ELSE 'unknown'
 				END AS flow_status
 			FROM (
-				SELECT id, base_label, base_color FROM reaches
-				WHERE primary_gauge_id = g.id
+				SELECT id, base_label, base_color FROM user_reaches
+				WHERE primary_gauge_id = g.id AND owner_id = '00000000-0000-0000-0000-000000000001' AND deleted_at IS NULL
 				  AND slug = COALESCE(
 				      ctx.reach_slug,
-				      (SELECT slug FROM reaches WHERE primary_gauge_id = g.id ORDER BY slug LIMIT 1)
+				      (SELECT slug FROM user_reaches WHERE primary_gauge_id = g.id AND owner_id = '00000000-0000-0000-0000-000000000001' AND deleted_at IS NULL ORDER BY slug LIMIT 1)
 				  )
 				LIMIT 1
 			) rch_w
 			LEFT JOIN LATERAL (
-				SELECT fr.label, fr.color FROM flow_ranges fr
-				WHERE fr.reach_id = rch_w.id
+				SELECT fr.label, fr.color FROM user_reach_flow_ranges fr
+				WHERE fr.user_reach_id = rch_w.id
 				  AND g.current_cfs >= fr.value
 				ORDER BY fr.value DESC LIMIT 1
 			) t ON TRUE
@@ -846,38 +805,38 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 	features := make([]Feature, 0)
 	for rows.Next() {
 		var (
-			id                     string
-			contextReachSlug       *string
-			externalID             string
-			source                 string
-			name                   *string
-			status                 string
-			featured               bool
-			prominenceScore        float64
-			reachID                *string
-			reachNamesRaw          []string
-			reachSlugsRaw          []string
-			reachCommonNamesRaw    []string
-			reachRelationship      *string
-			lastReadingAt          *time.Time
-			lng                    *float64
-			lat                    *float64
-			stateAbbr              *string
-			basinName              *string
-			watershedName          *string
-			contextReachCommonName  *string
-			contextReachFullName    *string
-			contextReachRiverName   *string
-			contextReachRiverID     *string
-			contextReachBasinGroup  *string
-			contextReachCenterLng      *float64
-			contextReachRiverOrder     *int16
-			contextReachAuthorHandle   *string
-			currentCFS                 *float64
-			flowStatus             string
-			flowBandLabel          *string
-			pollHealth             string
-			lastPollSuccessAt      *time.Time
+			id                       string
+			contextReachSlug         *string
+			externalID               string
+			source                   string
+			name                     *string
+			status                   string
+			featured                 bool
+			prominenceScore          float64
+			reachID                  *string
+			reachNamesRaw            []string
+			reachSlugsRaw            []string
+			reachCommonNamesRaw      []string
+			reachRelationship        *string
+			lastReadingAt            *time.Time
+			lng                      *float64
+			lat                      *float64
+			stateAbbr                *string
+			basinName                *string
+			watershedName            *string
+			contextReachCommonName   *string
+			contextReachFullName     *string
+			contextReachRiverName    *string
+			contextReachRiverID      *string
+			contextReachBasinGroup   *string
+			contextReachCenterLng    *float64
+			contextReachRiverOrder   *int16
+			contextReachAuthorHandle *string
+			currentCFS               *float64
+			flowStatus               string
+			flowBandLabel            *string
+			pollHealth               string
+			lastPollSuccessAt        *time.Time
 		)
 		if err := rows.Scan(
 			&id, &contextReachSlug, &externalID, &source, &name, &status,
@@ -987,14 +946,14 @@ func (h *GaugeHandler) GetSeasonalStats(w http.ResponseWriter, r *http.Request) 
 }
 
 type monthlyStats struct {
-	Month    int      `json:"month"`    // 1–12
+	Month    int      `json:"month"` // 1–12
 	Mean     *float64 `json:"mean"`
 	P10      *float64 `json:"p10"`
 	P25      *float64 `json:"p25"`
-	P50      *float64 `json:"p50"`     // median
+	P50      *float64 `json:"p50"` // median
 	P75      *float64 `json:"p75"`
 	P90      *float64 `json:"p90"`
-	Count    int      `json:"count"`   // years of record for this month
+	Count    int      `json:"count"`    // years of record for this month
 	Coverage float64  `json:"coverage"` // 0–1 relative to the most-active month
 }
 

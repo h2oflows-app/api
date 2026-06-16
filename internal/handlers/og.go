@@ -69,14 +69,14 @@ func (h *OGHandler) loadReachData(ctx context.Context, slug string) (og.ReachDat
 	err := h.db.QueryRow(ctx, `
 		SELECT
 			r.name,
-			r.common_name,
+			r.long_name,
 			rv.name AS river_name,
-			r.region,
+			NULL::text AS region,
 			r.class_max,
-			r.length_mi,
+			ROUND((ST_Length(r.centerline::geography)/1609.34)::numeric,2)::float8 AS length_mi,
 			lr.value AS current_cfs,
 			fr.band_label AS flow_band_label
-		FROM reaches r
+		FROM user_reaches r
 		LEFT JOIN rivers rv ON rv.id = r.river_id
 		LEFT JOIN gauges g  ON g.id  = r.primary_gauge_id
 		LEFT JOIN LATERAL (
@@ -86,8 +86,8 @@ func (h *OGHandler) loadReachData(ctx context.Context, slug string) (og.ReachDat
 			ORDER BY timestamp DESC LIMIT 1
 		) lr ON TRUE
 		LEFT JOIN LATERAL (
-			SELECT label, color FROM flow_ranges
-			WHERE reach_id = r.id
+			SELECT label, color FROM user_reach_flow_ranges
+			WHERE user_reach_id = r.id
 			  AND lr.value >= value
 			ORDER BY value DESC
 			LIMIT 1
@@ -95,7 +95,7 @@ func (h *OGHandler) loadReachData(ctx context.Context, slug string) (og.ReachDat
 		LATERAL (
 			SELECT COALESCE(thresh.label, CASE WHEN lr.value IS NOT NULL THEN r.base_label END) AS band_label
 		) fr
-		WHERE r.slug = $1
+		WHERE r.slug = $1 AND r.owner_id = '00000000-0000-0000-0000-000000000001' AND r.deleted_at IS NULL
 	`, slug).Scan(&name, &commonName, &riverName, &region, &classMax, &lengthMi, &cfs, &bandLabel)
 	if err != nil {
 		return d, err
@@ -136,13 +136,13 @@ func (h *OGHandler) Report(w http.ResponseWriter, r *http.Request) {
 
 	d := og.ReportData{ID: id}
 	var (
-		name       string
-		handle     *string
-		reportDate string
-		flowCfs    *float64
-		flowBand   *string
-		paddled    bool
-		reachName  *string
+		name        string
+		handle      *string
+		reportDate  string
+		flowCfs     *float64
+		flowBand    *string
+		paddled     bool
+		reachName   *string
 		reachCommon *string
 	)
 	err := h.db.QueryRow(r.Context(), `
@@ -154,9 +154,9 @@ func (h *OGHandler) Report(w http.ResponseWriter, r *http.Request) {
 			rep.flow_band,
 			rep.paddled,
 			rch.name AS reach_name,
-			rch.common_name AS reach_common
+			rch.long_name AS reach_common
 		FROM reports rep
-		LEFT JOIN reaches rch ON rch.id = rep.reach_id
+		LEFT JOIN user_reaches rch ON rch.id = rep.user_reach_id
 		WHERE rep.id = $1
 	`, id).Scan(&name, &handle, &reportDate, &flowCfs, &flowBand, &paddled, &reachName, &reachCommon)
 	if err != nil {
@@ -200,9 +200,9 @@ func (h *OGHandler) Gauge(w http.ResponseWriter, r *http.Request) {
 
 	d := og.GaugeData{ID: id}
 	var (
-		name     string
-		source   *string
-		cfs      *float64
+		name   string
+		source *string
+		cfs    *float64
 	)
 	err := h.db.QueryRow(r.Context(), `
 		SELECT

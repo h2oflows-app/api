@@ -283,10 +283,7 @@ func main() {
 			// Rivers-management reads/writes (unassigned, grouped, auto-river, river
 			// assign, /admin/rivers CRUD, reorder, gnis-lookup) are intentionally
 			// retained here and flip as one unit in Phase 4.
-			r.Get("/admin/reaches/unassigned", admin.ListUnassignedReaches)
-			r.Get("/admin/reaches/grouped", admin.GroupedReaches)
 			r.Get("/admin/rivers", admin.ListRivers)
-			r.Get("/admin/rivers/{riverSlug}", admin.GetRiver)
 			// NOTE: rivers-mgmt writes (CreateRiver/DeleteRiver/ReorderReachesForRiver)
 			// retired in runs-unify 5b — they wrote the legacy reaches table and had
 			// no live UI caller (admin UI only reads GET /admin/rivers).
