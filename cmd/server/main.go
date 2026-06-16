@@ -115,7 +115,6 @@ func main() {
 	reaches.WarmCache(context.Background())
 	reaches.StartCacheRefresh(pollerCtx, pollInterval.USGS)
 	trips := handlers.NewTripHandler(pool, describer)
-	contributions := handlers.NewContributionHandler(pool)
 	reports := handlers.NewReportHandler(pool, devFallbackID)
 	flowProposals := handlers.NewFlowProposalHandler(pool, devFallbackID)
 	flowBandOverrides := handlers.NewFlowBandOverrideHandler(pool, devFallbackID)
@@ -326,13 +325,8 @@ func main() {
 			r.Get("/admin/me/roles", admin.GetMyRoles)
 		})
 
-		r.Post("/reaches/{slug}/contributions", contributions.CreateContribution)
-		r.Post("/reaches/{slug}/trip-reports", contributions.CreateTripReport)
-		r.Get("/reaches/{slug}/trip-reports", contributions.ListTripReports)
-		r.Get("/trip-reports/{slug}", contributions.GetTripReport)
-		r.Patch("/trip-reports/{slug}", contributions.PatchTripReport)
-		r.Delete("/trip-reports/{slug}", contributions.DeleteTripReport)
-
+		// NOTE: legacy /reaches/{slug}/{contributions,trip-reports} + /proximity-events
+		// retired in runs-unify 5c — superseded by the unified `reports` table below.
 		// Reports (unified: trip reports, hazard warnings, conditions).
 		r.Post("/reaches/{slug}/reports", reports.Create)
 		r.Get("/reaches/{slug}/reports", reports.ListByReach)
@@ -355,7 +349,6 @@ func main() {
 		r.Patch("/me/dashboards/{slug}", dashboards.Update)
 		r.Delete("/me/dashboards/{slug}", dashboards.Delete)
 		r.Patch("/me/dashboards-reorder", dashboards.Reorder)
-		r.Post("/proximity-events", contributions.CreateProximityEvent)
 
 		r.Post("/trips", trips.Create)
 		r.Get("/trips", trips.List)
