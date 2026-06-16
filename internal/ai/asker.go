@@ -136,11 +136,11 @@ func (a *ReachAsker) IdentifyReach(ctx context.Context, question string, reaches
 }
 
 // Answer loads the reach's full structured data (description, rapids, access,
-// flow ranges) directly from the DB, supplements with embedding-based semantic
-// chunks, and injects all community reports using long-context prompt stuffing
-// (no retrieval). The reports block is prompt-cached per reach.
+// flow ranges) directly from the DB and injects all community reports using
+// long-context prompt stuffing (no vector retrieval). The reports block is
+// prompt-cached per reach.
 func (a *ReachAsker) Answer(ctx context.Context, reachID, reachName, question string) (string, error) {
-	// 1. Load live structured data directly from DB — always available.
+	// 1. Load live structured data directly from DB.
 	r, err := loadEmbedReach(ctx, a.db, reachID)
 	if err != nil {
 		return "", fmt.Errorf("load reach data: %w", err)
@@ -156,10 +156,10 @@ func (a *ReachAsker) Answer(ctx context.Context, reachID, reachName, question st
 		return "I don't have any data about this reach yet.", nil
 	}
 
-	// 3. Load community reports for long-context grounding.
+	// 2. Load community reports for long-context grounding.
 	reachReports, _ := loadReachReports(ctx, a.db, reachID)
 
-	// 4. Build system blocks. Reports block carries a prompt-cache breakpoint
+	// 3. Build system blocks. Reports block carries a prompt-cache breakpoint
 	//    so repeat queries to the same reach (within 5 min) skip re-tokenisation.
 	reachContext := strings.Join(chunks, "\n\n---\n\n")
 	systemBlocks := []anthropic.TextBlockParam{
