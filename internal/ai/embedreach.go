@@ -169,10 +169,14 @@ type embedChunk struct {
 func loadEmbedReach(ctx context.Context, pool *pgxpool.Pool, id string) (embedReachRow, error) {
 	var r embedReachRow
 	r.id = id
+	// runs-unify 5c: structured load reads the h2oflows sentinel twin in
+	// user_reaches (the reaches table is retired). length_mi computed inline;
+	// region/put_in_name/take_out_name don't exist on user_reaches → empty/NULL.
 	err := pool.QueryRow(ctx, `
-		SELECT name, common_name, COALESCE(region,''), class_min, class_max, length_mi, description,
-		       put_in_name, take_out_name
-		FROM reaches WHERE id = $1
+		SELECT name, COALESCE(long_name,''), ''::text, class_min, class_max,
+		       ROUND((ST_Length(centerline::geography) / 1609.34)::numeric, 2)::float8, note,
+		       NULL::text, NULL::text
+		FROM user_reaches WHERE id = $1
 	`, id).Scan(&r.name, &r.commonName, &r.region, &r.classMin, &r.classMax, &r.lengthMi, &r.description,
 		&r.putInName, &r.takeOutName)
 	if err != nil {
@@ -193,8 +197,8 @@ func loadEmbedReach(ctx context.Context, pool *pgxpool.Pool, id string) (embedRe
 		       rap.description, rap.portage_description,
 		       rap.is_permanent_hazard, rap.hazard_type
 		FROM rapids rap
-		JOIN reaches rc ON rc.id = rap.reach_id
-		WHERE rap.reach_id = $1
+		JOIN user_reaches rc ON rc.id = rap.user_reach_id
+		WHERE rap.user_reach_id = $1
 		ORDER BY effective_river_mile NULLS LAST, rap.name
 	`, id)
 	if err != nil {
@@ -215,7 +219,7 @@ func loadEmbedReach(ctx context.Context, pool *pgxpool.Pool, id string) (embedRe
 	// Access points — include all, even those without directions.
 	accRows, err := pool.Query(ctx, `
 		SELECT id, access_type, name, directions, notes
-		FROM reach_access WHERE reach_id = $1 ORDER BY access_type, name
+		FROM reach_access WHERE user_reach_id = $1 ORDER BY access_type, name
 	`, id)
 	if err != nil {
 		return r, err
@@ -232,11 +236,11 @@ func loadEmbedReach(ctx context.Context, pool *pgxpool.Pool, id string) (embedRe
 		return r, err
 	}
 
-	// Flow thresholds via reach_id.
+	// Flow thresholds via user_reach_id (runs-unify 5c).
 	frRows, err := pool.Query(ctx, `
 		SELECT fr.label, fr.value
-		FROM flow_ranges fr
-		WHERE fr.reach_id = $1
+		FROM user_reach_flow_ranges fr
+		WHERE fr.user_reach_id = $1
 		ORDER BY fr.value ASC
 	`, id)
 	if err != nil {

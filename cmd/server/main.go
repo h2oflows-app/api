@@ -61,12 +61,13 @@ func main() {
 		log.Println("ANTHROPIC_API_KEY not set — AI search enrichment disabled")
 	}
 
-	// River assistant (RAG) — requires both Voyage and Anthropic keys.
+	// River assistant — long-context prompt-stuffing of structured DB data +
+	// community reports (runs-unify 5c dropped the Voyage/reach_embeddings path).
 	var asker *ai.ReachAsker
-	if cfg.VoyageAPIKey != "" && cfg.AnthropicAPIKey != "" {
-		asker = ai.NewReachAsker(pool, cfg.VoyageAPIKey, cfg.AnthropicAPIKey)
+	if cfg.AnthropicAPIKey != "" {
+		asker = ai.NewReachAsker(pool, cfg.AnthropicAPIKey)
 	} else {
-		log.Println("VOYAGE_API_KEY not set — river assistant (/ask) disabled")
+		log.Println("ANTHROPIC_API_KEY not set — river assistant (/ask) disabled")
 	}
 
 	// Start gauge poller — runs in background, survives HTTP errors.
