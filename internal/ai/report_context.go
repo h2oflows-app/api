@@ -32,7 +32,7 @@ func loadReachReports(ctx context.Context, db *pgxpool.Pool, reachID string) ([]
 			rp.paddled, rp.flow_cfs, rp.flow_band
 		FROM reports rp
 		LEFT JOIN user_profiles up ON up.owner_id = rp.owner_id
-		WHERE rp.reach_id = $1
+		WHERE rp.user_reach_id = $1
 		  AND rp.report_date >= CURRENT_DATE - INTERVAL '24 months'
 		ORDER BY rp.report_date DESC, rp.created_at DESC
 		LIMIT 500

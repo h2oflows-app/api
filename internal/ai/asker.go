@@ -48,21 +48,19 @@ Rules:
 - Reach names often reference put-in/take-out landmarks (e.g. "Fisherman's Bridge to Hecla Junction"); the common name (aka) is what paddlers call it.
 - Keep the question natural — don't rewrite it heavily`
 
-// ReachAsker answers natural-language questions about a reach using RAG:
-// 1. Embed the question via Voyage AI
-// 2. Retrieve the top-K most similar chunks from reach_embeddings
-// 3. Feed those chunks as context to Claude and return its answer
+// ReachAsker answers natural-language questions about a reach by long-context
+// prompt-stuffing structured DB data + community reports (runs-unify 5c retired
+// the reach_embeddings vector path — it was only ever populated for curated
+// reaches, which now live as user_reaches twins).
 type ReachAsker struct {
-	db       *pgxpool.Pool
-	embedder *Embedder
-	claude   anthropic.Client
+	db     *pgxpool.Pool
+	claude anthropic.Client
 }
 
-func NewReachAsker(pool *pgxpool.Pool, voyageKey, anthropicKey string) *ReachAsker {
+func NewReachAsker(pool *pgxpool.Pool, anthropicKey string) *ReachAsker {
 	return &ReachAsker{
-		db:       pool,
-		embedder: NewEmbedder(voyageKey),
-		claude:   anthropic.NewClient(option.WithAPIKey(anthropicKey)),
+		db:     pool,
+		claude: anthropic.NewClient(option.WithAPIKey(anthropicKey)),
 	}
 }
 
@@ -113,7 +111,7 @@ func (a *ReachAsker) IdentifyReach(ctx context.Context, question string, reaches
 		Model:     anthropic.ModelClaudeHaiku4_5,
 		MaxTokens: 256,
 		System:    []anthropic.TextBlockParam{{Text: system}},
-		Messages:  []anthropic.MessageParam{
+		Messages: []anthropic.MessageParam{
 			anthropic.NewUserMessage(anthropic.NewTextBlock(question)),
 		},
 	})
@@ -138,11 +136,11 @@ func (a *ReachAsker) IdentifyReach(ctx context.Context, question string, reaches
 }
 
 // Answer loads the reach's full structured data (description, rapids, access,
-// flow ranges) directly from the DB, supplements with embedding-based semantic
-// chunks, and injects all community reports using long-context prompt stuffing
-// (no retrieval). The reports block is prompt-cached per reach.
+// flow ranges) directly from the DB and injects all community reports using
+// long-context prompt stuffing (no vector retrieval). The reports block is
+// prompt-cached per reach.
 func (a *ReachAsker) Answer(ctx context.Context, reachID, reachName, question string) (string, error) {
-	// 1. Load live structured data directly from DB — always available.
+	// 1. Load live structured data directly from DB.
 	r, err := loadEmbedReach(ctx, a.db, reachID)
 	if err != nil {
 		return "", fmt.Errorf("load reach data: %w", err)
@@ -154,39 +152,14 @@ func (a *ReachAsker) Answer(ctx context.Context, reachID, reachName, question st
 		chunks = append(chunks, c.text)
 	}
 
-	// 2. Supplement with embedding-based semantic search if available.
-	vecs, embedErr := a.embedder.Embed(ctx, []string{question})
-	if embedErr == nil && len(vecs) > 0 && vecs[0] != nil {
-		rows, queryErr := a.db.Query(ctx, `
-			SELECT chunk_type, content
-			FROM reach_embeddings
-			WHERE reach_id = $1
-			ORDER BY embedding <=> $2::vector
-			LIMIT 6
-		`, reachID, FormatVector(vecs[0]))
-		if queryErr == nil {
-			defer rows.Close()
-			seen := make(map[string]bool)
-			for _, c := range chunks {
-				seen[c] = true
-			}
-			for rows.Next() {
-				var chunkType, content string
-				if err := rows.Scan(&chunkType, &content); err == nil && !seen[content] {
-					chunks = append(chunks, content)
-				}
-			}
-		}
-	}
-
 	if len(chunks) == 0 {
 		return "I don't have any data about this reach yet.", nil
 	}
 
-	// 3. Load community reports for long-context grounding.
+	// 2. Load community reports for long-context grounding.
 	reachReports, _ := loadReachReports(ctx, a.db, reachID)
 
-	// 4. Build system blocks. Reports block carries a prompt-cache breakpoint
+	// 3. Build system blocks. Reports block carries a prompt-cache breakpoint
 	//    so repeat queries to the same reach (within 5 min) skip re-tokenisation.
 	reachContext := strings.Join(chunks, "\n\n---\n\n")
 	systemBlocks := []anthropic.TextBlockParam{

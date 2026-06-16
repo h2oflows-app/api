@@ -874,13 +874,15 @@ func (h *ReachHandler) GlobalAsk(w http.ResponseWriter, r *http.Request) {
 
 	// Load reaches with rapids and access names for richer identification.
 	rows, err := h.db.Query(r.Context(), `
-		SELECT r.slug, r.name, COALESCE(r.common_name,''), COALESCE(r.region,''),
+		SELECT r.slug, r.name, COALESCE(r.long_name,''), ''::text AS region,
 		       COALESCE(array_agg(DISTINCT rap.name) FILTER (WHERE rap.name IS NOT NULL), '{}') AS rapids,
 		       COALESCE(array_agg(DISTINCT ra.name)  FILTER (WHERE ra.name  IS NOT NULL), '{}') AS access_names
-		FROM reaches r
-		LEFT JOIN rapids rap ON rap.reach_id = r.id
-		LEFT JOIN reach_access ra ON ra.reach_id = r.id
-		GROUP BY r.id, r.slug, r.name, r.common_name, r.region
+		-- runs-unify 5c: identify against the h2oflows sentinel twins in user_reaches.
+		FROM user_reaches r
+		LEFT JOIN rapids rap ON rap.user_reach_id = r.id
+		LEFT JOIN reach_access ra ON ra.user_reach_id = r.id
+		WHERE r.owner_id = '00000000-0000-0000-0000-000000000001' AND r.deleted_at IS NULL
+		GROUP BY r.id, r.slug, r.name, r.long_name
 		ORDER BY r.name
 	`)
 	if err != nil {
@@ -937,10 +939,11 @@ func (h *ReachHandler) GlobalAsk(w http.ResponseWriter, r *http.Request) {
 			var primaryGaugeID *string
 			if err := h.db.QueryRow(askCtx, `
 				SELECT id, name,
-				       ST_Y(start_point::geometry) AS put_in_lat,
-				       ST_X(start_point::geometry) AS put_in_lng,
+				       ST_Y(put_in::geometry) AS put_in_lat,
+				       ST_X(put_in::geometry) AS put_in_lng,
 				       primary_gauge_id
-				FROM reaches WHERE slug = $1
+				FROM user_reaches WHERE slug = $1
+				  AND owner_id = '00000000-0000-0000-0000-000000000001' AND deleted_at IS NULL
 			`, slug).Scan(&reachID, &reachName, &putInLat, &putInLng, &primaryGaugeID); err != nil {
 				log.Printf("global ask: reach not found for slug %q: %v", slug, err)
 				return
