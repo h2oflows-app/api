@@ -86,13 +86,13 @@ ALTER TABLE reports DROP COLUMN IF EXISTS reach_id;
 
 -- ── 5. Drop dead tables ───────────────────────────────────────────────────────
 
-DROP TABLE IF EXISTS trip_reports;
-DROP TABLE IF EXISTS contributions;
-DROP TABLE IF EXISTS proximity_events;
-DROP TABLE IF EXISTS reach_relationships;
-DROP TABLE IF EXISTS reach_embeddings;
-DROP TABLE IF EXISTS flow_ranges;
-DROP TABLE IF EXISTS gauge_reach_associations;
+DROP TABLE IF EXISTS proximity_events CASCADE;
+DROP TABLE IF EXISTS trip_reports CASCADE;
+DROP TABLE IF EXISTS contributions CASCADE;
+DROP TABLE IF EXISTS reach_relationships CASCADE;
+DROP TABLE IF EXISTS reach_embeddings CASCADE;
+DROP TABLE IF EXISTS flow_ranges CASCADE;
+DROP TABLE IF EXISTS gauge_reach_associations CASCADE;
 
 -- ── 6. Drop dead columns ──────────────────────────────────────────────────────
 
