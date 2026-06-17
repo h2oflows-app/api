@@ -166,7 +166,7 @@ func (h *WatchlistHandler) Add(w http.ResponseWriter, r *http.Request) {
 			// Not owned by caller — check if curated reach exists; if yes, fork.
 			var curatedID string
 			cErr := tx.QueryRow(r.Context(),
-				`SELECT id FROM reaches WHERE slug = $1`, *body.ReachSlug,
+				`SELECT id FROM user_reaches WHERE slug = $1 AND owner_id = '00000000-0000-0000-0000-000000000001' AND deleted_at IS NULL`, *body.ReachSlug,
 			).Scan(&curatedID)
 			if cErr == nil {
 				// Check if user already has a fork of this curated reach — reuse it
@@ -174,7 +174,7 @@ func (h *WatchlistHandler) Add(w http.ResponseWriter, r *http.Request) {
 				// so the ownErr check above misses it and double-forks on re-add).
 				var existingForkSlug string
 				existingForkErr := tx.QueryRow(r.Context(),
-					`SELECT slug FROM user_reaches WHERE owner_id = $1 AND forked_from_reach_id = $2::uuid LIMIT 1`,
+					`SELECT slug FROM user_reaches WHERE owner_id = $1 AND forked_from_user_reach_id = $2::uuid LIMIT 1`,
 					userID, curatedID,
 				).Scan(&existingForkSlug)
 				if existingForkErr == nil {

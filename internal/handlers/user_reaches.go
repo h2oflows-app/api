@@ -841,7 +841,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 		LEFT JOIN rivers rv ON rv.id = ur.river_id
 		LEFT JOIN gauges g ON g.id = ur.primary_gauge_id
 		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
-		LEFT JOIN reaches fr_reach ON fr_reach.id = ur.forked_from_reach_id
+		LEFT JOIN user_reaches fr_reach ON fr_reach.id = ur.forked_from_user_reach_id
 		LEFT JOIN user_reaches fr_ur ON fr_ur.id = ur.forked_from_user_reach_id
 		LEFT JOIN LATERAL (
 			SELECT value, timestamp FROM gauge_readings
@@ -1045,7 +1045,7 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 		LEFT JOIN rivers rv ON rv.id = ur.river_id
 		LEFT JOIN gauges g ON g.id = ur.primary_gauge_id
 		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
-		LEFT JOIN reaches fr_reach ON fr_reach.id = ur.forked_from_reach_id
+		LEFT JOIN user_reaches fr_reach ON fr_reach.id = ur.forked_from_user_reach_id
 		LEFT JOIN user_reaches fr_ur ON fr_ur.id = ur.forked_from_user_reach_id
 		LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
 		LEFT JOIN LATERAL (
@@ -2112,7 +2112,7 @@ func forkCuratedReachTx(ctx context.Context, q pgxQueryer, ownerID, sourceSlug s
 	type srcRow struct {
 		ID         string
 		Name       string
-		CommonName *string
+		LongName   *string
 		RiverID    *string
 		RiverName  *string
 		ClassMin   *float64
@@ -2127,24 +2127,25 @@ func forkCuratedReachTx(ctx context.Context, q pgxQueryer, ownerID, sourceSlug s
 	var src srcRow
 	err = q.QueryRow(ctx, `
 		SELECT
-			r.id,
-			r.name,
-			r.common_name,
-			r.river_id::text,
-			COALESCE(r.river_name, rv.name),
-			r.class_min,
-			r.class_max,
-			r.primary_gauge_id::text,
-			ST_X(r.start_point::geometry),
-			ST_Y(r.start_point::geometry),
-			ST_X(r.end_point::geometry),
-			ST_Y(r.end_point::geometry),
-			ST_AsGeoJSON(r.centerline::geometry)
-		FROM reaches r
-		LEFT JOIN rivers rv ON rv.id = r.river_id
-		WHERE r.slug = $1
+			id,
+			name,
+			long_name,
+			river_id::text,
+			river_name,
+			class_min,
+			class_max,
+			primary_gauge_id::text,
+			ST_X(put_in::geometry),
+			ST_Y(put_in::geometry),
+			ST_X(take_out::geometry),
+			ST_Y(take_out::geometry),
+			ST_AsGeoJSON(centerline::geometry)
+		FROM user_reaches
+		WHERE slug = $1
+		  AND owner_id = '00000000-0000-0000-0000-000000000001'
+		  AND deleted_at IS NULL
 	`, sourceSlug).Scan(
-		&src.ID, &src.Name, &src.CommonName,
+		&src.ID, &src.Name, &src.LongName,
 		&src.RiverID, &src.RiverName,
 		&src.ClassMin, &src.ClassMax,
 		&src.GaugeID,
@@ -2157,8 +2158,8 @@ func forkCuratedReachTx(ctx context.Context, q pgxQueryer, ownerID, sourceSlug s
 	}
 
 	forkName := src.Name
-	if src.CommonName != nil && *src.CommonName != "" {
-		forkName = *src.CommonName
+	if src.LongName != nil && *src.LongName != "" {
+		forkName = *src.LongName
 	}
 
 	baseSlug := kmlimport.Slugify(forkName)
@@ -2178,7 +2179,7 @@ func forkCuratedReachTx(ctx context.Context, q pgxQueryer, ownerID, sourceSlug s
 			(owner_id, slug, name, river_id, river_name,
 			 put_in, take_out,
 			 class_min, class_max, primary_gauge_id,
-			 forked_from_reach_id, original_forked_at)
+			 forked_from_user_reach_id, original_forked_at)
 		VALUES
 			($1, $2, $3, $4::uuid, $5,
 			 ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography,
@@ -2203,18 +2204,21 @@ func forkCuratedReachTx(ctx context.Context, q pgxQueryer, ownerID, sourceSlug s
 		`, newID, string(src.Centerline))
 	}
 
-	// Copy base band config + thresholds verbatim from curated reach (V12).
+	// Copy base band config + thresholds verbatim from sentinel twin (V12).
 	_, _ = q.Exec(ctx, `
 		UPDATE user_reaches ur
 		SET base_label = r.base_label, base_color = r.base_color
-		FROM reaches r
+		FROM user_reaches r
 		WHERE ur.id = $1 AND r.id = $2
+		  AND r.owner_id = '00000000-0000-0000-0000-000000000001'
+		  AND r.deleted_at IS NULL
 	`, newID, src.ID)
 	_, _ = q.Exec(ctx, `
 		INSERT INTO user_reach_flow_ranges (user_reach_id, label, value, color)
 		SELECT $1, label, value, color
-		FROM flow_ranges
-		WHERE reach_id = $2
+		FROM user_reach_flow_ranges
+		WHERE user_reach_id = $2
+		ON CONFLICT (user_reach_id, value) DO NOTHING
 	`, newID, src.ID)
 
 	return newID, newSlug, nil

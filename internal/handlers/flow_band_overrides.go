@@ -46,7 +46,12 @@ type reachFlowBandOverride struct {
 
 func (h *FlowBandOverrideHandler) reachIDForSlug(r *http.Request, slug string) (string, error) {
 	var id string
-	err := h.db.QueryRow(r.Context(), `SELECT id FROM reaches WHERE slug = $1`, slug).Scan(&id)
+	err := h.db.QueryRow(r.Context(), `
+		SELECT id FROM user_reaches
+		WHERE slug = $1
+		  AND owner_id = '00000000-0000-0000-0000-000000000001'
+		  AND deleted_at IS NULL
+	`, slug).Scan(&id)
 	return id, err
 }
 
@@ -65,10 +70,10 @@ func (h *FlowBandOverrideHandler) GetOwn(w http.ResponseWriter, r *http.Request)
 	}
 	var o reachFlowBandOverride
 	err = h.db.QueryRow(r.Context(), `
-		SELECT id, user_id, reach_id::text, low_max, running_min, running_max,
+		SELECT id, user_id, user_reach_id::text, low_max, running_min, running_max,
 		       high_min, note, created_at, updated_at
 		FROM reach_flow_band_overrides
-		WHERE user_id = $1 AND reach_id = $2
+		WHERE user_id = $1 AND user_reach_id = $2
 	`, callerID, reachID).Scan(
 		&o.ID, &o.UserID, &o.ReachID, &o.LowMax, &o.RunningMin, &o.RunningMax,
 		&o.HighMin, &o.Note, &o.CreatedAt, &o.UpdatedAt,
@@ -127,9 +132,9 @@ func (h *FlowBandOverrideHandler) UpsertOwn(w http.ResponseWriter, r *http.Reque
 	var id string
 	err = h.db.QueryRow(r.Context(), `
 		INSERT INTO reach_flow_band_overrides
-		    (user_id, reach_id, low_max, running_min, running_max, high_min, note)
+		    (user_id, user_reach_id, low_max, running_min, running_max, high_min, note)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		ON CONFLICT (user_id, reach_id) DO UPDATE SET
+		ON CONFLICT (user_id, user_reach_id) DO UPDATE SET
 		    low_max     = EXCLUDED.low_max,
 		    running_min = EXCLUDED.running_min,
 		    running_max = EXCLUDED.running_max,
@@ -159,7 +164,7 @@ func (h *FlowBandOverrideHandler) DeleteOwn(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	_, _ = h.db.Exec(r.Context(),
-		`DELETE FROM reach_flow_band_overrides WHERE user_id = $1 AND reach_id = $2`,
+		`DELETE FROM reach_flow_band_overrides WHERE user_id = $1 AND user_reach_id = $2`,
 		callerID, reachID,
 	)
 	w.WriteHeader(http.StatusNoContent)
@@ -174,13 +179,13 @@ func (h *FlowBandOverrideHandler) AdminListForReach(w http.ResponseWriter, r *ht
 		return
 	}
 	rows, err := h.db.Query(r.Context(), `
-		SELECT o.id, o.user_id, o.reach_id::text,
+		SELECT o.id, o.user_id, o.user_reach_id::text,
 		       o.low_max, o.running_min, o.running_max, o.high_min,
 		       o.note, o.created_at, o.updated_at,
 		       up.handle
 		FROM reach_flow_band_overrides o
 		LEFT JOIN user_profiles up ON up.owner_id = o.user_id
-		WHERE o.reach_id = $1
+		WHERE o.user_reach_id = $1
 		ORDER BY o.updated_at DESC
 	`, reachID)
 	if err != nil {
@@ -214,18 +219,19 @@ func (h *FlowBandOverrideHandler) AdminQueue(w http.ResponseWriter, r *http.Requ
 		    r.id::text,
 		    r.slug,
 		    r.name,
-		    COALESCE(r.river_name, rv.name) AS river_name,
+		    r.river_name,
 		    COUNT(*)                         AS override_count,
 		    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY o.low_max)     AS median_low_max,
 		    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY o.running_min) AS median_running_min,
 		    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY o.running_max) AS median_running_max,
 		    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY o.high_min)    AS median_high_min,
-		    (SELECT value FROM flow_ranges WHERE reach_id = r.id AND label = 'Running' LIMIT 1) AS canonical_running_value,
-		    (SELECT value FROM flow_ranges WHERE reach_id = r.id AND label = 'High'    LIMIT 1) AS canonical_high_value
+		    (SELECT value FROM user_reach_flow_ranges WHERE user_reach_id = r.id AND label = 'Running' LIMIT 1) AS canonical_running_value,
+		    (SELECT value FROM user_reach_flow_ranges WHERE user_reach_id = r.id AND label = 'High'    LIMIT 1) AS canonical_high_value
 		FROM reach_flow_band_overrides o
-		JOIN reaches r ON r.id = o.reach_id
-		LEFT JOIN rivers rv ON rv.id = r.river_id
-		GROUP BY r.id, r.slug, r.name, r.river_name, rv.name
+		JOIN user_reaches r ON r.id = o.user_reach_id
+		WHERE r.owner_id = '00000000-0000-0000-0000-000000000001'
+		  AND r.deleted_at IS NULL
+		GROUP BY r.id, r.slug, r.name, r.river_name
 		HAVING COUNT(*) >= 2
 		ORDER BY override_count DESC, r.name ASC
 	`)
@@ -265,11 +271,10 @@ func (h *FlowBandOverrideHandler) AdminQueue(w http.ResponseWriter, r *http.Requ
 // Computes the median of all user overrides and writes them to flow_ranges.
 func (h *FlowBandOverrideHandler) AdminApplyMedian(w http.ResponseWriter, r *http.Request) {
 	slug := chi.URLParam(r, "slug")
-	var reachID string
-	var gaugeID *string
+	var userReachID string
 	err := h.db.QueryRow(r.Context(),
-		`SELECT id::text, primary_gauge_id::text FROM reaches WHERE slug = $1`, slug,
-	).Scan(&reachID, &gaugeID)
+		`SELECT id::text FROM user_reaches WHERE slug = $1 AND owner_id = '00000000-0000-0000-0000-000000000001' AND deleted_at IS NULL`, slug,
+	).Scan(&userReachID)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "reach not found")
 		return
@@ -285,8 +290,8 @@ func (h *FlowBandOverrideHandler) AdminApplyMedian(w http.ResponseWriter, r *htt
 		    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY running_min),
 		    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY running_max),
 		    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY high_min)
-		FROM reach_flow_band_overrides WHERE reach_id = $1
-	`, reachID).Scan(&count, &lowMax, &runMin, &runMax, &highMin)
+		FROM reach_flow_band_overrides WHERE user_reach_id = $1
+	`, userReachID).Scan(&count, &lowMax, &runMin, &runMax, &highMin)
 	if err != nil || count < 2 {
 		errorResponse(w, http.StatusBadRequest, "not enough overrides to apply median")
 		return
@@ -296,16 +301,12 @@ func (h *FlowBandOverrideHandler) AdminApplyMedian(w http.ResponseWriter, r *htt
 		return
 	}
 	upsert := func(label string, val float64, color string) error {
+		_, _ = h.db.Exec(r.Context(), `DELETE FROM user_reach_flow_ranges WHERE user_reach_id = $1 AND label = $2`, userReachID, label)
 		_, e := h.db.Exec(r.Context(), `
-			INSERT INTO flow_ranges
-			    (gauge_id, reach_id, label, value, color, data_source, verified)
-			VALUES ($1, $2, $3, $4, $5, 'override_median', true)
-			ON CONFLICT (reach_id, label) DO UPDATE SET
-			    value       = EXCLUDED.value,
-			    color       = EXCLUDED.color,
-			    data_source = 'override_median',
-			    verified    = true
-		`, gaugeID, reachID, label, val, color)
+			INSERT INTO user_reach_flow_ranges (user_reach_id, label, value, color)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (user_reach_id, value) DO UPDATE SET label = EXCLUDED.label, color = EXCLUDED.color
+		`, userReachID, label, val, color)
 		return e
 	}
 	if err := upsert("Running", *runMin, "green-3"); err != nil {
