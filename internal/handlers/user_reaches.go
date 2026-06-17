@@ -829,11 +829,8 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 			rv.state_abbr AS river_state_abbr,
 			rv.basin AS river_basin,
 			ur.visibility,
-			COALESCE(fr_reach.slug, fr_ur.slug) AS forked_from_slug,
-			COALESCE(
-				COALESCE(fr_reach.common_name, fr_reach.name),
-				fr_ur.name
-			) AS forked_from_name,
+			fr_reach.slug AS forked_from_slug,
+			COALESCE(fr_reach.long_name, fr_reach.name) AS forked_from_name,
 			ur.original_author_handle,
 			ur.original_forked_at,
 			ur.last_modified_after_fork_at
@@ -842,7 +839,6 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 		LEFT JOIN gauges g ON g.id = ur.primary_gauge_id
 		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
 		LEFT JOIN user_reaches fr_reach ON fr_reach.id = ur.forked_from_user_reach_id
-		LEFT JOIN user_reaches fr_ur ON fr_ur.id = ur.forked_from_user_reach_id
 		LEFT JOIN LATERAL (
 			SELECT value, timestamp FROM gauge_readings
 			WHERE gauge_id = ur.primary_gauge_id
@@ -1030,11 +1026,8 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 			rv.state_abbr AS river_state_abbr,
 			rv.basin AS river_basin,
 			ur.visibility,
-			COALESCE(fr_reach.slug, fr_ur.slug) AS forked_from_slug,
-			COALESCE(
-				COALESCE(fr_reach.common_name, fr_reach.name),
-				fr_ur.name
-			) AS forked_from_name,
+			fr_reach.slug AS forked_from_slug,
+			COALESCE(fr_reach.long_name, fr_reach.name) AS forked_from_name,
 			ur.owner_id,
 			up.handle AS author_handle,
 			ur.original_author_handle,
@@ -1046,7 +1039,6 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 		LEFT JOIN gauges g ON g.id = ur.primary_gauge_id
 		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
 		LEFT JOIN user_reaches fr_reach ON fr_reach.id = ur.forked_from_user_reach_id
-		LEFT JOIN user_reaches fr_ur ON fr_ur.id = ur.forked_from_user_reach_id
 		LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
 		LEFT JOIN LATERAL (
 			SELECT value, timestamp FROM gauge_readings
