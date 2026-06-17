@@ -215,14 +215,20 @@ func (p *Poller) writeReading(ctx context.Context, gaugeID string, r gauge.Readi
 		         FROM (
 		             SELECT COALESCE(
 		                 (SELECT fr2.color
-		                  FROM flow_ranges fr2
-		                  WHERE fr2.gauge_id = $1 AND $2 >= fr2.value
+		                  FROM user_reach_flow_ranges fr2
+		                  JOIN user_reaches rch2 ON rch2.id = fr2.user_reach_id
+		                  WHERE rch2.primary_gauge_id = $1
+		                    AND rch2.owner_id = '00000000-0000-0000-0000-000000000001'
+		                    AND rch2.deleted_at IS NULL
+		                    AND $2 >= fr2.value
 		                  ORDER BY fr2.value DESC LIMIT 1),
 		                 r.base_color
 		             ) AS bc
-		             FROM flow_ranges fr
-		             JOIN reaches r ON r.id = fr.reach_id
-		             WHERE fr.gauge_id = $1
+		             FROM user_reach_flow_ranges fr
+		             JOIN user_reaches r ON r.id = fr.user_reach_id
+		             WHERE r.primary_gauge_id = $1
+		               AND r.owner_id = '00000000-0000-0000-0000-000000000001'
+		               AND r.deleted_at IS NULL
 		             LIMIT 1
 		         ) _bc
 		        ),
