@@ -10,15 +10,12 @@
 ```
 cmd/
   server/           main entrypoint + Chi router + migrations + poller
-  seed-reaches/     Front Range CO reaches + AI content
-  seed-state-reaches/
-  embed-reaches/    pgvector embedding for RAG
   seed-flow-ranges/
   seed-usgs-states/
-  import-kml/       KMZ/KML reach importer
-  backfill-comids/
+  backfill-river-gnis/
+  test-ask/         local harness for the /ask river assistant
 internal/
-  ai/               Claude + Voyage AI (RAG, reach seeder, search enrichment)
+  ai/               Claude long-context river assistant + search enrichment
   alerts/           Flow threshold alert evaluation
   auth/             Supabase JWT middleware
   config/           Environment config
@@ -26,7 +23,7 @@ internal/
   elevation/        Elevation profile lookups
   gaugecore/        Gauge adapter interface + USGS/DWR/HUC implementations
   handlers/         HTTP route handlers
-  kmlimport/        KMZ/KML importer + OSM/NLDI centerline sync
+  kmlimport/        KMZ/KML parser + NLDI centerline fetch (user run import)
   models/           Shared DB model types
   nldi/             USGS NLDI API client
   osm/              Overpass API client + reach centerline fetch
