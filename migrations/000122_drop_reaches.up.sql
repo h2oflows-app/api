@@ -39,7 +39,8 @@ END $$;
 -- but haven't been linked to the twin yet, resolve via slug.
 
 UPDATE user_reaches ur
-SET    forked_from_user_reach_id = twin.id
+SET    forked_from_user_reach_id = twin.id,
+       forked_from_reach_id      = NULL        -- clear to satisfy fork_single_source check constraint
 FROM   reaches r
 JOIN   user_reaches twin
        ON twin.slug     = r.slug
