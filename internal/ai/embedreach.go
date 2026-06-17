@@ -1,117 +1,13 @@
-// embedreach.go — reusable logic for generating and storing reach embeddings.
-//
-// Used by both cmd/embed-reaches (full batch re-embed) and the KMZ import
-// handler (auto-embed newly imported reaches in the background).
-//
-// Key design choices:
-//   - Reaches without descriptions ARE included — rapids and access points
-//     with only a name and coordinates still produce useful chunks.
-//   - Rapids without description text ARE included — the name, class, and
-//     river mile alone are enough for the AI to answer "where is Rapid 10?"
-//   - Access points without directions ARE included — name + type let the
-//     AI answer "what's the put-in for X?"
-//   - Already-embedded chunks are skipped (ON CONFLICT DO NOTHING).
-//   - Rate-limited at ~22s per reach to respect Voyage free tier (3 RPM).
+// embedreach.go — structured reach data loader for AI prompt stuffing.
 package ai
 
 import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
-
-// EmbedReachesAll embeds every reach in the database. Idempotent — already-
-// embedded chunks are skipped unless reembed is true (which first wipes all
-// existing embeddings).
-func EmbedReachesAll(ctx context.Context, pool *pgxpool.Pool, embedder *Embedder, reembed bool) (embedded, skipped int, err error) {
-	if reembed {
-		if _, err := pool.Exec(ctx, `DELETE FROM reach_embeddings`); err != nil {
-			return 0, 0, fmt.Errorf("delete embeddings: %w", err)
-		}
-	}
-	rows, err := pool.Query(ctx, `SELECT id FROM reaches ORDER BY name`)
-	if err != nil {
-		return 0, 0, fmt.Errorf("list reaches: %w", err)
-	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return 0, 0, err
-		}
-		ids = append(ids, id)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return 0, 0, err
-	}
-	return EmbedReaches(ctx, pool, embedder, ids, true)
-}
-
-// EmbedReaches embeds a specific set of reaches (by ID). Used after KMZ import
-// to embed only the affected reaches without rate-limiting the full corpus.
-// When rateLimit is false the per-reach sleep is skipped (useful in tests or
-// when the caller already manages concurrency).
-func EmbedReaches(ctx context.Context, pool *pgxpool.Pool, embedder *Embedder, ids []string, rateLimit bool) (embedded, skipped int, err error) {
-	for i, id := range ids {
-		r, loadErr := loadEmbedReach(ctx, pool, id)
-		if loadErr != nil {
-			return embedded, skipped, fmt.Errorf("load reach %s: %w", id, loadErr)
-		}
-
-		chunks := buildEmbedChunks(r)
-		if len(chunks) == 0 {
-			skipped++
-			continue
-		}
-
-		toEmbed := filterUnembeddedChunks(ctx, pool, id, chunks)
-		skipped += len(chunks) - len(toEmbed)
-		if len(toEmbed) == 0 {
-			continue
-		}
-
-		// Embed in batches of 100.
-		for j := 0; j < len(toEmbed); j += 100 {
-			end := j + 100
-			if end > len(toEmbed) {
-				end = len(toEmbed)
-			}
-			batch := toEmbed[j:end]
-			texts := make([]string, len(batch))
-			for k, c := range batch {
-				texts[k] = c.text
-			}
-			vecs, embedErr := embedder.Embed(ctx, texts)
-			if embedErr != nil {
-				return embedded, skipped, fmt.Errorf("embed reach %s: %w", id, embedErr)
-			}
-			for k, c := range batch {
-				if vecs[k] == nil {
-					continue
-				}
-				if insErr := insertEmbeddingRow(ctx, pool, id, c, vecs[k]); insErr != nil {
-					return embedded, skipped, fmt.Errorf("insert chunk for reach %s: %w", id, insErr)
-				}
-				embedded++
-			}
-		}
-
-		// Stay under Voyage free-tier 3 RPM between reaches (not after the last one).
-		if rateLimit && i < len(ids)-1 {
-			select {
-			case <-ctx.Done():
-				return embedded, skipped, ctx.Err()
-			case <-time.After(22 * time.Second):
-			}
-		}
-	}
-	return embedded, skipped, nil
-}
 
 // ── internal data model ───────────────────────────────────────────────────────
 
@@ -429,42 +325,4 @@ func derefStr(s *string, fallback string) string {
 		return fallback
 	}
 	return *s
-}
-
-// ── DB helpers ────────────────────────────────────────────────────────────────
-
-func filterUnembeddedChunks(ctx context.Context, pool *pgxpool.Pool, reachID string, chunks []embedChunk) []embedChunk {
-	var count int
-	pool.QueryRow(ctx, `SELECT COUNT(*) FROM reach_embeddings WHERE reach_id = $1`, reachID).Scan(&count)
-	if count == 0 {
-		return chunks
-	}
-	var out []embedChunk
-	for _, c := range chunks {
-		var exists bool
-		pool.QueryRow(ctx, `
-			SELECT EXISTS(
-				SELECT 1 FROM reach_embeddings
-				WHERE reach_id   = $1
-				  AND chunk_type = $2
-				  AND ($3::uuid IS NULL OR rapid_id  = $3)
-				  AND ($4::uuid IS NULL OR access_id = $4)
-			)
-		`, reachID, c.chunkType, c.rapidID, c.accessID).Scan(&exists)
-		if !exists {
-			out = append(out, c)
-		}
-	}
-	return out
-}
-
-func insertEmbeddingRow(ctx context.Context, pool *pgxpool.Pool, reachID string, c embedChunk, vec []float32) error {
-	_, err := pool.Exec(ctx, `
-		INSERT INTO reach_embeddings
-			(reach_id, rapid_id, access_id, chunk_type, content, embedding)
-		VALUES
-			($1, $2, $3, $4, $5, $6::vector)
-		ON CONFLICT DO NOTHING
-	`, reachID, c.rapidID, c.accessID, c.chunkType, c.text, FormatVector(vec))
-	return err
 }
