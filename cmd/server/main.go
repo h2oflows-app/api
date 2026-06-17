@@ -74,7 +74,7 @@ func main() {
 	pollInterval := cfg.ParsePollInterval()
 	p := poller.New(pool)
 	p.Register(gauge.NewUSGSSource(cfg.USGSAPIKey), pollInterval.USGS)
-	p.Register(gauge.NewDWRSource(), pollInterval.DWR)
+	p.Register(gauge.NewDWRSource(cfg.DWRAPIKeys), pollInterval.DWR)
 	pollerCtx, stopPoller := context.WithCancel(context.Background())
 	go p.Run(pollerCtx)
 

@@ -665,11 +665,13 @@ func (p *Poller) propagateRiverBasins(ctx context.Context) {
 	tag, err := p.db.Exec(ctx, `
 		UPDATE rivers rv
 		SET    basin = g.watershed_name
-		FROM   reaches re
+		FROM   user_reaches re
 		JOIN   gauges  g ON g.id = re.primary_gauge_id
-		WHERE  re.river_id        = rv.id
-		  AND  rv.basin           IS NULL
-		  AND  g.watershed_name   IS NOT NULL
+		WHERE  re.river_id   = rv.id
+		  AND  re.owner_id   = '00000000-0000-0000-0000-000000000001'
+		  AND  re.deleted_at IS NULL
+		  AND  rv.basin      IS NULL
+		  AND  g.watershed_name IS NOT NULL
 	`)
 	if err != nil {
 		log.Printf("poller: propagate river basins: %v", err)
@@ -820,9 +822,11 @@ func (p *Poller) applyMetadata(ctx context.Context, gaugeID string, site *gauge.
 		if _, err := p.db.Exec(ctx, `
 			UPDATE rivers rv
 			SET    basin = $2
-			FROM   reaches re
+			FROM   user_reaches re
 			WHERE  re.river_id         = rv.id
 			  AND  re.primary_gauge_id = $1
+			  AND  re.owner_id         = '00000000-0000-0000-0000-000000000001'
+			  AND  re.deleted_at       IS NULL
 			  AND  rv.basin            IS NULL
 		`, gaugeID, site.CanonicalBasin); err != nil {
 			log.Printf("poller: propagate basin to river for gauge %s: %v", gaugeID, err)

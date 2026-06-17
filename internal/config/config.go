@@ -19,6 +19,7 @@ type Config struct {
 	AnthropicAPIKey  string // required for AI search enrichment and flow interpretation
 	VoyageAPIKey     string // required for reach embeddings and /ask endpoint
 	USGSAPIKey       string // optional, raises rate limits
+	DWRAPIKeys       string // optional comma-separated; raises rate limits (1000 req/day per key without)
 	USGSPollInterval string
 	DWRPollInterval  string
 	MigrationsPath   string
@@ -37,6 +38,7 @@ func Load() Config {
 		AnthropicAPIKey:  env("ANTHROPIC_API_KEY", ""),
 		VoyageAPIKey:     env("VOYAGE_API_KEY", ""),
 		USGSAPIKey:       env("USGS_API_KEY", ""),
+		DWRAPIKeys:       env("DWR_API_KEY", ""),
 		USGSPollInterval: env("USGS_POLL_INTERVAL", "15m"),
 		DWRPollInterval:  env("DWR_POLL_INTERVAL", "15m"),
 		MigrationsPath:   env("MIGRATIONS_PATH", "migrations"),

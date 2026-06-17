@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -18,7 +19,7 @@ const (
 )
 
 // DWRSource implements GaugeSource and SiteDiscoverer for the Colorado
-// Division of Water Resources telemetry API. No API key is required.
+// Division of Water Resources telemetry API.
 //
 // The primary identifier for DWR gauges is the station abbreviation
 // (e.g. "PLAWATCO"), not a numeric ID. This is what gets stored as
@@ -29,19 +30,38 @@ const (
 // consecutive_failures tracking handles this automatically; gauges that
 // go quiet in November and return in April will transition through
 // StatusMaintenance rather than StatusRetired.
+//
+// apiKeys is optional; without one DWR caps at 1000 req/day per IP.
+// Multiple keys are round-robined to multiply the effective cap.
 type DWRSource struct {
 	httpClient *http.Client
-	apiBase    string // override in tests via httptest server URL
+	apiBase    string   // override in tests via httptest server URL
+	apiKeys    []string // optional; round-robined per request
+	keyIdx     atomic.Uint64
 }
 
-// NewDWRSource creates a DWRSource.
-func NewDWRSource() *DWRSource {
-	return &DWRSource{
-		httpClient: &http.Client{
-			Timeout: 15 * time.Second,
-		},
-		apiBase: dwrAPIBase,
+// NewDWRSource creates a DWRSource. apiKeys is a comma-separated list of
+// DWR API keys (pass cfg.DWRAPIKeys); empty string means no key (anonymous).
+func NewDWRSource(apiKeys string) *DWRSource {
+	s := &DWRSource{
+		httpClient: &http.Client{Timeout: 15 * time.Second},
+		apiBase:    dwrAPIBase,
 	}
+	for _, k := range strings.Split(apiKeys, ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			s.apiKeys = append(s.apiKeys, k)
+		}
+	}
+	return s
+}
+
+// nextKey returns the next API key in round-robin order, or "" if none configured.
+func (s *DWRSource) nextKey() string {
+	if len(s.apiKeys) == 0 {
+		return ""
+	}
+	idx := s.keyIdx.Add(1) - 1
+	return s.apiKeys[idx%uint64(len(s.apiKeys))]
 }
 
 func (s *DWRSource) Name() string           { return "Colorado DWR" }
@@ -56,6 +76,9 @@ func (s *DWRSource) FetchReading(ctx context.Context, externalID string) (*Readi
 		"parameter":    {"DISCHRG"},
 		"min-modified": {"-2days"},
 		"format":       {"json"},
+	}
+	if k := s.nextKey(); k != "" {
+		params.Set("apiKey", k)
 	}
 	endpoint := fmt.Sprintf("%s/telemetrystations/telemetrytimeseriesraw/?%s", s.apiBase, params.Encode())
 
@@ -92,6 +115,9 @@ func (s *DWRSource) FetchHistory(ctx context.Context, externalID string, since t
 		"startDate": {since.Format(dwrDateFormat)},
 		"endDate":   {time.Now().Format(dwrDateFormat)},
 		"format":    {"json"},
+	}
+	if k := s.nextKey(); k != "" {
+		params.Set("apiKey", k)
 	}
 	endpoint := fmt.Sprintf("%s/telemetrystations/telemetrytimeseriesraw/?%s", s.apiBase, params.Encode())
 
@@ -135,6 +161,9 @@ func (s *DWRSource) DiscoverSites(ctx context.Context, opts DiscoverOptions) ([]
 	params := url.Values{
 		"stationType": {"Stream Gage"}, // discharge stream gages only
 		"format":      {"json"},
+	}
+	if k := s.nextKey(); k != "" {
+		params.Set("apiKey", k)
 	}
 	endpoint := fmt.Sprintf("%s/telemetrystations/telemetrystation/?%s", s.apiBase, params.Encode())
 

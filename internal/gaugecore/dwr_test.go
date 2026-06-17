@@ -12,7 +12,7 @@ import (
 
 // newTestDWR returns a DWRSource pointed at the provided test server URL.
 func newTestDWR(apiURL string) *DWRSource {
-	s := NewDWRSource()
+	s := NewDWRSource("")
 	s.apiBase = apiURL
 	return s
 }
