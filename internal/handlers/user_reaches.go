@@ -286,8 +286,12 @@ func (h *UserReachHandler) MapAll(w http.ResponseWriter, r *http.Request) {
 		) thresh ON TRUE,
 		LATERAL (
 			SELECT
-				COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END) AS band_label,
-				COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END) AS band_color
+				CASE WHEN EXISTS(SELECT 1 FROM user_reach_flow_ranges WHERE user_reach_id = ur.id) THEN
+					COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END)
+				END AS band_label,
+				CASE WHEN EXISTS(SELECT 1 FROM user_reach_flow_ranges WHERE user_reach_id = ur.id) THEN
+					COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END)
+				END AS band_color
 		) fr
 		WHERE ur.owner_id = $1
 		  AND ($2::text[] IS NULL OR ur.slug = ANY($2))
@@ -479,8 +483,12 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 		) thresh ON TRUE,
 		LATERAL (
 			SELECT
-				COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END) AS band_label,
-				COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END) AS band_color
+				CASE WHEN EXISTS(SELECT 1 FROM user_reach_flow_ranges WHERE user_reach_id = ur.id) THEN
+					COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END)
+				END AS band_label,
+				CASE WHEN EXISTS(SELECT 1 FROM user_reach_flow_ranges WHERE user_reach_id = ur.id) THEN
+					COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END)
+				END AS band_color
 		) fr
 		WHERE ur.visibility = 'public' AND ur.deleted_at IS NULL
 	`)
@@ -650,8 +658,12 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 		) thresh ON TRUE,
 		LATERAL (
 			SELECT
-				COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END) AS band_label,
-				COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END) AS band_color
+				CASE WHEN EXISTS(SELECT 1 FROM user_reach_flow_ranges WHERE user_reach_id = ur.id) THEN
+					COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END)
+				END AS band_label,
+				CASE WHEN EXISTS(SELECT 1 FROM user_reach_flow_ranges WHERE user_reach_id = ur.id) THEN
+					COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END)
+				END AS band_color
 		) fr
 		WHERE ur.owner_id = $1
 		ORDER BY ur.name
@@ -746,8 +758,12 @@ func (h *UserReachHandler) ReferencedRuns(w http.ResponseWriter, r *http.Request
 		) thresh ON TRUE,
 		LATERAL (
 			SELECT
-				COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END) AS band_label,
-				COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END) AS band_color
+				CASE WHEN EXISTS(SELECT 1 FROM user_reach_flow_ranges WHERE user_reach_id = ur.id) THEN
+					COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END)
+				END AS band_label,
+				CASE WHEN EXISTS(SELECT 1 FROM user_reach_flow_ranges WHERE user_reach_id = ur.id) THEN
+					COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END)
+				END AS band_color
 		) fr
 		WHERE w.user_id = $1
 		  AND w.referenced_user_reach_id IS NOT NULL
@@ -854,11 +870,15 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 		) thresh ON TRUE,
 		LATERAL (
 			SELECT
-				COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END) AS band_label,
-				COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END) AS band_color
+				CASE WHEN EXISTS(SELECT 1 FROM user_reach_flow_ranges WHERE user_reach_id = ur.id) THEN
+					COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END)
+				END AS band_label,
+				CASE WHEN EXISTS(SELECT 1 FROM user_reach_flow_ranges WHERE user_reach_id = ur.id) THEN
+					COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END)
+				END AS band_color
 		) fr
-		WHERE ur.owner_id = $1 AND ur.slug = $2
-	`, ownerID, slug).Scan(
+		WHERE (ur.owner_id = $1 OR (ur.owner_id = $2 AND $3::boolean)) AND ur.slug = $4
+	`, ownerID, h2oflowsSentinelOwnerID, auth.IsDataAdminFromContext(r.Context()), slug).Scan(
 		&d.ID, &d.Slug, &d.Name, &d.LongName, &d.RiverName,
 		&d.PutInLng, &d.PutInLat, &d.TakeOutLng, &d.TakeOutLat,
 		&d.Note, &d.CreatedAt,
@@ -1055,8 +1075,12 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 		) thresh ON TRUE,
 		LATERAL (
 			SELECT
-				COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END) AS band_label,
-				COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END) AS band_color
+				CASE WHEN EXISTS(SELECT 1 FROM user_reach_flow_ranges WHERE user_reach_id = ur.id) THEN
+					COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END)
+				END AS band_label,
+				CASE WHEN EXISTS(SELECT 1 FROM user_reach_flow_ranges WHERE user_reach_id = ur.id) THEN
+					COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END)
+				END AS band_color
 		) fr
 		WHERE ur.id = $1 AND ur.visibility = 'public'
 	`, runID).Scan(
@@ -1085,7 +1109,8 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 
 	d.IsPrivate = d.Visibility != "public"
 	d.IsOfficial = (authorID == h2oflowsSentinelOwnerID)
-	d.IsOwn = callerID != "" && callerID == authorID
+	d.IsOwn = callerID != "" && (callerID == authorID ||
+		(authorID == h2oflowsSentinelOwnerID && auth.IsDataAdminFromContext(r.Context())))
 
 	if geojsonBytes != nil {
 		raw := json.RawMessage(geojsonBytes)
@@ -2308,8 +2333,12 @@ func (h *UserReachHandler) ListCommunity(w http.ResponseWriter, r *http.Request)
 		) thresh ON TRUE,
 		LATERAL (
 			SELECT
-				COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END) AS band_label,
-				COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END) AS band_color
+				CASE WHEN EXISTS(SELECT 1 FROM user_reach_flow_ranges WHERE user_reach_id = ur.id) THEN
+					COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END)
+				END AS band_label,
+				CASE WHEN EXISTS(SELECT 1 FROM user_reach_flow_ranges WHERE user_reach_id = ur.id) THEN
+					COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END)
+				END AS band_color
 		) fr
 		WHERE ur.visibility = 'public' AND ur.deleted_at IS NULL
 		  AND ur.completeness_score >= 0.2
