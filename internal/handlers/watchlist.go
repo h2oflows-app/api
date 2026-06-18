@@ -207,11 +207,28 @@ func (h *WatchlistHandler) Add(w http.ResponseWriter, r *http.Request) {
 				ON CONFLICT DO NOTHING
 			`, userID, body.CustomGaugeID, finalReachSlug, dashboardID)
 		default:
-			_, insertErr = tx.Exec(r.Context(), `
-				INSERT INTO user_watchlists (user_id, reach_slug, dashboard_id)
-				VALUES ($1, $2, $3::uuid)
-				ON CONFLICT DO NOTHING
-			`, userID, finalReachSlug, dashboardID)
+			// Resolve primary_gauge_id from the user reach so the watchlist entry
+			// includes the gauge — enables group-by-gauge on the dashboard and uses
+			// the existing unique constraint (migration 082) to prevent duplicates.
+			var primaryGaugeID *string
+			_ = tx.QueryRow(r.Context(),
+				`SELECT primary_gauge_id::text FROM user_reaches WHERE slug = $1 AND deleted_at IS NULL LIMIT 1`,
+				finalReachSlug,
+			).Scan(&primaryGaugeID)
+
+			if primaryGaugeID != nil {
+				_, insertErr = tx.Exec(r.Context(), `
+					INSERT INTO user_watchlists (user_id, gauge_id, reach_slug, dashboard_id)
+					VALUES ($1, $2::uuid, $3, $4::uuid)
+					ON CONFLICT DO NOTHING
+				`, userID, primaryGaugeID, finalReachSlug, dashboardID)
+			} else {
+				_, insertErr = tx.Exec(r.Context(), `
+					INSERT INTO user_watchlists (user_id, reach_slug, dashboard_id)
+					VALUES ($1, $2, $3::uuid)
+					ON CONFLICT DO NOTHING
+				`, userID, finalReachSlug, dashboardID)
+			}
 		}
 		if insertErr != nil {
 			errorResponse(w, http.StatusInternalServerError, "insert failed")
