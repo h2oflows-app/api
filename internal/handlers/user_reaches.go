@@ -1448,6 +1448,7 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+	isAdmin := auth.IsDataAdminFromContext(r.Context())
 	slug := chi.URLParam(r, "slug")
 
 	type latLng struct {
@@ -1505,8 +1506,8 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		var curVisibility string
 		var publishedAt *string
 		if err := h.db.QueryRow(ctx,
-			`SELECT visibility, published_at::text FROM user_reaches WHERE owner_id = $1 AND slug = $2`,
-			ownerID, slug,
+			`SELECT visibility, published_at::text FROM user_reaches WHERE (owner_id = $1 OR (owner_id = $3 AND $4::boolean)) AND slug = $2`,
+			ownerID, slug, h2oflowsSentinelOwnerID, isAdmin,
 		).Scan(&curVisibility, &publishedAt); err != nil {
 			errorResponse(w, http.StatusNotFound, "user reach not found")
 			return
@@ -1539,12 +1540,13 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 				WHEN original_forked_at IS NOT NULL THEN NOW()
 				ELSE last_modified_after_fork_at
 			END
-		WHERE owner_id = $1 AND slug = $2
+		WHERE (owner_id = $1 OR (owner_id = $15 AND $16::boolean)) AND slug = $2
 	`, ownerID, slug, body.Name, body.LongName != nil, body.LongName, body.Note,
 		body.RiverName != nil, riverName,
 		body.ClassMin != nil, body.ClassMin,
 		body.ClassMax != nil, body.ClassMax,
-		newVisibility != nil, newVisibility)
+		newVisibility != nil, newVisibility,
+		h2oflowsSentinelOwnerID, isAdmin)
 	if err != nil || tag.RowsAffected() == 0 {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
 		return
@@ -1559,8 +1561,8 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		rid := resolveOrCreateRiver(ctx, h.db, *riverName, gnisID, 0, 0)
 		if rid != "" {
 			_, _ = h.db.Exec(ctx,
-				`UPDATE user_reaches SET river_id = $3 WHERE owner_id = $1 AND slug = $2`,
-				ownerID, slug, rid)
+				`UPDATE user_reaches SET river_id = $3 WHERE (owner_id = $1 OR (owner_id = $4 AND $5::boolean)) AND slug = $2`,
+				ownerID, slug, rid, h2oflowsSentinelOwnerID, isAdmin)
 		}
 	}
 
@@ -1574,17 +1576,18 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 				up_comid   = NULLIF($7, ''),
 				down_comid = NULLIF($8, ''),
 				updated_at = NOW()
-			WHERE owner_id = $1 AND slug = $2
+			WHERE (owner_id = $1 OR (owner_id = $9 AND $10::boolean)) AND slug = $2
 		`, ownerID, slug,
 			body.PutIn.Lng, body.PutIn.Lat,
 			body.TakeOut.Lng, body.TakeOut.Lat,
-			*body.UpComID, *body.DownComID)
+			*body.UpComID, *body.DownComID,
+			h2oflowsSentinelOwnerID, isAdmin)
 	}
 
 	// Recompute completeness after any field change. (V18)
 	var runID string
-	if h.db.QueryRow(ctx, `SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2`,
-		ownerID, slug).Scan(&runID) == nil {
+	if h.db.QueryRow(ctx, `SELECT id FROM user_reaches WHERE (owner_id = $1 OR (owner_id = $3 AND $4::boolean)) AND slug = $2`,
+		ownerID, slug, h2oflowsSentinelOwnerID, isAdmin).Scan(&runID) == nil {
 		saveCompleteness(ctx, h.db, runID)
 	}
 }
@@ -1730,11 +1733,13 @@ func (h *UserReachHandler) SetFlowRanges(w http.ResponseWriter, r *http.Request)
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+	isAdmin := auth.IsDataAdminFromContext(r.Context())
 	slug := chi.URLParam(r, "slug")
 
 	var reachID string
 	if err := h.db.QueryRow(r.Context(),
-		`SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2`, ownerID, slug).Scan(&reachID); err != nil {
+		`SELECT id FROM user_reaches WHERE (owner_id = $1 OR (owner_id = $3 AND $4::boolean)) AND slug = $2`,
+		ownerID, slug, h2oflowsSentinelOwnerID, isAdmin).Scan(&reachID); err != nil {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
 		return
 	}
