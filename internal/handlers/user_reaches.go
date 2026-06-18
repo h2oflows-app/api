@@ -877,8 +877,8 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 					COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END)
 				END AS band_color
 		) fr
-		WHERE ur.owner_id = $1 AND ur.slug = $2
-	`, ownerID, slug).Scan(
+		WHERE (ur.owner_id = $1 OR (ur.owner_id = $2 AND $3::boolean)) AND ur.slug = $4
+	`, ownerID, h2oflowsSentinelOwnerID, auth.IsDataAdminFromContext(r.Context()), slug).Scan(
 		&d.ID, &d.Slug, &d.Name, &d.LongName, &d.RiverName,
 		&d.PutInLng, &d.PutInLat, &d.TakeOutLng, &d.TakeOutLat,
 		&d.Note, &d.CreatedAt,
