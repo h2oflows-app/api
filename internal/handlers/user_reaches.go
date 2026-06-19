@@ -166,6 +166,8 @@ type userReachSummary struct {
 	GaugeExternalID *string    `json:"gauge_external_id"`
 	GaugeSource     *string    `json:"gauge_source"`
 	GaugeName       *string    `json:"gauge_name"`
+	GaugeLat        *float64   `json:"gauge_lat"`
+	GaugeLng        *float64   `json:"gauge_lng"`
 	CustomGaugeID   *string    `json:"custom_gauge_id"`
 	CustomGaugeSlug *string    `json:"custom_gauge_slug"`
 	CustomGaugeName *string    `json:"custom_gauge_name"`
@@ -633,6 +635,8 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			g.external_id AS gauge_external_id,
 			g.source AS gauge_source,
 			g.name AS gauge_name,
+			ST_Y(g.location::geometry) AS gauge_lat,
+			ST_X(g.location::geometry) AS gauge_lng,
 			ur.custom_gauge_id::text AS custom_gauge_id,
 			cg.slug AS custom_gauge_slug,
 			cg.name AS custom_gauge_name,
@@ -686,6 +690,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			&s.CurrentCFS, &s.LastReadAt,
 			&s.FlowStatus, &s.FlowBand, &s.GaugeID,
 			&s.GaugeExternalID, &s.GaugeSource, &s.GaugeName,
+			&s.GaugeLat, &s.GaugeLng,
 			&s.CustomGaugeID, &s.CustomGaugeSlug, &s.CustomGaugeName,
 			&s.Visibility, &s.AuthorHandle,
 		); err == nil {
@@ -733,6 +738,8 @@ func (h *UserReachHandler) ReferencedRuns(w http.ResponseWriter, r *http.Request
 			g.external_id AS gauge_external_id,
 			g.source AS gauge_source,
 			g.name AS gauge_name,
+			ST_Y(g.location::geometry) AS gauge_lat,
+			ST_X(g.location::geometry) AS gauge_lng,
 			ur.custom_gauge_id::text AS custom_gauge_id,
 			cg.slug AS custom_gauge_slug,
 			cg.name AS custom_gauge_name,
@@ -787,6 +794,7 @@ func (h *UserReachHandler) ReferencedRuns(w http.ResponseWriter, r *http.Request
 			&s.CurrentCFS, &s.LastReadAt,
 			&s.FlowStatus, &s.FlowBand, &s.GaugeID,
 			&s.GaugeExternalID, &s.GaugeSource, &s.GaugeName,
+			&s.GaugeLat, &s.GaugeLng,
 			&s.CustomGaugeID, &s.CustomGaugeSlug, &s.CustomGaugeName,
 			&s.AuthorHandle,
 		); err == nil {
