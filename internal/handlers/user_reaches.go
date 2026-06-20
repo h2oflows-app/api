@@ -888,6 +888,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 				END AS band_color
 		) fr
 		WHERE (ur.owner_id = $1 OR (ur.owner_id = $2 AND $3::boolean)) AND ur.slug = $4
+		ORDER BY (ur.owner_id = $1) DESC LIMIT 1
 	`, ownerID, h2oflowsSentinelOwnerID, auth.IsDataAdminFromContext(r.Context()), slug).Scan(
 		&d.ID, &d.Slug, &d.Name, &d.LongName, &d.RiverName,
 		&d.PutInLng, &d.PutInLat, &d.TakeOutLng, &d.TakeOutLat,
@@ -1613,13 +1614,16 @@ func (h *UserReachHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+	isAdmin := auth.IsDataAdminFromContext(r.Context())
 	slug := chi.URLParam(r, "slug")
 	ctx := r.Context()
 
 	var runID string
 	if err := h.db.QueryRow(ctx,
-		`SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2 AND deleted_at IS NULL`,
-		ownerID, slug,
+		`SELECT id FROM user_reaches
+		 WHERE (owner_id = $1 OR (owner_id = $3 AND $4::boolean)) AND slug = $2 AND deleted_at IS NULL
+		 ORDER BY (owner_id = $1) DESC LIMIT 1`,
+		ownerID, slug, h2oflowsSentinelOwnerID, isAdmin,
 	).Scan(&runID); err != nil {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
 		return
@@ -1749,7 +1753,8 @@ func (h *UserReachHandler) SetFlowRanges(w http.ResponseWriter, r *http.Request)
 
 	var reachID string
 	if err := h.db.QueryRow(r.Context(),
-		`SELECT id FROM user_reaches WHERE (owner_id = $1 OR (owner_id = $3 AND $4::boolean)) AND slug = $2`,
+		`SELECT id FROM user_reaches WHERE (owner_id = $1 OR (owner_id = $3 AND $4::boolean)) AND slug = $2
+		 ORDER BY (owner_id = $1) DESC LIMIT 1`,
 		ownerID, slug, h2oflowsSentinelOwnerID, isAdmin).Scan(&reachID); err != nil {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
 		return
