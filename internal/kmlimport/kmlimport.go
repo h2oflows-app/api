@@ -54,6 +54,7 @@ type ReachResult struct {
 	PutIns    int      `json:"put_ins"`
 	TakeOuts  int      `json:"take_outs"`
 	Parking   int      `json:"parking"`
+	BoatRamps int      `json:"boat_ramps"`
 	Campsites int      `json:"campsites"`
 	Errors    []string `json:"errors,omitempty"`
 }
@@ -334,6 +335,9 @@ func SplitPrefixWithHint(name, description, folderHint string) (prefix, rest str
 	}
 	descLower := strings.ToLower(description)
 	switch {
+	case strings.Contains(descLower, "boat ramp") || strings.Contains(descLower, "boat launch") ||
+		strings.Contains(descLower, "launch ramp"):
+		return "boat-ramp", name
 	case strings.Contains(descLower, "parking") || strings.Contains(descLower, "can park") ||
 		strings.Contains(descLower, "park as well") || strings.Contains(descLower, "park here"):
 		return "parking", name
@@ -366,11 +370,14 @@ func SplitPrefixWithHint(name, description, folderHint string) (prefix, rest str
 // SplitPrefix splits "Rapid: Zoom Flume" → ("rapid", "Zoom Flume").
 func SplitPrefix(name string) (prefix, rest string) {
 	lower := strings.ToLower(name)
-	for _, p := range []string{"Rapid", "Wave", "Surf", "Put-in", "Take-out", "Parking", "Hazard", "Campsite"} {
+	for _, p := range []string{"Rapid", "Wave", "Surf", "Put-in", "Take-out", "Parking", "Boat Ramp", "Hazard", "Campsite"} {
 		if strings.HasPrefix(lower, strings.ToLower(p)+":") {
 			prefix := strings.ToLower(p)
 			if prefix == "surf" {
 				prefix = "wave"
+			}
+			if prefix == "boat ramp" {
+				prefix = "boat-ramp"
 			}
 			return prefix, strings.TrimSpace(name[len(p)+1:])
 		}
@@ -384,6 +391,11 @@ func SplitPrefix(name string) (prefix, rest string) {
 		return "take-out", name
 	case strings.Contains(lower, "parking") || strings.Contains(lower, "trailhead"):
 		return "parking", name
+	case strings.HasPrefix(lower, "boat ramp") || strings.HasSuffix(lower, "boat ramp"):
+		return "boat-ramp", name
+	case strings.Contains(lower, "surf wave") || strings.Contains(lower, "play wave") ||
+		strings.Contains(lower, "surf spot"):
+		return "wave", name
 	case strings.Contains(lower, "rapid") || strings.Contains(lower, "falls") ||
 		strings.Contains(lower, "drop") || strings.Contains(lower, "hole"):
 		return "rapid", name
@@ -622,6 +634,14 @@ func (imp *Importer) ImportForUserReach(ctx context.Context, ownerID, reachSlug 
 			} else {
 				st.Campsites++
 				res.Log = append(res.Log, fmt.Sprintf("✓ [%s] campsite: %s", urName, pinName))
+			}
+		case "boat-ramp":
+			if err := imp.upsertAccessForTarget(ctx, target, "boat_ramp", pinName, desc, lon, lat); err != nil {
+				st.Errors = append(st.Errors, fmt.Sprintf("boat-ramp %q: %v", pinName, err))
+				res.Log = append(res.Log, fmt.Sprintf("✗ [%s] boat-ramp %q: %v", urName, pinName, err))
+			} else {
+				st.BoatRamps++
+				res.Log = append(res.Log, fmt.Sprintf("✓ [%s] boat-ramp: %s", urName, pinName))
 			}
 		default:
 			res.Log = append(res.Log, fmt.Sprintf("⚠  [%s] %q — unknown type, skipping", urName, pm.Name))
