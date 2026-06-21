@@ -230,6 +230,7 @@ type userReachDetail struct {
 	UpvoteCount             int                    `json:"upvote_count"`
 	UserUpvoted             bool                   `json:"user_upvoted"`
 	IsOwn                   bool                   `json:"is_own"`
+	RiverConfirmed          bool                   `json:"river_confirmed"`
 }
 
 // ── MapAll ────────────────────────────────────────────────────────────────────
@@ -858,7 +859,8 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 			ur.original_author_handle,
 			ur.original_forked_at,
 			ur.last_modified_after_fork_at,
-			up.handle AS author_handle
+			up.handle AS author_handle,
+			ur.river_confirmed
 		FROM user_reaches ur
 		LEFT JOIN rivers rv ON rv.id = ur.river_id
 		LEFT JOIN gauges g ON g.id = ur.primary_gauge_id
@@ -906,6 +908,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 		&d.ForkedFromSlug, &d.ForkedFromName,
 		&d.OriginalAuthorHandle, &d.OriginalForkedAt, &d.LastModifiedAfterForkAt,
 		&d.AuthorHandle,
+		&d.RiverConfirmed,
 	)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
@@ -1285,20 +1288,22 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var reachID string
 	err := h.db.QueryRow(ctx, `
 		INSERT INTO user_reaches
-			(owner_id, slug, name, long_name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, class_min, class_max, visibility, published_at)
+			(owner_id, slug, name, long_name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, class_min, class_max, visibility, published_at, river_confirmed)
 		VALUES
 			($1, $2, $3, $4, $5, $6,
 			 ST_SetSRID(ST_MakePoint($7, $8), 4326)::geography,
 			 ST_SetSRID(ST_MakePoint($9, $10), 4326)::geography,
 			 NULLIF($11,''), NULLIF($12,''), $13, $14, $15,
 			 $16::run_visibility,
-			 CASE WHEN $16 = 'public' THEN NOW() ELSE NULL END)
+			 CASE WHEN $16 = 'public' THEN NOW() ELSE NULL END,
+			 $17)
 		RETURNING id
 	`, ownerID, slug, body.Name, body.LongName, riverID, finalRiverName,
 		body.PutIn.Lng, body.PutIn.Lat,
 		body.TakeOut.Lng, body.TakeOut.Lat,
 		body.UpComID, body.DownComID, body.Note,
 		body.ClassMin, body.ClassMax, createVisibility,
+		riverID != nil,
 	).Scan(&reachID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("create failed: %v", err))
@@ -1398,17 +1403,18 @@ func (h *UserReachHandler) Import(w http.ResponseWriter, r *http.Request) { //no
 	var reachID string
 	err := h.db.QueryRow(ctx, `
 		INSERT INTO user_reaches
-			(owner_id, slug, name, long_name, river_id, river_name, put_in, take_out, up_comid, down_comid, note)
+			(owner_id, slug, name, long_name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, river_confirmed)
 		VALUES
 			($1, $2, $3, $4, $5, $6,
 			 ST_SetSRID(ST_MakePoint($7, $8), 4326)::geography,
 			 ST_SetSRID(ST_MakePoint($9, $10), 4326)::geography,
-			 NULLIF($11,''), NULLIF($12,''), $13)
+			 NULLIF($11,''), NULLIF($12,''), $13, $14)
 		RETURNING id
 	`, ownerID, slug, body.Name, body.LongName, riverID, finalRiverName,
 		body.PutIn.Lng, body.PutIn.Lat,
 		body.TakeOut.Lng, body.TakeOut.Lat,
 		body.UpComID, body.DownComID, body.Note,
+		riverID != nil,
 	).Scan(&reachID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("import failed: %v", err))
@@ -2083,14 +2089,16 @@ func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 			 put_in, take_out,
 			 class_min, class_max, primary_gauge_id,
 			 forked_from_user_reach_id,
-			 original_author_handle, original_author_owner_id, original_forked_at)
+			 original_author_handle, original_author_owner_id, original_forked_at,
+			 river_confirmed)
 		VALUES
 			($1, $2, $3, $4::uuid, $5,
 			 ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography,
 			 ST_SetSRID(ST_MakePoint($8, $9), 4326)::geography,
 			 $10, $11, $12::uuid,
 			 $13::uuid,
-			 $14, $15::uuid, NOW())
+			 $14, $15::uuid, NOW(),
+			 $16)
 		RETURNING id
 	`, ownerID, slug, src.Name, src.RiverID, src.RiverName,
 		src.PutInLng, src.PutInLat,
@@ -2098,6 +2106,7 @@ func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 		src.ClassMin, src.ClassMax, src.GaugeID,
 		src.ID,
 		src.AuthorHandle, src.OwnerID,
+		src.RiverID != nil,
 	).Scan(&newID); err != nil {
 		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("fork failed: %v", err))
 		return
@@ -2217,19 +2226,22 @@ func forkCuratedReachTx(ctx context.Context, q pgxQueryer, ownerID, sourceSlug s
 			(owner_id, slug, name, river_id, river_name,
 			 put_in, take_out,
 			 class_min, class_max, primary_gauge_id,
-			 forked_from_user_reach_id, original_forked_at)
+			 forked_from_user_reach_id, original_forked_at,
+			 river_confirmed)
 		VALUES
 			($1, $2, $3, $4::uuid, $5,
 			 ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography,
 			 ST_SetSRID(ST_MakePoint($8, $9), 4326)::geography,
 			 $10, $11, $12::uuid,
-			 $13::uuid, NOW())
+			 $13::uuid, NOW(),
+			 $14)
 		RETURNING id
 	`, ownerID, newSlug, forkName, src.RiverID, src.RiverName,
 		src.PutInLng, src.PutInLat,
 		src.TakeOutLng, src.TakeOutLat,
 		src.ClassMin, src.ClassMax, src.GaugeID,
 		src.ID,
+		src.RiverID != nil,
 	).Scan(&newID); err != nil {
 		return "", "", fmt.Errorf("fork insert failed: %w", err)
 	}
