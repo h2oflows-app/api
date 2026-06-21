@@ -21,7 +21,7 @@ type FlowBands struct {
 	Thresholds []FlowBandThreshold `json:"thresholds"`
 }
 
-var colorKeyRe = regexp.MustCompile(`^(red|orange|yellow|green|blue|purple)-[1-5]$`)
+var colorKeyRe = regexp.MustCompile(`^(red|orange|yellow|green|blue|purple|neutral)-[1-5]$`)
 
 // flowStatusFromColor maps a color key to the legacy flow_status enum (V9).
 // red-* → caution, blue-* → flood, other color → runnable, empty → unknown.
