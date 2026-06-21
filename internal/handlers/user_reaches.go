@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -122,6 +123,10 @@ func (h *UserReachHandler) ownerID(r *http.Request) (string, bool) {
 // h2oflowsSentinelOwnerID is the owner_id of the h2oflows curator account
 // (seeded by mig 105). Runs owned by it are official curator content.
 const h2oflowsSentinelOwnerID = "00000000-0000-0000-0000-000000000001"
+
+// userReachSlugRe validates user-editable run slugs: lowercase alphanumeric + hyphens,
+// starts and ends with alphanumeric.
+var userReachSlugRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$`)
 
 // authorOwnerID resolves the owner a run is authored under. When the request
 // carries ?as=h2oflows AND the caller has data_admin rights, the run is
@@ -1457,6 +1462,33 @@ func (h *UserReachHandler) Import(w http.ResponseWriter, r *http.Request) { //no
 	jsonResponse(w, http.StatusCreated, map[string]string{"id": reachID, "slug": slug})
 }
 
+// ── Slug check ───────────────────────────────────────────────────────────────
+
+// GET /api/v1/me/runs/slug-check?slug=X&exclude=current-slug
+func (h *UserReachHandler) SlugCheck(w http.ResponseWriter, r *http.Request) {
+	ownerID, ok := h.ownerID(r)
+	if !ok {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	slug := r.URL.Query().Get("slug")
+	if slug == "" {
+		errorResponse(w, http.StatusBadRequest, "slug is required")
+		return
+	}
+	if !userReachSlugRe.MatchString(slug) {
+		jsonResponse(w, http.StatusOK, map[string]bool{"available": false})
+		return
+	}
+	exclude := r.URL.Query().Get("exclude")
+	var exists bool
+	_ = h.db.QueryRow(r.Context(),
+		`SELECT EXISTS(SELECT 1 FROM user_reaches WHERE owner_id = $1 AND slug = $2 AND deleted_at IS NULL AND slug != $3)`,
+		ownerID, slug, exclude,
+	).Scan(&exists)
+	jsonResponse(w, http.StatusOK, map[string]bool{"available": !exists})
+}
+
 // ── Update ───────────────────────────────────────────────────────────────────
 
 // PATCH /api/v1/me/reaches/{slug}
@@ -1475,7 +1507,7 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 	var body struct {
 		Name      *string  `json:"name"`
-		LongName  *string  `json:"long_name"`
+		NewSlug   *string  `json:"slug"`
 		Note      *string  `json:"note"`
 		RiverName *string  `json:"river_name"`
 		GnisID    *string  `json:"gnis_id"`
@@ -1499,6 +1531,28 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if body.RiverName != nil && strings.TrimSpace(*body.RiverName) != "" {
 		rn := strings.TrimSpace(*body.RiverName)
 		riverName = &rn
+	}
+
+	// Validate and uniqueness-check new slug when provided.
+	var newSlug *string
+	if body.NewSlug != nil && *body.NewSlug != slug {
+		ns := strings.TrimSpace(*body.NewSlug)
+		if !userReachSlugRe.MatchString(ns) {
+			errorResponse(w, http.StatusBadRequest, "slug must be lowercase alphanumeric with hyphens")
+			return
+		}
+		// Reject if another run already uses this slug.
+		ctx := r.Context()
+		var conflict bool
+		_ = h.db.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM user_reaches WHERE owner_id = $1 AND slug = $2 AND deleted_at IS NULL)`,
+			ownerID, ns,
+		).Scan(&conflict)
+		if conflict {
+			errorResponse(w, http.StatusConflict, "slug already in use")
+			return
+		}
+		newSlug = &ns
 	}
 
 	ctx := r.Context()
@@ -1547,7 +1601,7 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		UPDATE user_reaches
 		SET
 			name       = COALESCE($3, name),
-			long_name  = CASE WHEN $4 THEN $5 ELSE long_name END,
+			slug       = CASE WHEN $4 THEN $5 ELSE slug END,
 			note       = $6,
 			river_name = CASE WHEN $7 THEN $8 ELSE river_name END,
 			class_min  = CASE WHEN $9 THEN $10::numeric ELSE class_min END,
@@ -1559,7 +1613,7 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 				ELSE last_modified_after_fork_at
 			END
 		WHERE (owner_id = $1 OR (owner_id = $15 AND $16::boolean)) AND slug = $2
-	`, ownerID, slug, body.Name, body.LongName != nil, body.LongName, body.Note,
+	`, ownerID, slug, body.Name, newSlug != nil, newSlug, body.Note,
 		body.RiverName != nil, riverName,
 		body.ClassMin != nil, body.ClassMin,
 		body.ClassMax != nil, body.ClassMax,
@@ -1568,6 +1622,10 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if err != nil || tag.RowsAffected() == 0 {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
 		return
+	}
+	// Subsequent lookups must use the new slug when renamed.
+	if newSlug != nil {
+		slug = *newSlug
 	}
 
 	// Re-resolve river when river_name is being set, so state/basin/huc8 get populated.
@@ -1608,6 +1666,8 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		ownerID, slug, h2oflowsSentinelOwnerID, isAdmin).Scan(&runID) == nil {
 		saveCompleteness(ctx, h.db, runID)
 	}
+
+	jsonResponse(w, http.StatusOK, map[string]string{"slug": slug})
 }
 
 // ── Delete ───────────────────────────────────────────────────────────────────

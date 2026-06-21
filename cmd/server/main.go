@@ -226,6 +226,7 @@ func main() {
 		r.Post("/me/runs", userReaches.Create)
 		r.Post("/me/runs/import", userReaches.Import)
 		r.Get("/me/runs/map/all", userReaches.MapAll)
+		r.Get("/me/runs/slug-check", userReaches.SlugCheck)
 		r.Post("/me/runs/fork-reach/{slug}", userReaches.ForkReach)
 		r.Get("/me/runs/{slug}", userReaches.Get)
 		r.Patch("/me/runs/{slug}", userReaches.Update)
