@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -123,6 +124,10 @@ func (h *UserReachHandler) ownerID(r *http.Request) (string, bool) {
 // (seeded by mig 105). Runs owned by it are official curator content.
 const h2oflowsSentinelOwnerID = "00000000-0000-0000-0000-000000000001"
 
+// userReachSlugRe validates user-editable run slugs: lowercase alphanumeric + hyphens,
+// starts and ends with alphanumeric.
+var userReachSlugRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$`)
+
 // authorOwnerID resolves the owner a run is authored under. When the request
 // carries ?as=h2oflows AND the caller has data_admin rights, the run is
 // authored as the h2oflows curator (official content); otherwise it is owned by
@@ -230,6 +235,7 @@ type userReachDetail struct {
 	UpvoteCount             int                    `json:"upvote_count"`
 	UserUpvoted             bool                   `json:"user_upvoted"`
 	IsOwn                   bool                   `json:"is_own"`
+	RiverConfirmed          bool                   `json:"river_confirmed"`
 }
 
 // ── MapAll ────────────────────────────────────────────────────────────────────
@@ -858,7 +864,8 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 			ur.original_author_handle,
 			ur.original_forked_at,
 			ur.last_modified_after_fork_at,
-			up.handle AS author_handle
+			up.handle AS author_handle,
+			ur.river_confirmed
 		FROM user_reaches ur
 		LEFT JOIN rivers rv ON rv.id = ur.river_id
 		LEFT JOIN gauges g ON g.id = ur.primary_gauge_id
@@ -906,6 +913,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 		&d.ForkedFromSlug, &d.ForkedFromName,
 		&d.OriginalAuthorHandle, &d.OriginalForkedAt, &d.LastModifiedAfterForkAt,
 		&d.AuthorHandle,
+		&d.RiverConfirmed,
 	)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
@@ -1285,20 +1293,22 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var reachID string
 	err := h.db.QueryRow(ctx, `
 		INSERT INTO user_reaches
-			(owner_id, slug, name, long_name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, class_min, class_max, visibility, published_at)
+			(owner_id, slug, name, long_name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, class_min, class_max, visibility, published_at, river_confirmed)
 		VALUES
 			($1, $2, $3, $4, $5, $6,
 			 ST_SetSRID(ST_MakePoint($7, $8), 4326)::geography,
 			 ST_SetSRID(ST_MakePoint($9, $10), 4326)::geography,
 			 NULLIF($11,''), NULLIF($12,''), $13, $14, $15,
 			 $16::run_visibility,
-			 CASE WHEN $16 = 'public' THEN NOW() ELSE NULL END)
+			 CASE WHEN $16 = 'public' THEN NOW() ELSE NULL END,
+			 $17)
 		RETURNING id
 	`, ownerID, slug, body.Name, body.LongName, riverID, finalRiverName,
 		body.PutIn.Lng, body.PutIn.Lat,
 		body.TakeOut.Lng, body.TakeOut.Lat,
 		body.UpComID, body.DownComID, body.Note,
 		body.ClassMin, body.ClassMax, createVisibility,
+		riverID != nil,
 	).Scan(&reachID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("create failed: %v", err))
@@ -1398,17 +1408,18 @@ func (h *UserReachHandler) Import(w http.ResponseWriter, r *http.Request) { //no
 	var reachID string
 	err := h.db.QueryRow(ctx, `
 		INSERT INTO user_reaches
-			(owner_id, slug, name, long_name, river_id, river_name, put_in, take_out, up_comid, down_comid, note)
+			(owner_id, slug, name, long_name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, river_confirmed)
 		VALUES
 			($1, $2, $3, $4, $5, $6,
 			 ST_SetSRID(ST_MakePoint($7, $8), 4326)::geography,
 			 ST_SetSRID(ST_MakePoint($9, $10), 4326)::geography,
-			 NULLIF($11,''), NULLIF($12,''), $13)
+			 NULLIF($11,''), NULLIF($12,''), $13, $14)
 		RETURNING id
 	`, ownerID, slug, body.Name, body.LongName, riverID, finalRiverName,
 		body.PutIn.Lng, body.PutIn.Lat,
 		body.TakeOut.Lng, body.TakeOut.Lat,
 		body.UpComID, body.DownComID, body.Note,
+		riverID != nil,
 	).Scan(&reachID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("import failed: %v", err))
@@ -1451,6 +1462,33 @@ func (h *UserReachHandler) Import(w http.ResponseWriter, r *http.Request) { //no
 	jsonResponse(w, http.StatusCreated, map[string]string{"id": reachID, "slug": slug})
 }
 
+// ── Slug check ───────────────────────────────────────────────────────────────
+
+// GET /api/v1/me/runs/slug-check?slug=X&exclude=current-slug
+func (h *UserReachHandler) SlugCheck(w http.ResponseWriter, r *http.Request) {
+	ownerID, ok := h.ownerID(r)
+	if !ok {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	slug := r.URL.Query().Get("slug")
+	if slug == "" {
+		errorResponse(w, http.StatusBadRequest, "slug is required")
+		return
+	}
+	if !userReachSlugRe.MatchString(slug) {
+		jsonResponse(w, http.StatusOK, map[string]bool{"available": false})
+		return
+	}
+	exclude := r.URL.Query().Get("exclude")
+	var exists bool
+	_ = h.db.QueryRow(r.Context(),
+		`SELECT EXISTS(SELECT 1 FROM user_reaches WHERE owner_id = $1 AND slug = $2 AND deleted_at IS NULL AND slug != $3)`,
+		ownerID, slug, exclude,
+	).Scan(&exists)
+	jsonResponse(w, http.StatusOK, map[string]bool{"available": !exists})
+}
+
 // ── Update ───────────────────────────────────────────────────────────────────
 
 // PATCH /api/v1/me/reaches/{slug}
@@ -1469,7 +1507,7 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 	var body struct {
 		Name      *string  `json:"name"`
-		LongName  *string  `json:"long_name"`
+		NewSlug   *string  `json:"slug"`
 		Note      *string  `json:"note"`
 		RiverName *string  `json:"river_name"`
 		GnisID    *string  `json:"gnis_id"`
@@ -1493,6 +1531,28 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if body.RiverName != nil && strings.TrimSpace(*body.RiverName) != "" {
 		rn := strings.TrimSpace(*body.RiverName)
 		riverName = &rn
+	}
+
+	// Validate and uniqueness-check new slug when provided.
+	var newSlug *string
+	if body.NewSlug != nil && *body.NewSlug != slug {
+		ns := strings.TrimSpace(*body.NewSlug)
+		if !userReachSlugRe.MatchString(ns) {
+			errorResponse(w, http.StatusBadRequest, "slug must be lowercase alphanumeric with hyphens")
+			return
+		}
+		// Reject if another run already uses this slug.
+		ctx := r.Context()
+		var conflict bool
+		_ = h.db.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM user_reaches WHERE owner_id = $1 AND slug = $2 AND deleted_at IS NULL)`,
+			ownerID, ns,
+		).Scan(&conflict)
+		if conflict {
+			errorResponse(w, http.StatusConflict, "slug already in use")
+			return
+		}
+		newSlug = &ns
 	}
 
 	ctx := r.Context()
@@ -1541,7 +1601,7 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		UPDATE user_reaches
 		SET
 			name       = COALESCE($3, name),
-			long_name  = CASE WHEN $4 THEN $5 ELSE long_name END,
+			slug       = CASE WHEN $4 THEN $5 ELSE slug END,
 			note       = $6,
 			river_name = CASE WHEN $7 THEN $8 ELSE river_name END,
 			class_min  = CASE WHEN $9 THEN $10::numeric ELSE class_min END,
@@ -1553,7 +1613,7 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 				ELSE last_modified_after_fork_at
 			END
 		WHERE (owner_id = $1 OR (owner_id = $15 AND $16::boolean)) AND slug = $2
-	`, ownerID, slug, body.Name, body.LongName != nil, body.LongName, body.Note,
+	`, ownerID, slug, body.Name, newSlug != nil, newSlug, body.Note,
 		body.RiverName != nil, riverName,
 		body.ClassMin != nil, body.ClassMin,
 		body.ClassMax != nil, body.ClassMax,
@@ -1562,6 +1622,10 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if err != nil || tag.RowsAffected() == 0 {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
 		return
+	}
+	// Subsequent lookups must use the new slug when renamed.
+	if newSlug != nil {
+		slug = *newSlug
 	}
 
 	// Re-resolve river when river_name is being set, so state/basin/huc8 get populated.
@@ -1602,6 +1666,8 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		ownerID, slug, h2oflowsSentinelOwnerID, isAdmin).Scan(&runID) == nil {
 		saveCompleteness(ctx, h.db, runID)
 	}
+
+	jsonResponse(w, http.StatusOK, map[string]string{"slug": slug})
 }
 
 // ── Delete ───────────────────────────────────────────────────────────────────
@@ -2083,14 +2149,16 @@ func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 			 put_in, take_out,
 			 class_min, class_max, primary_gauge_id,
 			 forked_from_user_reach_id,
-			 original_author_handle, original_author_owner_id, original_forked_at)
+			 original_author_handle, original_author_owner_id, original_forked_at,
+			 river_confirmed)
 		VALUES
 			($1, $2, $3, $4::uuid, $5,
 			 ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography,
 			 ST_SetSRID(ST_MakePoint($8, $9), 4326)::geography,
 			 $10, $11, $12::uuid,
 			 $13::uuid,
-			 $14, $15::uuid, NOW())
+			 $14, $15::uuid, NOW(),
+			 $16)
 		RETURNING id
 	`, ownerID, slug, src.Name, src.RiverID, src.RiverName,
 		src.PutInLng, src.PutInLat,
@@ -2098,6 +2166,7 @@ func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 		src.ClassMin, src.ClassMax, src.GaugeID,
 		src.ID,
 		src.AuthorHandle, src.OwnerID,
+		src.RiverID != nil,
 	).Scan(&newID); err != nil {
 		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("fork failed: %v", err))
 		return
@@ -2217,19 +2286,22 @@ func forkCuratedReachTx(ctx context.Context, q pgxQueryer, ownerID, sourceSlug s
 			(owner_id, slug, name, river_id, river_name,
 			 put_in, take_out,
 			 class_min, class_max, primary_gauge_id,
-			 forked_from_user_reach_id, original_forked_at)
+			 forked_from_user_reach_id, original_forked_at,
+			 river_confirmed)
 		VALUES
 			($1, $2, $3, $4::uuid, $5,
 			 ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography,
 			 ST_SetSRID(ST_MakePoint($8, $9), 4326)::geography,
 			 $10, $11, $12::uuid,
-			 $13::uuid, NOW())
+			 $13::uuid, NOW(),
+			 $14)
 		RETURNING id
 	`, ownerID, newSlug, forkName, src.RiverID, src.RiverName,
 		src.PutInLng, src.PutInLat,
 		src.TakeOutLng, src.TakeOutLat,
 		src.ClassMin, src.ClassMax, src.GaugeID,
 		src.ID,
+		src.RiverID != nil,
 	).Scan(&newID); err != nil {
 		return "", "", fmt.Errorf("fork insert failed: %w", err)
 	}
