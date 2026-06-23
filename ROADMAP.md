@@ -36,7 +36,7 @@ Current state as of June 2026. Phase 1 (gauge dashboard + reach pages + AI assis
 **Locked decisions (2026-06-22):**
 
 1. **Channel model (option a).** Discovery is browsing channels one at a time. No global cross-user browse surface. Logged-out already redirects to `/explore/h2oflows`, consistent with this.
-2. **`visibility` collapses to binary public / private.** Its *only* meaning is "does this run appear on your `/explore/{handle}` profile." New runs default **public**. `unlisted` is dropped from the UX; direct-link-without-listing sharing is dropped (deemed pointless). Private = owner-only, off-profile.
+2. **Per-run privacy DROPPED — all runs public (community model, decided 2026-06-23).** No visibility UI; the "Make private" toggle is gone. Anonymous read is preserved (sign-in required only to create/fork/upvote/add-to-dashboard). The `visibility` column is retained (always `'public'`) so private could return later if product direction changes; supersedes the earlier binary-toggle plan.
 3. **Forks hidden from the public channel map.** Originals (both `forked_from_*` columns null) appear on a profile; forks appear only in the owner's dashboard + My Runs management.
 4. **"My Runs" management page returns** under the avatar menu (the list view was retired in Umbrella I; only `/my/runs/{slug}` detail/edit survived). Grouped like the explore sidebar, with **two toggles**: per-run dashboard membership on/off, and view-whole-authored-library vs dashboard-only.
 5. **Custom-gauge channel layer is DEFERRED** to its own GH issue (see N.deferred). Not in channels-v1.
@@ -55,12 +55,14 @@ Current state as of June 2026. Phase 1 (gauge dashboard + reach pages + AI assis
 
 | # | Item | Repo | Size |
 |---|------|------|------|
-| N.1 | **Visibility simplification.** Creation defaults `public` (set explicitly in the create path; verify `WizardEntryModal` + create handler). Replace the visibility picker with a single "Make private" toggle, off by default. Stop writing `unlisted`. One-off: count existing `unlisted` rows in prod and migrate → `public` (verify count first; they were meant to be visible). Query layer stays as-is — `MapAllByHandle` + reports already filter `visibility='public'`, so private stays hidden. **Never auto-flip existing `private` rows.** | api + web | S |
+| N.1 | **Visibility simplification (updated 2026-06-23).** Per-run privacy dropped; all runs are public. Create handler always writes `visibility='public'`; no "Make private" toggle in the UI. `visibility` column retained (always `'public'`). Query layer unchanged — `MapAllByHandle` + reports already filter `visibility='public'`. No migration needed (prod had zero `unlisted` rows; existing `private` rows remain private for now — no auto-flip). | api + web | S |
 | N.2 | **Hide forks from public channel map.** Add `AND forked_from_reach_id IS NULL AND forked_from_user_reach_id IS NULL` to `MapAllByHandle` (users.go:165). Audit any other public-channel endpoint for the same filter. Originals on profile; forks only in dashboard / My Runs. | api | S |
 | N.3 | **Channel header chrome.** Browse mode of `/explore/[[handle]].vue` gains a profile header — handle, avatar, run count, river count — so it reads as a profile, not a bare map. Sort-by-upvotes on the channel sidebar. Own-`/explore` keeps current my-runs behavior. | web | S |
 | N.4 | **"My Runs" management page.** New `/my/runs` list view + avatar-menu entry. Grouped like the explore sidebar. Two toggles: per-run dashboard membership, and authored-library vs dashboard-only. Reuse `DashboardMembershipPicker`. | web (+api if a list endpoint is missing) | M |
 | N.5 | **Relocate Add Run + Report.** Remove from `AppHeader` (desktop `60-69` Add Run / `43-57` Report; mobile `209-218` / `246-260`). Add subtle buttons to the dashboard page and explore page. Report still routes `/reports/new`. | web | S |
 | N.6 | **Easier upvoting.** Surface upvote in explore sidebar rows + map popup as a one-tap optimistic toggle. **Show the upvote count next to the thumbs-up icon** everywhere it renders. Sort-by-upvotes ties into N.3. Verify upvote endpoint at build time. | web (+verify api) | S |
+
+**Note — Delete paradox already handled (no new work needed).** Adding another user's run to a dashboard is a read-only reference (no ownership transfer). If a referenced run is deleted: the delete is soft (tombstone); dashboard referencers keep a read-only snapshot labelled "Author removed this run" with Fork/Adopt buttons to get a live copy. Runs with zero references are hard-deleted immediately. A background GC purges the tombstone record once the last reference is removed. The existing `reference_count` column tracks this — no migration or new logic needed for Channels.
 
 ### Deferred (own items)
 
@@ -69,11 +71,10 @@ Current state as of June 2026. Phase 1 (gauge dashboard + reach pages + AI assis
 
 ### PR sequencing
 
-1. **api PR** — N.2 fork filter + N.1 server-side `public` default. Small, independent, lands first so profile correctness is right before the UX builds on it.
-2. **web PR** — N.5 button relocation. No dependencies; declutters the header early.
-3. **web PR** — N.1 wizard/editor visibility simplification (single Make-private toggle).
-4. **web PR** — N.3 channel header + N.6 upvote surfacing/sort (cohesive; share the channel sidebar work).
-5. **web PR** — N.4 My Runs management page (largest; lands last).
+1. **api PR** — N.2 fork filter + N.1 server-side `public` always. Small, independent, lands first.
+2. **web PR** — N.5 button relocation + N.1 visibility UI removal (no "Make private" toggle; all runs public). No dependencies; declutters the header early.
+3. **web PR** — N.3 channel header + N.6 upvote surfacing/sort (cohesive; share the channel sidebar work).
+4. **web PR** — N.4 My Runs management page (largest; lands last).
 6. ~~**Ops task** — count + migrate prod `unlisted` rows → `public`~~ — **not needed**. Prod count 2026-06-22: 0 unlisted rows (169 public, 3 private).
 
 No schema migration for v1 (the `visibility` and fork columns already exist) and no data backfill — prod has zero `unlisted` rows.

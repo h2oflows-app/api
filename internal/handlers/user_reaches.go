@@ -1287,16 +1287,9 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 		slug = fmt.Sprintf("%s-%d", baseSlug, i)
 	}
 
-	// Default public; honor explicit is_private=true → private.
-	// 'unlisted' input treated as 'public' (deprecated).
-	// h2oflows curator content is always public (mig 109).
+	// Per-run privacy dropped — all runs public (community model).
 	createVisibility := "public"
-	if body.IsPrivate != nil && *body.IsPrivate {
-		createVisibility = "private"
-	}
-	if asH2oflows {
-		createVisibility = "public"
-	}
+	_ = asH2oflows // retained; no longer affects visibility
 
 	var reachID string
 	err := h.db.QueryRow(ctx, `
