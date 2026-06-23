@@ -1231,7 +1231,7 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Note      *string  `json:"note"`
 		ClassMin  *float64 `json:"class_min"`
 		ClassMax  *float64 `json:"class_max"`
-		// is_private kept for backward compat; nil (absent) = private by default (V1)
+		// is_private kept for backward compat; nil (absent) = public by default; true → private
 		IsPrivate *bool      `json:"is_private"`
 		FlowBands *FlowBands `json:"flow_bands"`
 	}
@@ -1280,11 +1280,12 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 		slug = fmt.Sprintf("%s-%d", baseSlug, i)
 	}
 
-	// V1: default private; is_private=false (explicit) → public for backward compat.
+	// Default public; honor explicit is_private=true → private.
+	// 'unlisted' input treated as 'public' (deprecated).
 	// h2oflows curator content is always public (mig 109).
-	createVisibility := "private"
-	if body.IsPrivate != nil && !*body.IsPrivate {
-		createVisibility = "public"
+	createVisibility := "public"
+	if body.IsPrivate != nil && *body.IsPrivate {
+		createVisibility = "private"
 	}
 	if asH2oflows {
 		createVisibility = "public"
