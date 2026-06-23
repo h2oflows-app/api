@@ -74,9 +74,9 @@ Current state as of June 2026. Phase 1 (gauge dashboard + reach pages + AI assis
 3. **web PR** — N.1 wizard/editor visibility simplification (single Make-private toggle).
 4. **web PR** — N.3 channel header + N.6 upvote surfacing/sort (cohesive; share the channel sidebar work).
 5. **web PR** — N.4 My Runs management page (largest; lands last).
-6. **Ops task** — count + migrate prod `unlisted` rows → `public` alongside N.1.
+6. ~~**Ops task** — count + migrate prod `unlisted` rows → `public`~~ — **not needed**. Prod count 2026-06-22: 0 unlisted rows (169 public, 3 private).
 
-No schema migration expected for v1 (the `visibility` and fork columns already exist); the only data touch is the one-off `unlisted` → `public` backfill, pending a prod count.
+No schema migration for v1 (the `visibility` and fork columns already exist) and no data backfill — prod has zero `unlisted` rows.
 
 ### Verification
 
