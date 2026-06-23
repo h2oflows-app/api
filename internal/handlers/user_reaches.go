@@ -236,6 +236,7 @@ type userReachDetail struct {
 	UserUpvoted             bool                   `json:"user_upvoted"`
 	IsOwn                   bool                   `json:"is_own"`
 	RiverConfirmed          bool                   `json:"river_confirmed"`
+	ReferenceCount          int                    `json:"reference_count"`
 }
 
 // ── MapAll ────────────────────────────────────────────────────────────────────
@@ -993,6 +994,12 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 	_ = h.db.QueryRow(r.Context(), `SELECT COUNT(*) FROM run_upvotes WHERE user_reach_id = $1`, d.ID).Scan(&d.UpvoteCount)
 	_ = h.db.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM run_upvotes WHERE user_reach_id = $1 AND user_id = $2)`, d.ID, ownerID).Scan(&d.UserUpvoted)
 
+	// Reference count: how many distinct non-owner users have this run on a dashboard.
+	_ = h.db.QueryRow(r.Context(),
+		`SELECT COUNT(DISTINCT user_id) FROM user_watchlists WHERE referenced_user_reach_id = $1 AND user_id <> $2`,
+		d.ID, ownerID,
+	).Scan(&d.ReferenceCount)
+
 	jsonResponse(w, http.StatusOK, d)
 }
 
@@ -1569,46 +1576,29 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		}
 		newVisibility = &v
 	}
-
-	// V2/V3 ratchet guard: read current state before applying visibility change.
-	if newVisibility != nil {
-		if *newVisibility == "public" {
-			errorResponse(w, http.StatusBadRequest, "use POST /publish to make a run public")
-			return
-		}
-		var curVisibility string
-		var publishedAt *string
-		if err := h.db.QueryRow(ctx,
-			`SELECT visibility, published_at::text FROM user_reaches WHERE (owner_id = $1 OR (owner_id = $3 AND $4::boolean)) AND slug = $2`,
-			ownerID, slug, h2oflowsSentinelOwnerID, isAdmin,
-		).Scan(&curVisibility, &publishedAt); err != nil {
-			errorResponse(w, http.StatusNotFound, "user reach not found")
-			return
-		}
-		if curVisibility == "public" {
-			// V2: once public, visibility is immutable (only delete path exists)
-			errorResponse(w, http.StatusConflict, "run is public; visibility cannot be changed")
-			return
-		}
-		if *newVisibility == "private" && publishedAt != nil {
-			// V3: unlisted→private only allowed if never published
-			errorResponse(w, http.StatusConflict, "run was published; cannot revert to private")
-			return
-		}
+	// Normalize legacy 'unlisted' → 'public' (unlisted retired).
+	if newVisibility != nil && *newVisibility == "unlisted" {
+		v := "public"
+		newVisibility = &v
 	}
 
 	// Core fields update. Set last_modified_after_fork_at when run is a fork.
+	// When visibility is set to 'public' for the first time, also stamp published_at.
 	tag, err := h.db.Exec(ctx, `
 		UPDATE user_reaches
 		SET
-			name       = COALESCE($3, name),
-			slug       = CASE WHEN $4 THEN $5 ELSE slug END,
-			note       = $6,
-			river_name = CASE WHEN $7 THEN $8 ELSE river_name END,
-			class_min  = CASE WHEN $9 THEN $10::numeric ELSE class_min END,
-			class_max  = CASE WHEN $11 THEN $12::numeric ELSE class_max END,
-			visibility = CASE WHEN $13 THEN $14::run_visibility ELSE visibility END,
-			updated_at = NOW(),
+			name         = COALESCE($3, name),
+			slug         = CASE WHEN $4 THEN $5 ELSE slug END,
+			note         = $6,
+			river_name   = CASE WHEN $7 THEN $8 ELSE river_name END,
+			class_min    = CASE WHEN $9 THEN $10::numeric ELSE class_min END,
+			class_max    = CASE WHEN $11 THEN $12::numeric ELSE class_max END,
+			visibility   = CASE WHEN $13 THEN $14::run_visibility ELSE visibility END,
+			published_at = CASE
+				WHEN $13 AND $14 = 'public' AND published_at IS NULL THEN NOW()
+				ELSE published_at
+			END,
+			updated_at   = NOW(),
 			last_modified_after_fork_at = CASE
 				WHEN original_forked_at IS NOT NULL THEN NOW()
 				ELSE last_modified_after_fork_at
