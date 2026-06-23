@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -125,6 +126,10 @@ func (h *UserProfileHandler) MapAllByHandle(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Caller may be anonymous (auth.Optional route). Empty string makes the
+	// EXISTS subquery evaluate false for every run, so anon always gets false.
+	callerID, _ := auth.UserIDFromContext(r.Context())
+
 	rows, err := h.db.Query(r.Context(), `
 		SELECT
 			ur.id, ur.slug, ur.name, ur.river_name,
@@ -142,7 +147,8 @@ func (h *UserProfileHandler) MapAllByHandle(w http.ResponseWriter, r *http.Reque
 			END AS flow_status,
 			ur.primary_gauge_id::text AS gauge_id,
 			ur.class_max,
-			COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0) AS upvote_count
+			COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0) AS upvote_count,
+			EXISTS(SELECT 1 FROM run_upvotes uv WHERE uv.user_reach_id = ur.id AND uv.user_id = $2::text) AS user_upvoted
 		FROM user_reaches ur
 		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
 		LEFT JOIN LATERAL (
@@ -165,7 +171,7 @@ func (h *UserProfileHandler) MapAllByHandle(w http.ResponseWriter, r *http.Reque
 		) fr
 		WHERE ur.owner_id = $1 AND ur.visibility = 'public' AND ur.deleted_at IS NULL
 		  AND ur.forked_from_reach_id IS NULL AND ur.forked_from_user_reach_id IS NULL
-	`, ownerID)
+	`, ownerID, callerID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
 		return
@@ -181,8 +187,9 @@ func (h *UserProfileHandler) MapAllByHandle(w http.ResponseWriter, r *http.Reque
 		FlowStatus  string   `json:"flow_status"`
 		CurrentCFS  *float64 `json:"current_cfs"`
 		GaugeID     *string  `json:"gauge_id"`
-		IsUserReach bool     `json:"is_user_reach"`
-		UpvoteCount int64    `json:"upvote_count"`
+		IsUserReach  bool     `json:"is_user_reach"`
+		UpvoteCount  int64    `json:"upvote_count"`
+		UserUpvoted  bool     `json:"user_upvoted"`
 	}
 	type feature struct {
 		Type       string          `json:"type"`
@@ -203,12 +210,13 @@ func (h *UserProfileHandler) MapAllByHandle(w http.ResponseWriter, r *http.Reque
 			gaugeID              *string
 			classMax             *float64
 			upvoteCount          int64
+			userUpvoted          bool
 		)
 		if err := rows.Scan(
 			&id, &slug, &name, &riverName,
 			&centerlineJSON,
 			&putInLng, &putInLat, &takeOutLng, &takeOutLat,
-			&currentCFS, &flowStatus, &gaugeID, &classMax, &upvoteCount,
+			&currentCFS, &flowStatus, &gaugeID, &classMax, &upvoteCount, &userUpvoted,
 		); err != nil {
 			continue
 		}
@@ -242,6 +250,7 @@ func (h *UserProfileHandler) MapAllByHandle(w http.ResponseWriter, r *http.Reque
 				GaugeID:     gaugeID,
 				IsUserReach: true,
 				UpvoteCount: upvoteCount,
+				UserUpvoted: userUpvoted,
 			},
 		})
 	}
