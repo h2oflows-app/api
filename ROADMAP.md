@@ -16,6 +16,7 @@ Current state as of June 2026. Phase 1 (gauge dashboard + reach pages + AI assis
 - ✅ **Umbrella G: UX Polish batch — merged 2026-05-31, tagged v0.6.0.** Dashboard filter removal, explore sidebar cleanup, forked-from inline, self-upvote guard, run editor polish (DashboardMembershipPicker, ask/override removal, KML move, similar-runs @handle), /my/runs table, gaugeSourceUrl util, admin Last CFS column, /me/gauges + refresh endpoint, /my/gauges page, /users/{handle}/runs/map/all, explore Browse User mode, NLDI tributary overlay, adaptive poll intervals.
 - ✅ **Umbrella I: All-user ownership + handle URLs — merged 2026-06-03.** Fork-on-add + handle claim, /runs/{handle}/{slug} routing, explore 3-tab redesign, dashboard card refactor, /my/runs retired, owner toolbar, curated concept dropped. Migration 106 (watchlist fork) + 107 (long_name). All runs user-owned; h2oflows curator handle for official content.
 - ✅ **long_name on user_reaches — merged 2026-06-03** (api#68, web#159). Migration 107 adds nullable `long_name` column; backfills forked runs from curated reach name. Editor exposes Short name + Full name fields. Dashboard shows full name as subtitle.
+- 🔨 **Umbrella N: Channels — IN PROGRESS (target v0.7.0).** Every user is a channel; `/explore/{handle}` becomes a public profile map. `visibility` collapses to binary public/private whose only meaning is "shows on your profile" (`unlisted` + direct-link sharing dropped). Forks hidden from public map. "My Runs" management page returns under the avatar menu with dashboard-membership + library toggles. Add Run / Report relocated off the AppHeader onto the dashboard + explore pages. Upvoting surfaced inline with counts. Custom-gauge channel layer + AW-as-user deferred to their own items. Full plan in the "Umbrella N — Channels" section below.
 - ⏳ **LLM audit (PR 9 deferred)** — nightly Haiku scan of new UGC, auto-flags outliers into abuse queue. Add when UGC volume warrants it. See "Post-v0.4 backlog" below.
 - ⏳ Pilot rollout (0.x) — on hold per user
 - ⏳ Phase 3 — SEO infra (build behind noindex wall, flip robots.txt at 1.0 launch)
@@ -23,6 +24,69 @@ Current state as of June 2026. Phase 1 (gauge dashboard + reach pages + AI assis
 - ⏳ Umbrella B — API v1 route split (`/public` + `/me` + `/internal`); target v0.5.0 post-UGC
 - ⏳ Phase 5 — American Whitewater interop (`reach-ingest-v1` schema drafted 2026-05-18)
 - ⏳ Phase 6+ — deferred
+
+---
+
+## Umbrella N — Channels (target v0.7.0) 🔨 IN PROGRESS
+
+*Every user is a channel. `/explore/{handle}` becomes that user's public profile map; h2oflows and (later) American Whitewater are simply channels among many.*
+
+**Premise.** Umbrella I already made every run user-owned, added handle URLs (`/runs/{handle}/{slug}`), and demoted h2oflows to a curator handle. PR #275 made `/explore/[[handle]].vue` route-driven — `/explore` = my runs, `/explore/{handle}` = browse a user. Channels completes that arc: a user's `/explore/{handle}` is their published profile, discovery is **per-channel** (you browse one profile at a time), and the global "all runs" map is intentionally absent.
+
+**Locked decisions (2026-06-22):**
+
+1. **Channel model (option a).** Discovery is browsing channels one at a time. No global cross-user browse surface. Logged-out already redirects to `/explore/h2oflows`, consistent with this.
+2. **Per-run privacy DROPPED — all runs public (community model, decided 2026-06-23).** No visibility UI; the "Make private" toggle is gone. Anonymous read is preserved (sign-in required only to create/fork/upvote/add-to-dashboard). The `visibility` column is retained (always `'public'`) so private could return later if product direction changes; supersedes the earlier binary-toggle plan.
+3. **Forks hidden from the public channel map.** Originals (both `forked_from_*` columns null) appear on a profile; forks appear only in the owner's dashboard + My Runs management.
+4. **"My Runs" management page returns** under the avatar menu (the list view was retired in Umbrella I; only `/my/runs/{slug}` detail/edit survived). Grouped like the explore sidebar, with **two toggles**: per-run dashboard membership on/off, and view-whole-authored-library vs dashboard-only.
+5. **Custom-gauge channel layer is DEFERRED** to its own GH issue (see N.deferred). Not in channels-v1.
+6. **AW-as-user / PATs stay Phase 4 + Phase 5.** Channels is the *prerequisite* (AW becomes a channel once PATs land), but token infrastructure is greenfield and not bundled here.
+
+### Grounding (verified 2026-06-22)
+
+- Explore is already channel-shaped: `web/app/pages/explore/[[handle]].vue`, optional `handle` param, my-runs vs browse-user modes.
+- Public map endpoint exists and already filters privacy: `api/internal/handlers/users.go:115` `MapAllByHandle` → `WHERE ur.owner_id = $1 AND ur.visibility = 'public' AND ur.deleted_at IS NULL`. **It does not yet filter forks.**
+- `user_reaches.visibility` is `ENUM('private','unlisted','public')`, DB default **`'private'`** (migration `000112`). Backfill set existing non-private rows to public. New-run creation must therefore set `public` **explicitly** — do not rely on the column default, and do not migrate-drop the column.
+- Fork origin tracked: `forked_from_reach_id` / `forked_from_user_reach_id` (migration `000093`), mutually exclusive; attribution snapshot in `000101`.
+- Reports survived runs-unify healthy: `reports` now FKs `user_reach_id` (migration `000094`), writes target `user_reach_id` only, reads filter `visibility='public'`. Relocating the Report button is safe.
+- Upvotes shipped in Umbrella A with a self-upvote guard.
+
+### Items
+
+| # | Item | Repo | Size |
+|---|------|------|------|
+| N.1 | **Visibility simplification (updated 2026-06-23).** Per-run privacy dropped; all runs are public. Create handler always writes `visibility='public'`; no "Make private" toggle in the UI. `visibility` column retained (always `'public'`). Query layer unchanged — `MapAllByHandle` + reports already filter `visibility='public'`. No migration needed (prod had zero `unlisted` rows; existing `private` rows remain private for now — no auto-flip). | api + web | S |
+| N.2 | **Hide forks from public channel map.** Add `AND forked_from_reach_id IS NULL AND forked_from_user_reach_id IS NULL` to `MapAllByHandle` (users.go:165). Audit any other public-channel endpoint for the same filter. Originals on profile; forks only in dashboard / My Runs. | api | S |
+| N.3 | **Channel header chrome.** Browse mode of `/explore/[[handle]].vue` gains a profile header — handle, avatar, run count, river count — so it reads as a profile, not a bare map. Sort-by-upvotes on the channel sidebar. Own-`/explore` keeps current my-runs behavior. | web | S |
+| N.4 | **"My Runs" management page.** New `/my/runs` list view + avatar-menu entry. Grouped like the explore sidebar. Two toggles: per-run dashboard membership, and authored-library vs dashboard-only. Reuse `DashboardMembershipPicker`. | web (+api if a list endpoint is missing) | M |
+| N.5 | **Relocate Add Run + Report.** Remove from `AppHeader` (desktop `60-69` Add Run / `43-57` Report; mobile `209-218` / `246-260`). Add subtle buttons to the dashboard page and explore page. Report still routes `/reports/new`. | web | S |
+| N.6 | **Easier upvoting.** Surface upvote in explore sidebar rows + map popup as a one-tap optimistic toggle. **Show the upvote count next to the thumbs-up icon** everywhere it renders. Sort-by-upvotes ties into N.3. Verify upvote endpoint at build time. | web (+verify api) | S |
+
+**Note — Delete paradox already handled (no new work needed).** Adding another user's run to a dashboard is a read-only reference (no ownership transfer). If a referenced run is deleted: the delete is soft (tombstone); dashboard referencers keep a read-only snapshot labelled "Author removed this run" with Fork/Adopt buttons to get a live copy. Runs with zero references are hard-deleted immediately. A background GC purges the tombstone record once the last reference is removed. The existing `reference_count` column tracks this — no migration or new logic needed for Channels.
+
+### Deferred (own items)
+
+- **N.deferred — Custom-gauge channel layer.** Showcase a channel's custom gauges on the profile map and let visitors fork them. Render each public custom gauge as its **own pin** (calc icon at the centroid of its input gauges), tap → popover with name, computed CFS, formula (`A + B − C`), faint lines to input gauges, and a "Fork to my gauges" button reusing the existing payload export/import (`POST /me/custom-gauges`). *Not* the color-matched-input-gauges rendering — a real gauge can feed many custom gauges (`custom_gauge_inputs`), so one-pin-one-color collapses. Requires a new `is_public`/visibility column on `custom_gauges` (currently private-by-design — roadmap 2.3) and a moderation thought for user-authored gauge names. Tracked as **web#276**; revisit after channels-v1.
+- **AW-as-user / bulk upload.** Phase 4 (PATs) + Phase 5 (AW interop, `reach-ingest-v1`). Once PATs land, AW is a channel with a service-account token — zero rework on the channel model.
+
+### PR sequencing
+
+1. **api PR** — N.2 fork filter + N.1 server-side `public` always. Small, independent, lands first.
+2. **web PR** — N.5 button relocation + N.1 visibility UI removal (no "Make private" toggle; all runs public). No dependencies; declutters the header early.
+3. **web PR** — N.3 channel header + N.6 upvote surfacing/sort (cohesive; share the channel sidebar work).
+4. **web PR** — N.4 My Runs management page (largest; lands last).
+6. ~~**Ops task** — count + migrate prod `unlisted` rows → `public`~~ — **not needed**. Prod count 2026-06-22: 0 unlisted rows (169 public, 3 private).
+
+No schema migration for v1 (the `visibility` and fork columns already exist) and no data backfill — prod has zero `unlisted` rows.
+
+### Verification
+
+- Logged-out `/explore` → redirects to `/explore/h2oflows`; that profile shows h2oflows runs only, no forks, no private rows.
+- Create a run → defaults public, appears on own `/explore/{handle}`. Toggle private → drops off the public profile, still visible to owner.
+- Fork another user's run → appears in own dashboard + My Runs, **not** on own public profile.
+- My Runs page lists authored library; dashboard-membership toggle adds/removes from a dashboard; library/dashboard-only toggle filters the list.
+- Add Run / Report absent from AppHeader; present (subtle) on dashboard + explore.
+- Upvote a run from the explore sidebar → count increments next to the thumbs-up, optimistic, persists on reload; sort-by-upvotes reorders the channel.
 
 ---
 
