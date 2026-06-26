@@ -678,7 +678,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 					COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END)
 				END AS band_color
 		) fr
-		WHERE ur.owner_id = $1
+		WHERE ur.owner_id = $1 AND ur.deleted_at IS NULL
 		ORDER BY ur.name
 	`, ownerID)
 	if err != nil {
