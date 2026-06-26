@@ -183,6 +183,7 @@ type userReachSummary struct {
 	DeletedAt       *time.Time `json:"deleted_at"`
 	ForkCount       int        `json:"fork_count"`
 	IsFork          bool       `json:"is_fork"`
+	UpvoteCount     int        `json:"upvote_count"`
 	AuthorHandle    *string    `json:"author_handle"`
 	IsOfficial      bool       `json:"is_official"`
 }
@@ -648,6 +649,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			cg.slug AS custom_gauge_slug,
 			cg.name AS custom_gauge_name,
 			ur.visibility,
+			COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0) AS upvote_count,
 			up.handle AS author_handle
 		FROM user_reaches ur
 		LEFT JOIN rivers rv ON rv.id = ur.river_id
@@ -699,7 +701,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			&s.GaugeExternalID, &s.GaugeSource, &s.GaugeName,
 			&s.GaugeLat, &s.GaugeLng,
 			&s.CustomGaugeID, &s.CustomGaugeSlug, &s.CustomGaugeName,
-			&s.Visibility, &s.AuthorHandle,
+			&s.Visibility, &s.UpvoteCount, &s.AuthorHandle,
 		); err == nil {
 			s.IsPrivate = s.Visibility != "public"
 			items = append(items, s)
