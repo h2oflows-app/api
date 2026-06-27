@@ -54,9 +54,9 @@ echo ""
 echo "✓ Local database is now in sync with production."
 psql "${LOCAL_PGURL}/h2oflows?sslmode=disable" -c "
   SELECT
-    (SELECT count(*) FROM reaches)     AS reaches,
+    (SELECT count(*) FROM user_reaches) AS user_reaches,
     (SELECT count(*) FROM gauges)      AS gauges,
-    (SELECT count(*) FROM flow_ranges) AS flow_ranges,
+    (SELECT count(*) FROM user_reach_flow_ranges) AS flow_ranges,
     (SELECT count(*) FROM rivers)      AS rivers,
     (SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1) AS migration;
 "
