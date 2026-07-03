@@ -21,7 +21,13 @@ type FlowBands struct {
 	Thresholds []FlowBandThreshold `json:"thresholds"`
 }
 
-var colorKeyRe = regexp.MustCompile(`^(red|orange|yellow|green|blue|purple|neutral)-[1-5]$`)
+// colorKeyRe accepts both color formats a flow-band color may carry:
+//   - indexed palette: "p<n>" where n is 0..39 (8 families × 5 levels, web#252)
+//   - legacy family-level keys: "green-3" etc. (still present on older rows)
+// The indexed form is now the default the web client sends; the migration in
+// web#252 moved stored keys to "p<n>", so the validator must accept it or every
+// edit-save 400s (issue #307). Legacy list includes pink (previously omitted).
+var colorKeyRe = regexp.MustCompile(`^(p([0-9]|[12][0-9]|3[0-9])|(red|orange|yellow|green|blue|purple|pink|neutral)-[1-5])$`)
 
 // flowStatusFromColor maps a color key to the legacy flow_status enum (V9).
 // red-* → caution, blue-* → flood, other color → runnable, empty → unknown.
