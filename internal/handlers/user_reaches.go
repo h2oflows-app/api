@@ -1843,6 +1843,225 @@ func (h *UserReachHandler) SetFlowRanges(w http.ResponseWriter, r *http.Request)
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// ── Rapids & Access Points ──────────────────────────────────────────────────
+//
+// Bulk-replace endpoints backing the run editor's rapids/access-points steps.
+// Wholesale DELETE-then-INSERT inside a transaction, same shape as
+// SetFlowRanges above. Every inserted row is stamped data_source='community',
+// verified=true — NOT 'import'/'ai_seed' — so a future KML re-import (which
+// only clears rows with data_source IN ('import','ai_seed'), see
+// kmlimport.Importer.clearImportDataForTarget) never clobbers a manual edit.
+
+// editableAccessTypes are the reach_access.access_type values the feature
+// editor may write. put_in/take_out are excluded: those are owned by the
+// run's put_in/take_out columns and set via wizard steps 1-2, never here.
+var editableAccessTypes = map[string]bool{
+	"camp":         true,
+	"parking":      true,
+	"boat_ramp":    true,
+	"intermediate": true,
+	"shuttle_drop": true,
+}
+
+type rapidInput struct {
+	Name              string   `json:"name"`
+	Description       *string  `json:"description"`
+	ClassRating       *float64 `json:"class_rating"`
+	IsSurfWave        bool     `json:"is_surf_wave"`
+	IsPermanentHazard bool     `json:"is_permanent_hazard"`
+	HazardType        *string  `json:"hazard_type"`
+	Lng               *float64 `json:"lng"`
+	Lat               *float64 `json:"lat"`
+}
+
+// PUT /api/v1/me/reaches/{slug}/rapids
+// Body: { "rapids": [ {rapid}, ... ] }
+// Wholesale-replaces every rapid on the run.
+func (h *UserReachHandler) SetRapids(w http.ResponseWriter, r *http.Request) {
+	ownerID, _, ok := h.authorOwnerID(r)
+	if !ok {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	isAdmin := auth.IsDataAdminFromContext(r.Context())
+	slug := chi.URLParam(r, "slug")
+
+	var reachID string
+	if err := h.db.QueryRow(r.Context(),
+		`SELECT id FROM user_reaches WHERE (owner_id = $1 OR (owner_id = $3 AND $4::boolean)) AND slug = $2
+		 ORDER BY (owner_id = $1) DESC LIMIT 1`,
+		ownerID, slug, h2oflowsSentinelOwnerID, isAdmin).Scan(&reachID); err != nil {
+		errorResponse(w, http.StatusNotFound, "user reach not found")
+		return
+	}
+
+	var body struct {
+		Rapids []rapidInput `json:"rapids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		errorResponse(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	for i := range body.Rapids {
+		body.Rapids[i].Name = strings.TrimSpace(body.Rapids[i].Name)
+		if body.Rapids[i].Name == "" {
+			errorResponse(w, http.StatusBadRequest, fmt.Sprintf("rapids[%d].name is required", i))
+			return
+		}
+	}
+
+	ctx := r.Context()
+	tx, err := h.db.Begin(ctx)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "tx begin failed")
+		return
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if _, err := tx.Exec(ctx, `DELETE FROM rapids WHERE user_reach_id = $1`, reachID); err != nil {
+		errorResponse(w, http.StatusInternalServerError, "delete failed: "+err.Error())
+		return
+	}
+	for _, rp := range body.Rapids {
+		var insertErr error
+		if rp.Lng != nil && rp.Lat != nil {
+			_, insertErr = tx.Exec(ctx, `
+				INSERT INTO rapids (user_reach_id, name, location, description, class_rating,
+				                    is_surf_wave, is_permanent_hazard, hazard_type, data_source, verified)
+				VALUES ($1, $2, ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography,
+				        NULLIF($5, ''), $6, $7, $8, NULLIF($9, ''), 'community', true)
+			`, reachID, rp.Name, rp.Lng, rp.Lat, rp.Description, rp.ClassRating,
+				rp.IsSurfWave, rp.IsPermanentHazard, rp.HazardType)
+		} else {
+			_, insertErr = tx.Exec(ctx, `
+				INSERT INTO rapids (user_reach_id, name, description, class_rating,
+				                    is_surf_wave, is_permanent_hazard, hazard_type, data_source, verified)
+				VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, NULLIF($7, ''), 'community', true)
+			`, reachID, rp.Name, rp.Description, rp.ClassRating,
+				rp.IsSurfWave, rp.IsPermanentHazard, rp.HazardType)
+		}
+		if insertErr != nil {
+			if isUniqueViolation(insertErr) {
+				errorResponse(w, http.StatusConflict, fmt.Sprintf("duplicate rapid name: %q", rp.Name))
+			} else {
+				errorResponse(w, http.StatusInternalServerError, "insert failed: "+insertErr.Error())
+			}
+			return
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		errorResponse(w, http.StatusInternalServerError, "commit failed")
+		return
+	}
+
+	saveCompleteness(ctx, h.db, reachID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+type accessPointInput struct {
+	AccessType string   `json:"access_type"`
+	Name       *string  `json:"name"`
+	Notes      *string  `json:"notes"`
+	Lng        *float64 `json:"lng"`
+	Lat        *float64 `json:"lat"`
+}
+
+// PUT /api/v1/me/reaches/{slug}/access
+// Body: { "access": [ {access}, ... ] }
+// Wholesale-replaces every non-put_in/take_out access point on the run;
+// put_in/take_out rows (owned by the run's put_in/take_out columns) are
+// preserved untouched.
+func (h *UserReachHandler) SetAccessPoints(w http.ResponseWriter, r *http.Request) {
+	ownerID, _, ok := h.authorOwnerID(r)
+	if !ok {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	isAdmin := auth.IsDataAdminFromContext(r.Context())
+	slug := chi.URLParam(r, "slug")
+
+	var reachID string
+	if err := h.db.QueryRow(r.Context(),
+		`SELECT id FROM user_reaches WHERE (owner_id = $1 OR (owner_id = $3 AND $4::boolean)) AND slug = $2
+		 ORDER BY (owner_id = $1) DESC LIMIT 1`,
+		ownerID, slug, h2oflowsSentinelOwnerID, isAdmin).Scan(&reachID); err != nil {
+		errorResponse(w, http.StatusNotFound, "user reach not found")
+		return
+	}
+
+	var body struct {
+		Access []accessPointInput `json:"access"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		errorResponse(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	for i, ap := range body.Access {
+		if editableAccessTypes[ap.AccessType] {
+			continue
+		}
+		if ap.AccessType == "put_in" || ap.AccessType == "take_out" {
+			errorResponse(w, http.StatusBadRequest,
+				fmt.Sprintf("access[%d].access_type %q is owned by the run's put-in/take-out fields and cannot be set here", i, ap.AccessType))
+		} else {
+			errorResponse(w, http.StatusBadRequest,
+				fmt.Sprintf("access[%d].access_type %q is invalid", i, ap.AccessType))
+		}
+		return
+	}
+
+	ctx := r.Context()
+	tx, err := h.db.Begin(ctx)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "tx begin failed")
+		return
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM reach_access WHERE user_reach_id = $1 AND access_type NOT IN ('put_in','take_out')`,
+		reachID); err != nil {
+		errorResponse(w, http.StatusInternalServerError, "delete failed: "+err.Error())
+		return
+	}
+	for _, ap := range body.Access {
+		var insertErr error
+		if ap.Lng != nil && ap.Lat != nil {
+			_, insertErr = tx.Exec(ctx, `
+				INSERT INTO reach_access (user_reach_id, access_type, name, location, notes, data_source, verified)
+				VALUES ($1, $2, NULLIF($3, ''), ST_SetSRID(ST_MakePoint($4, $5), 4326)::geography,
+				        NULLIF($6, ''), 'community', true)
+			`, reachID, ap.AccessType, ap.Name, ap.Lng, ap.Lat, ap.Notes)
+		} else {
+			_, insertErr = tx.Exec(ctx, `
+				INSERT INTO reach_access (user_reach_id, access_type, name, notes, data_source, verified)
+				VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), 'community', true)
+			`, reachID, ap.AccessType, ap.Name, ap.Notes)
+		}
+		if insertErr != nil {
+			if isUniqueViolation(insertErr) {
+				name := ""
+				if ap.Name != nil {
+					name = *ap.Name
+				}
+				errorResponse(w, http.StatusConflict, fmt.Sprintf("duplicate access point: %s %q", ap.AccessType, name))
+			} else {
+				errorResponse(w, http.StatusInternalServerError, "insert failed: "+insertErr.Error())
+			}
+			return
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		errorResponse(w, http.StatusInternalServerError, "commit failed")
+		return
+	}
+
+	saveCompleteness(ctx, h.db, reachID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // DELETE /api/v1/me/reaches/{slug}/gauge
 func (h *UserReachHandler) ClearGauge(w http.ResponseWriter, r *http.Request) {
 	ownerID, ok := h.ownerID(r)
