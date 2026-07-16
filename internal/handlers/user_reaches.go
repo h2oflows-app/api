@@ -2355,7 +2355,7 @@ func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 			 class_min, class_max, primary_gauge_id,
 			 forked_from_user_reach_id,
 			 original_author_handle, original_author_owner_id, original_forked_at,
-			 river_confirmed)
+			 river_confirmed, visibility, published_at)
 		VALUES
 			($1, $2, $3, $4::uuid, $5,
 			 ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography,
@@ -2363,7 +2363,7 @@ func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 			 $10, $11, $12::uuid,
 			 $13::uuid,
 			 $14, $15::uuid, NOW(),
-			 $16)
+			 $16, 'public'::run_visibility, NOW())
 		RETURNING id
 	`, ownerID, slug, src.Name, src.RiverID, src.RiverName,
 		src.PutInLng, src.PutInLat,
@@ -2495,14 +2495,14 @@ func forkCuratedReachTx(ctx context.Context, q pgxQueryer, ownerID, sourceSlug s
 			 put_in, take_out,
 			 class_min, class_max, primary_gauge_id,
 			 forked_from_user_reach_id, original_forked_at,
-			 river_confirmed)
+			 river_confirmed, visibility, published_at)
 		VALUES
 			($1, $2, $3, $4::uuid, $5,
 			 ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography,
 			 ST_SetSRID(ST_MakePoint($8, $9), 4326)::geography,
 			 $10, $11, $12::uuid,
 			 $13::uuid, NOW(),
-			 $14)
+			 $14, 'public'::run_visibility, NOW())
 		RETURNING id
 	`, ownerID, newSlug, forkName, src.RiverID, src.RiverName,
 		src.PutInLng, src.PutInLat,
