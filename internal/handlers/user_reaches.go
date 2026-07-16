@@ -2399,6 +2399,9 @@ func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 		WHERE user_reach_id = $2
 	`, newID, src.ID)
 
+	// Copy all features (rapids + access points) so a fork carries the whole run (#312).
+	copyRunFeatures(ctx, h.db, newID, src.ID)
+
 	saveCompleteness(ctx, h.db, newID)
 	jsonResponse(w, http.StatusCreated, map[string]string{"id": newID, "slug": slug, "gauge_id": func() string {
 		if src.GaugeID != nil {
@@ -2536,7 +2539,43 @@ func forkCuratedReachTx(ctx context.Context, q pgxQueryer, ownerID, sourceSlug s
 		ON CONFLICT (user_reach_id, value) DO NOTHING
 	`, newID, src.ID)
 
+	// Copy all features (rapids + access points) so a fork carries the whole run (#312).
+	copyRunFeatures(ctx, q, newID, src.ID)
+
 	return newID, newSlug, nil
+}
+
+// copyRunFeatures clones every rapids + reach_access row from srcID's run onto
+// dstID's freshly-forked run. Feature rows are re-stamped data_source='community'
+// so the fork owns its own copies (see the run-features editor CRUD). Best-effort:
+// a fork still succeeds if this fails. dstID is a brand-new run with no existing
+// features, so there are no unique-constraint conflicts to handle.
+func copyRunFeatures(ctx context.Context, q pgxQueryer, dstID, srcID string) {
+	_, _ = q.Exec(ctx, `
+		INSERT INTO rapids
+			(user_reach_id, name, river_mile, location, class_rating, class_at_low, class_at_high,
+			 description, portage_description, is_portage_recommended,
+			 is_surf_wave, is_permanent_hazard, hazard_type, data_source, verified)
+		SELECT $1, name, river_mile, location, class_rating, class_at_low, class_at_high,
+			 description, portage_description, is_portage_recommended,
+			 is_surf_wave, is_permanent_hazard, hazard_type, 'community', verified
+		FROM rapids WHERE user_reach_id = $2
+	`, dstID, srcID)
+
+	_, _ = q.Exec(ctx, `
+		INSERT INTO reach_access
+			(user_reach_id, access_type, name, location, directions, road_type,
+			 parking_spaces, parking_fee, permit_required, permit_info, permit_url,
+			 seasonal_close_start, seasonal_close_end, notes, parking_location,
+			 parking_notes, hike_to_water_min, entry_style, approach_dist_mi, approach_notes,
+			 data_source, verified)
+		SELECT $1, access_type, name, location, directions, road_type,
+			 parking_spaces, parking_fee, permit_required, permit_info, permit_url,
+			 seasonal_close_start, seasonal_close_end, notes, parking_location,
+			 parking_notes, hike_to_water_min, entry_style, approach_dist_mi, approach_notes,
+			 'community', verified
+		FROM reach_access WHERE user_reach_id = $2
+	`, dstID, srcID)
 }
 
 // POST /api/v1/me/reaches/fork-reach/{slug}
