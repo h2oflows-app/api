@@ -449,11 +449,33 @@ func (h *AdminHandler) AddRoleMember(w http.ResponseWriter, r *http.Request) {
 func (h *AdminHandler) RemoveRoleMember(w http.ResponseWriter, r *http.Request) {
 	role := chi.URLParam(r, "role")
 	userID := chi.URLParam(r, "userId")
-	_, err := h.db.Exec(r.Context(),
-		`DELETE FROM user_roles WHERE role = $1 AND user_id = $2 AND river_id IS NULL`, role, userID,
-	)
+
+	// Last-admin guard: the platform must always retain at least one site_admin
+	// membership row. The COUNT guard is inside the DELETE so the check-and-
+	// delete is atomic (no TOCTOU window).
+	tag, err := h.db.Exec(r.Context(), `
+		DELETE FROM user_roles
+		WHERE role = $1 AND user_id = $2 AND river_id IS NULL
+		  AND ($1 <> 'site_admin'
+		       OR (SELECT COUNT(*) FROM user_roles WHERE role = 'site_admin' AND river_id IS NULL) > 1)
+	`, role, userID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "delete failed")
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		// Nothing deleted: either the membership doesn't exist, or it's the last
+		// site_admin. Disambiguate for a useful error.
+		var exists bool
+		_ = h.db.QueryRow(r.Context(),
+			`SELECT EXISTS(SELECT 1 FROM user_roles WHERE role = $1 AND user_id = $2 AND river_id IS NULL)`,
+			role, userID,
+		).Scan(&exists)
+		if exists {
+			errorResponse(w, http.StatusConflict, "cannot remove the last admin — at least one member must remain in the admins role")
+			return
+		}
+		errorResponse(w, http.StatusNotFound, "membership not found")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
