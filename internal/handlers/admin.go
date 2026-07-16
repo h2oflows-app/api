@@ -216,13 +216,13 @@ func (h *AdminHandler) AssignRole(w http.ResponseWriter, r *http.Request) {
 // DELETE /api/v1/admin/users/roles/{roleId}
 func (h *AdminHandler) RevokeRole(w http.ResponseWriter, r *http.Request) {
 	roleID := chi.URLParam(r, "roleId")
-	// Last-admin guard (same as RemoveRoleMember): never delete the final
-	// site_admin membership row. Atomic via in-DELETE count guard.
+	// Last-member guard (same as RemoveRoleMember): never delete the final
+	// site_admin or h2oflows membership row. Atomic via in-DELETE count guard.
 	tag, err := h.db.Exec(r.Context(), `
 		DELETE FROM user_roles
 		WHERE id = $1
-		  AND (role <> 'site_admin'
-		       OR (SELECT COUNT(*) FROM user_roles WHERE role = 'site_admin' AND river_id IS NULL) > 1)
+		  AND (role NOT IN ('site_admin', 'h2oflows')
+		       OR (SELECT COUNT(*) FROM user_roles r2 WHERE r2.role = user_roles.role AND r2.river_id IS NULL) > 1)
 	`, roleID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "delete failed")
@@ -232,7 +232,7 @@ func (h *AdminHandler) RevokeRole(w http.ResponseWriter, r *http.Request) {
 		var exists bool
 		_ = h.db.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM user_roles WHERE id = $1)`, roleID).Scan(&exists)
 		if exists {
-			errorResponse(w, http.StatusConflict, "cannot remove the last admin — at least one member must remain in the admins role")
+			errorResponse(w, http.StatusConflict, "cannot remove the last member of a protected role (admins / h2oflows)")
 			return
 		}
 		errorResponse(w, http.StatusNotFound, "role assignment not found")

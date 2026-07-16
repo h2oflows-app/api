@@ -27,18 +27,23 @@ type RateLimit struct {
 // orgs) that can be granted authoring rights via a user_roles role equal to
 // its handle.
 type SpecialUser struct {
-	ID          string    `json:"id"` // owner_id
-	Handle      string    `json:"handle"`
-	DisplayName *string   `json:"display_name"`
-	IsSpecial   bool      `json:"is_special"`
-	PublicOnMap bool      `json:"public_on_map"`
-	RunCount    int       `json:"run_count"`
-	MemberCount int       `json:"member_count"`
-	UsageHour   int       `json:"usage_hour"`
-	APIKeyLast4 *string   `json:"api_key_last4"`
-	CreatedAt   time.Time `json:"created_at"`
-	RateLimit   RateLimit `json:"rate_limit"`
+	ID           string    `json:"id"` // owner_id
+	Handle       string    `json:"handle"`
+	DisplayName  *string   `json:"display_name"`
+	IsSpecial    bool      `json:"is_special"`
+	PublicOnMap  bool      `json:"public_on_map"`
+	DeleteLocked bool      `json:"delete_locked"`
+	RunCount     int       `json:"run_count"`
+	MemberCount  int       `json:"member_count"`
+	UsageHour    int       `json:"usage_hour"`
+	APIKeyLast4  *string   `json:"api_key_last4"`
+	CreatedAt    time.Time `json:"created_at"`
+	RateLimit    RateLimit `json:"rate_limit"`
 }
+
+// h2oflowsHandle is the platform's anchor special account: permanently
+// delete-locked, handle immutable, and its role must always keep >= 1 member.
+const h2oflowsHandle = "h2oflows"
 
 // RoleMember is a single user_roles grant, resolved against user_profiles
 // for display.
@@ -80,7 +85,7 @@ func (h *AdminHandler) ListSpecialUsers(w http.ResponseWriter, r *http.Request) 
 	rows, err := h.db.Query(r.Context(), `
 		SELECT
 			up.owner_id, up.handle, up.display_name, up.is_special, up.public_on_map,
-			up.created_at,
+			up.delete_locked, up.created_at,
 			COALESCE((SELECT COUNT(*) FROM user_reaches ur WHERE ur.owner_id = up.owner_id AND ur.deleted_at IS NULL), 0) AS run_count,
 			COALESCE((SELECT COUNT(*) FROM user_roles r2 WHERE r2.role = up.handle), 0) AS member_count,
 			a.api_key_last4,
@@ -105,7 +110,7 @@ func (h *AdminHandler) ListSpecialUsers(w http.ResponseWriter, r *http.Request) 
 		var su SpecialUser
 		if err := rows.Scan(
 			&su.ID, &su.Handle, &su.DisplayName, &su.IsSpecial, &su.PublicOnMap,
-			&su.CreatedAt, &su.RunCount, &su.MemberCount, &su.APIKeyLast4, &su.UsageHour,
+			&su.DeleteLocked, &su.CreatedAt, &su.RunCount, &su.MemberCount, &su.APIKeyLast4, &su.UsageHour,
 			&su.RateLimit.RunsPerHour, &su.RateLimit.MaxBatch, &su.RateLimit.RequestsPerMinute, &su.RateLimit.ConcurrentJobs,
 		); err == nil {
 			out = append(out, su)
@@ -169,9 +174,12 @@ func (h *AdminHandler) CreateSpecialUser(w http.ResponseWriter, r *http.Request)
 
 	var ownerID string
 	var createdAt time.Time
+	// New special accounts start delete_locked=true — unlocking is a deliberate
+	// admin action before a delete, so a big imported run database (AW, ...)
+	// can't be dropped by a stray click.
 	if err := tx.QueryRow(r.Context(), `
-		INSERT INTO user_profiles (owner_id, handle, display_name, is_special, public_on_map)
-		VALUES (gen_random_uuid()::text, $1, $2, true, $3)
+		INSERT INTO user_profiles (owner_id, handle, display_name, is_special, public_on_map, delete_locked)
+		VALUES (gen_random_uuid()::text, $1, $2, true, $3, true)
 		RETURNING owner_id, created_at
 	`, body.Handle, body.DisplayName, publicOnMap).Scan(&ownerID, &createdAt); err != nil {
 		errorResponse(w, http.StatusInternalServerError, "create failed: "+err.Error())
@@ -194,7 +202,7 @@ func (h *AdminHandler) CreateSpecialUser(w http.ResponseWriter, r *http.Request)
 
 	su := SpecialUser{
 		ID: ownerID, Handle: body.Handle, DisplayName: body.DisplayName,
-		IsSpecial: true, PublicOnMap: publicOnMap,
+		IsSpecial: true, PublicOnMap: publicOnMap, DeleteLocked: true,
 		APIKeyLast4: &last4, CreatedAt: createdAt,
 		RateLimit: RateLimit{
 			RunsPerHour: runsPerHour, MaxBatch: specialMaxBatch,
@@ -213,9 +221,10 @@ func (h *AdminHandler) CreateSpecialUser(w http.ResponseWriter, r *http.Request)
 func (h *AdminHandler) UpdateSpecialUser(w http.ResponseWriter, r *http.Request) {
 	ownerID := chi.URLParam(r, "ownerId")
 	var body struct {
-		Handle      *string `json:"handle"`
-		DisplayName *string `json:"display_name"`
-		PublicOnMap *bool   `json:"public_on_map"`
+		Handle       *string `json:"handle"`
+		DisplayName  *string `json:"display_name"`
+		PublicOnMap  *bool   `json:"public_on_map"`
+		DeleteLocked *bool   `json:"delete_locked"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid JSON")
@@ -228,6 +237,20 @@ func (h *AdminHandler) UpdateSpecialUser(w http.ResponseWriter, r *http.Request)
 	).Scan(&oldHandle); err != nil {
 		errorResponse(w, http.StatusNotFound, "special user not found")
 		return
+	}
+
+	// h2oflows is the platform anchor: permanently delete-locked and its
+	// handle is immutable (the hero map and anon explore default are pinned
+	// to /users/h2oflows/...).
+	if oldHandle == h2oflowsHandle {
+		if body.DeleteLocked != nil && !*body.DeleteLocked {
+			errorResponse(w, http.StatusConflict, "@h2oflows is permanently locked for delete and cannot be unlocked")
+			return
+		}
+		if body.Handle != nil && strings.ToLower(strings.TrimSpace(*body.Handle)) != h2oflowsHandle {
+			errorResponse(w, http.StatusConflict, "the @h2oflows handle cannot be changed")
+			return
+		}
 	}
 
 	newHandle := oldHandle
@@ -252,9 +275,10 @@ func (h *AdminHandler) UpdateSpecialUser(w http.ResponseWriter, r *http.Request)
 		SET handle = $2,
 		    display_name = COALESCE($3, display_name),
 		    public_on_map = COALESCE($4, public_on_map),
+		    delete_locked = COALESCE($5, delete_locked),
 		    updated_at = NOW()
 		WHERE owner_id = $1
-	`, ownerID, newHandle, body.DisplayName, body.PublicOnMap); err != nil {
+	`, ownerID, newHandle, body.DisplayName, body.PublicOnMap, body.DeleteLocked); err != nil {
 		if isUniqueViolation(err) {
 			errorResponse(w, http.StatusConflict, "handle already in use")
 		} else {
@@ -284,10 +308,18 @@ func (h *AdminHandler) UpdateSpecialUser(w http.ResponseWriter, r *http.Request)
 func (h *AdminHandler) DeleteSpecialUser(w http.ResponseWriter, r *http.Request) {
 	ownerID := chi.URLParam(r, "ownerId")
 	var handle string
+	var deleteLocked bool
 	if err := h.db.QueryRow(r.Context(),
-		`SELECT handle FROM user_profiles WHERE owner_id = $1 AND is_special`, ownerID,
-	).Scan(&handle); err != nil {
+		`SELECT handle, delete_locked FROM user_profiles WHERE owner_id = $1 AND is_special`, ownerID,
+	).Scan(&handle, &deleteLocked); err != nil {
 		errorResponse(w, http.StatusNotFound, "special user not found")
+		return
+	}
+	// Delete-lock: refuse outright. h2oflows can never be unlocked; other
+	// special users must be explicitly unlocked (PATCH delete_locked=false)
+	// before a delete is accepted.
+	if deleteLocked {
+		errorResponse(w, http.StatusConflict, fmt.Sprintf("@%s is locked for delete — unlock it first", handle))
 		return
 	}
 
@@ -450,14 +482,15 @@ func (h *AdminHandler) RemoveRoleMember(w http.ResponseWriter, r *http.Request) 
 	role := chi.URLParam(r, "role")
 	userID := chi.URLParam(r, "userId")
 
-	// Last-admin guard: the platform must always retain at least one site_admin
-	// membership row. The COUNT guard is inside the DELETE so the check-and-
-	// delete is atomic (no TOCTOU window).
+	// Last-member guards: the platform must always retain at least one
+	// site_admin membership row, and the h2oflows role must always keep at
+	// least one member (someone must be able to steward the anchor account).
+	// The COUNT guard is inside the DELETE so check-and-delete is atomic.
 	tag, err := h.db.Exec(r.Context(), `
 		DELETE FROM user_roles
 		WHERE role = $1 AND user_id = $2 AND river_id IS NULL
-		  AND ($1 <> 'site_admin'
-		       OR (SELECT COUNT(*) FROM user_roles WHERE role = 'site_admin' AND river_id IS NULL) > 1)
+		  AND ($1 NOT IN ('site_admin', 'h2oflows')
+		       OR (SELECT COUNT(*) FROM user_roles WHERE role = $1 AND river_id IS NULL) > 1)
 	`, role, userID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "delete failed")
@@ -465,14 +498,15 @@ func (h *AdminHandler) RemoveRoleMember(w http.ResponseWriter, r *http.Request) 
 	}
 	if tag.RowsAffected() == 0 {
 		// Nothing deleted: either the membership doesn't exist, or it's the last
-		// site_admin. Disambiguate for a useful error.
+		// member of a guarded role. Disambiguate for a useful error.
 		var exists bool
 		_ = h.db.QueryRow(r.Context(),
 			`SELECT EXISTS(SELECT 1 FROM user_roles WHERE role = $1 AND user_id = $2 AND river_id IS NULL)`,
 			role, userID,
 		).Scan(&exists)
 		if exists {
-			errorResponse(w, http.StatusConflict, "cannot remove the last admin — at least one member must remain in the admins role")
+			errorResponse(w, http.StatusConflict,
+				fmt.Sprintf("cannot remove the last member of the %s role — at least one member must remain", role))
 			return
 		}
 		errorResponse(w, http.StatusNotFound, "membership not found")
