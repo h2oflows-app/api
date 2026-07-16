@@ -307,6 +307,16 @@ func (h *AdminHandler) UpdateSpecialUser(w http.ResponseWriter, r *http.Request)
 // role's membership rows.
 func (h *AdminHandler) DeleteSpecialUser(w http.ResponseWriter, r *http.Request) {
 	ownerID := chi.URLParam(r, "ownerId")
+	// Absolute anchor guard, independent of any flag state: the h2oflows
+	// account (by handle OR by the legacy sentinel owner id) can never be
+	// deleted — even if the row was re-seeded without delete_locked, or an
+	// older build's data predates the flag. (A staging incident deleted the
+	// profile row this way; the runs survived only because user_reaches has
+	// no FK to user_profiles.)
+	if ownerID == "00000000-0000-0000-0000-000000000001" {
+		errorResponse(w, http.StatusConflict, "@h2oflows is the platform anchor account and can never be deleted")
+		return
+	}
 	var handle string
 	var deleteLocked bool
 	if err := h.db.QueryRow(r.Context(),
@@ -315,9 +325,12 @@ func (h *AdminHandler) DeleteSpecialUser(w http.ResponseWriter, r *http.Request)
 		errorResponse(w, http.StatusNotFound, "special user not found")
 		return
 	}
-	// Delete-lock: refuse outright. h2oflows can never be unlocked; other
-	// special users must be explicitly unlocked (PATCH delete_locked=false)
-	// before a delete is accepted.
+	if handle == h2oflowsHandle {
+		errorResponse(w, http.StatusConflict, "@h2oflows is the platform anchor account and can never be deleted")
+		return
+	}
+	// Delete-lock: refuse outright. Other special users must be explicitly
+	// unlocked (PATCH delete_locked=false) before a delete is accepted.
 	if deleteLocked {
 		errorResponse(w, http.StatusConflict, fmt.Sprintf("@%s is locked for delete — unlock it first", handle))
 		return
