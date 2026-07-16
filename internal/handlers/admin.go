@@ -192,6 +192,10 @@ func (h *AdminHandler) AssignRole(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusBadRequest, "user_id and role are required")
 		return
 	}
+	if !isValidRoleName(r.Context(), h.db, body.Role) {
+		errorResponse(w, http.StatusBadRequest, "role must be site_admin, data_admin, or an existing special-user handle")
+		return
+	}
 
 	var id string
 	err := h.db.QueryRow(r.Context(), `

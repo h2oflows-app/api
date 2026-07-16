@@ -18,7 +18,9 @@ import (
 // same NHD up_comid (user_reaches) or put_in_comid (curated reaches).
 //
 // Ranking formula (no upvotes yet — added in PR 6.6):
-//   reports * 2  + completeness * 5 + system_owned * 50
+//
+//	reports * 2  + completeness * 5 + system_owned * 50
+//
 // Completeness: +1 each for centerline, flow ranges, note ≥ 20 chars (max 3).
 type ClusterHandler struct {
 	db            *pgxpool.Pool
@@ -39,19 +41,19 @@ func (h *ClusterHandler) callerID(r *http.Request) string {
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 type clusterRun struct {
-	ID          string   `json:"id"`
-	Slug        string   `json:"slug"`
-	Name        string   `json:"name"`
-	AuthorHandle *string `json:"author_handle"`
-	IsOfficial  bool     `json:"is_official"`
-	ClassMin    *float64 `json:"class_min"`
-	ClassMax    *float64 `json:"class_max"`
-	PutInLng    float64  `json:"put_in_lng"`
-	PutInLat    float64  `json:"put_in_lat"`
-	TakeOutLng  float64  `json:"take_out_lng"`
-	TakeOutLat  float64  `json:"take_out_lat"`
-	RankScore   int      `json:"rank_score"`
-	ReportCount int      `json:"report_count"`
+	ID           string   `json:"id"`
+	Slug         string   `json:"slug"`
+	Name         string   `json:"name"`
+	AuthorHandle *string  `json:"author_handle"`
+	IsSpecial    bool     `json:"is_special"`
+	ClassMin     *float64 `json:"class_min"`
+	ClassMax     *float64 `json:"class_max"`
+	PutInLng     float64  `json:"put_in_lng"`
+	PutInLat     float64  `json:"put_in_lat"`
+	TakeOutLng   float64  `json:"take_out_lng"`
+	TakeOutLat   float64  `json:"take_out_lat"`
+	RankScore    int      `json:"rank_score"`
+	ReportCount  int      `json:"report_count"`
 }
 
 // nearbyRuns finds curated + public community runs near the given put-in and
@@ -73,9 +75,7 @@ func (h *ClusterHandler) nearbyRuns(r *http.Request, putInLat, putInLng, takeOut
 			ur.slug,
 			ur.name,
 			up.handle AS author_handle,
-			-- Official = the h2oflows sentinel owner (runs-unify Phase 4). Curated
-			-- runs are sentinel-owned twins; the legacy reaches branch is retired.
-			(ur.owner_id = '00000000-0000-0000-0000-000000000001') AS is_official,
+			COALESCE(up.is_special, false) AS is_special,
 			ur.class_min,
 			ur.class_max,
 			ST_X(ur.put_in::geometry)   AS put_in_lng,
@@ -83,9 +83,9 @@ func (h *ClusterHandler) nearbyRuns(r *http.Request, putInLat, putInLng, takeOut
 			ST_X(ur.take_out::geometry) AS take_out_lng,
 			ST_Y(ur.take_out::geometry) AS take_out_lat,
 			(
-				-- Official h2oflows runs keep the curated baseline boost (was +50 on
-				-- the retired curated branch) so they retain cluster prominence.
-				CASE WHEN ur.owner_id = '00000000-0000-0000-0000-000000000001' THEN 50 ELSE 0 END
+				-- Special-user (curated/partner) runs keep the baseline boost (was +50
+				-- hardcoded to the h2oflows sentinel) so they retain cluster prominence.
+				CASE WHEN COALESCE(up.is_special, false) THEN 50 ELSE 0 END
 				+ COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0)
 				+ COALESCE((SELECT COUNT(*) FROM reports rp WHERE rp.user_reach_id = ur.id AND rp.deleted_at IS NULL), 0) * 2
 				+ (CASE WHEN ur.centerline IS NOT NULL THEN 1 ELSE 0 END
@@ -122,7 +122,7 @@ func (h *ClusterHandler) nearbyRuns(r *http.Request, putInLat, putInLng, takeOut
 		var cr clusterRun
 		if err := rows.Scan(
 			&cr.ID, &cr.Slug, &cr.Name,
-			&cr.AuthorHandle, &cr.IsOfficial,
+			&cr.AuthorHandle, &cr.IsSpecial,
 			&cr.ClassMin, &cr.ClassMax,
 			&cr.PutInLng, &cr.PutInLat, &cr.TakeOutLng, &cr.TakeOutLat,
 			&cr.RankScore, &cr.ReportCount,
