@@ -2298,6 +2298,7 @@ func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 		AuthorHandle *string
 		RiverID      *string
 		RiverName    *string
+		Note         *string
 		ClassMin     *float64
 		ClassMax     *float64
 		GaugeID      *string
@@ -2312,7 +2313,7 @@ func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 		SELECT
 			ur.id::text, ur.name, ur.owner_id::text,
 			up.handle,
-			ur.river_id::text, ur.river_name,
+			ur.river_id::text, ur.river_name, ur.note,
 			ur.class_min, ur.class_max,
 			ur.primary_gauge_id::text,
 			ST_X(ur.put_in::geometry),  ST_Y(ur.put_in::geometry),
@@ -2323,7 +2324,7 @@ func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 		WHERE ur.id = $1 AND ur.visibility = 'public' AND ur.deleted_at IS NULL
 	`, runID).Scan(
 		&src.ID, &src.Name, &src.OwnerID, &src.AuthorHandle,
-		&src.RiverID, &src.RiverName,
+		&src.RiverID, &src.RiverName, &src.Note,
 		&src.ClassMin, &src.ClassMax,
 		&src.GaugeID,
 		&src.PutInLng, &src.PutInLat,
@@ -2350,20 +2351,20 @@ func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 	var newID string
 	if err = h.db.QueryRow(ctx, `
 		INSERT INTO user_reaches
-			(owner_id, slug, name, river_id, river_name,
+			(owner_id, slug, name, river_id, river_name, note,
 			 put_in, take_out,
 			 class_min, class_max, primary_gauge_id,
 			 forked_from_user_reach_id,
 			 original_author_handle, original_author_owner_id, original_forked_at,
-			 river_confirmed)
+			 river_confirmed, visibility, published_at)
 		VALUES
-			($1, $2, $3, $4::uuid, $5,
+			($1, $2, $3, $4::uuid, $5, $17,
 			 ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography,
 			 ST_SetSRID(ST_MakePoint($8, $9), 4326)::geography,
 			 $10, $11, $12::uuid,
 			 $13::uuid,
 			 $14, $15::uuid, NOW(),
-			 $16)
+			 $16, 'public'::run_visibility, NOW())
 		RETURNING id
 	`, ownerID, slug, src.Name, src.RiverID, src.RiverName,
 		src.PutInLng, src.PutInLat,
@@ -2372,6 +2373,7 @@ func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 		src.ID,
 		src.AuthorHandle, src.OwnerID,
 		src.RiverID != nil,
+		src.Note,
 	).Scan(&newID); err != nil {
 		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("fork failed: %v", err))
 		return
@@ -2430,6 +2432,7 @@ func forkCuratedReachTx(ctx context.Context, q pgxQueryer, ownerID, sourceSlug s
 		LongName   *string
 		RiverID    *string
 		RiverName  *string
+		Note       *string
 		ClassMin   *float64
 		ClassMax   *float64
 		GaugeID    *string
@@ -2447,6 +2450,7 @@ func forkCuratedReachTx(ctx context.Context, q pgxQueryer, ownerID, sourceSlug s
 			long_name,
 			river_id::text,
 			river_name,
+			note,
 			class_min,
 			class_max,
 			primary_gauge_id::text,
@@ -2461,7 +2465,7 @@ func forkCuratedReachTx(ctx context.Context, q pgxQueryer, ownerID, sourceSlug s
 		  AND deleted_at IS NULL
 	`, sourceSlug).Scan(
 		&src.ID, &src.Name, &src.LongName,
-		&src.RiverID, &src.RiverName,
+		&src.RiverID, &src.RiverName, &src.Note,
 		&src.ClassMin, &src.ClassMax,
 		&src.GaugeID,
 		&src.PutInLng, &src.PutInLat,
@@ -2491,18 +2495,18 @@ func forkCuratedReachTx(ctx context.Context, q pgxQueryer, ownerID, sourceSlug s
 
 	if err = q.QueryRow(ctx, `
 		INSERT INTO user_reaches
-			(owner_id, slug, name, river_id, river_name,
+			(owner_id, slug, name, river_id, river_name, note,
 			 put_in, take_out,
 			 class_min, class_max, primary_gauge_id,
 			 forked_from_user_reach_id, original_forked_at,
-			 river_confirmed)
+			 river_confirmed, visibility, published_at)
 		VALUES
-			($1, $2, $3, $4::uuid, $5,
+			($1, $2, $3, $4::uuid, $5, $15,
 			 ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography,
 			 ST_SetSRID(ST_MakePoint($8, $9), 4326)::geography,
 			 $10, $11, $12::uuid,
 			 $13::uuid, NOW(),
-			 $14)
+			 $14, 'public'::run_visibility, NOW())
 		RETURNING id
 	`, ownerID, newSlug, forkName, src.RiverID, src.RiverName,
 		src.PutInLng, src.PutInLat,
@@ -2510,6 +2514,7 @@ func forkCuratedReachTx(ctx context.Context, q pgxQueryer, ownerID, sourceSlug s
 		src.ClassMin, src.ClassMax, src.GaugeID,
 		src.ID,
 		src.RiverID != nil,
+		src.Note,
 	).Scan(&newID); err != nil {
 		return "", "", fmt.Errorf("fork insert failed: %w", err)
 	}
