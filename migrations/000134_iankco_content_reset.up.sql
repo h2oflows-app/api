@@ -43,7 +43,7 @@ SELECT
      src.put_in, src.take_out, src.up_comid, src.down_comid,
      src.class_min, src.class_max, src.primary_gauge_id, src.custom_gauge_id, src.centerline,
      src.base_label, src.base_color, src.river_confirmed, src.completeness_score,
-     src.id, 'h2oflows', src.owner_id,
+     src.id, 'h2oflows', src.owner_id::uuid,
      NOW(), 'public'::run_visibility, NOW()
 FROM user_reaches src
 JOIN user_profiles sp ON sp.owner_id = src.owner_id AND sp.handle = 'h2oflows'
