@@ -96,7 +96,10 @@ func (h *ReachHandler) WithPoller(p gaugeFetcher) *ReachHandler {
 // in the in-memory cache. Call once at server startup, then every poll cycle.
 // Also warms the lightweight list cache used by GET /reaches.
 func (h *ReachHandler) WarmCache(ctx context.Context) {
-	features, err := h.queryAllFeatures(ctx)
+	// The shared cache represents the authenticated/default (unfiltered) view;
+	// anonymous callers bypass it and run a live filtered query instead (see
+	// MapAll/List) since a single process-wide cache can't vary per-caller.
+	features, err := h.queryAllFeatures(ctx, false)
 	if err != nil {
 		log.Printf("reach cache: warm failed: %v", err)
 		return
@@ -110,7 +113,7 @@ func (h *ReachHandler) WarmCache(ctx context.Context) {
 	log.Printf("reach cache: warmed %d features", len(features))
 
 	// Warm lightweight list cache (no geometry).
-	items, err := h.queryAllListItems(ctx)
+	items, err := h.queryAllListItems(ctx, false)
 	if err != nil {
 		log.Printf("reach list cache: warm failed: %v", err)
 		return
@@ -239,7 +242,7 @@ func (h *ReachHandler) Map(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// mapBaseSQL already includes WHERE owner_id/deleted_at; append extra filters with AND.
-	extraWhere := "AND r.centerline IS NOT NULL"
+	extraWhere := "AND r.centerline IS NOT NULL" + anonPublicOnMapFilter(r, "r.owner_id")
 	args := make([]any, 0, 5)
 	n := 1
 
@@ -364,15 +367,21 @@ func (h *ReachHandler) Map(w http.ResponseWriter, r *http.Request) {
 // frontend loads this once and filters client-side on every viewport change,
 // eliminating per-pan/zoom round-trips.
 func (h *ReachHandler) MapAll(w http.ResponseWriter, r *http.Request) {
-	if payload, ok := h.cache.get(); ok {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Cache-Control", "public, max-age=60")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(payload)
-		return
+	// Anonymous callers bypass the shared cache entirely — it holds the
+	// unfiltered (authenticated) view and can't vary per-caller — and run a
+	// live, publicly-scoped query instead (#314).
+	anon := isAnonymousCaller(r)
+	if !anon {
+		if payload, ok := h.cache.get(); ok {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "public, max-age=60")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(payload)
+			return
+		}
 	}
-	// Cache cold (first request before WarmCache finishes) — query directly.
-	features, err := h.queryAllFeatures(r.Context())
+	// Cache cold (first request before WarmCache finishes), or anonymous — query directly.
+	features, err := h.queryAllFeatures(r.Context(), anon)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
 		return
@@ -381,8 +390,14 @@ func (h *ReachHandler) MapAll(w http.ResponseWriter, r *http.Request) {
 }
 
 // queryAllFeatures runs the reach-map query without a bbox filter and returns
-// the raw Feature slice. Shared by MapAll and WarmCache.
-func (h *ReachHandler) queryAllFeatures(ctx context.Context) ([]Feature, error) {
+// the raw Feature slice. Shared by MapAll and WarmCache. When anonOnly is
+// true, results are additionally restricted to special-user accounts opted
+// into public_on_map (#314).
+func (h *ReachHandler) queryAllFeatures(ctx context.Context, anonOnly bool) ([]Feature, error) {
+	extra := ""
+	if anonOnly {
+		extra = specialPublicOnMapClause("r.owner_id")
+	}
 	rows, err := h.db.Query(ctx, `
 		WITH latest_reading AS (
 			SELECT DISTINCT ON (gauge_id)
@@ -442,7 +457,7 @@ func (h *ReachHandler) queryAllFeatures(ctx context.Context) ([]Feature, error) 
 		WHERE r.centerline IS NOT NULL
 		  AND r.owner_id = '00000000-0000-0000-0000-000000000001'
 		  AND r.deleted_at IS NULL
-	`)
+	`+extra)
 	if err != nil {
 		return nil, err
 	}
@@ -516,15 +531,19 @@ func (h *ReachHandler) queryAllFeatures(ctx context.Context) ([]Feature, error) 
 // grouped by the frontend into basin → river → reach. No geometry is included.
 // Served from an in-memory cache warmed at startup and refreshed every poll cycle.
 func (h *ReachHandler) List(w http.ResponseWriter, r *http.Request) {
-	if payload, ok := h.listCache.get(); ok {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Cache-Control", "public, max-age=60")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(payload)
-		return
+	// Anonymous callers bypass the shared cache — see MapAll (#314).
+	anon := isAnonymousCaller(r)
+	if !anon {
+		if payload, ok := h.listCache.get(); ok {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "public, max-age=60")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(payload)
+			return
+		}
 	}
-	// Cache cold — query directly.
-	items, err := h.queryAllListItems(r.Context())
+	// Cache cold, or anonymous — query directly.
+	items, err := h.queryAllListItems(r.Context(), anon)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
 		return
@@ -552,14 +571,19 @@ type reachListItem struct {
 	GaugeSource     *string  `json:"gauge_source"`
 	GaugeName       *string  `json:"gauge_name"`
 	GaugeStatus     *string  `json:"gauge_status"`
-	IsOfficial      bool     `json:"is_official"`
+	IsSpecial       bool     `json:"is_special"`
 	AuthorHandle    *string  `json:"author_handle"`
 }
 
 // queryAllListItems returns a lightweight slice of all reaches with current
-// flow data. No geometry, no gauge notes/links — just what the browse page needs.
-// runs-unify 5a: reads from user_reaches (sentinel-owned twins); reaches retired.
-func (h *ReachHandler) queryAllListItems(ctx context.Context) ([]reachListItem, error) {
+// flow data. No geometry, no gauge notes/links — just what the browse page
+// needs. When anonOnly is true, results are additionally restricted to
+// special-user accounts opted into public_on_map (#314).
+func (h *ReachHandler) queryAllListItems(ctx context.Context, anonOnly bool) ([]reachListItem, error) {
+	extra := ""
+	if anonOnly {
+		extra = specialPublicOnMapClause("r.owner_id")
+	}
 	rows, err := h.db.Query(ctx, `
 		WITH latest_reading AS (
 			SELECT DISTINCT ON (gauge_id)
@@ -595,7 +619,7 @@ func (h *ReachHandler) queryAllListItems(ctx context.Context) ([]reachListItem, 
 				WHEN fr.band_color LIKE 'blue%'   THEN 'flood'
 				ELSE                                   'runnable'
 			END AS flow_status,
-			r.owner_id,
+			COALESCE(up.is_special, false) AS is_special,
 			up.handle AS author_handle
 		FROM user_reaches r
 		LEFT JOIN rivers rv ON rv.id = r.river_id
@@ -616,6 +640,7 @@ func (h *ReachHandler) queryAllListItems(ctx context.Context) ([]reachListItem, 
 		) fr
 		WHERE r.owner_id = '00000000-0000-0000-0000-000000000001'
 		  AND r.deleted_at IS NULL
+	`+extra+`
 		ORDER BY rv.basin NULLS LAST,
 		         r.river_name NULLS LAST,
 		         g.elevation_ft DESC NULLS LAST,
@@ -629,7 +654,6 @@ func (h *ReachHandler) queryAllListItems(ctx context.Context) ([]reachListItem, 
 	items := make([]reachListItem, 0)
 	for rows.Next() {
 		var item reachListItem
-		var ownerID string // always sentinel UUID for this query
 		if err := rows.Scan(
 			&item.Slug, &item.Name,
 			&item.RiverName, &item.CommonName, &item.PutInName, &item.TakeOutName,
@@ -638,12 +662,10 @@ func (h *ReachHandler) queryAllListItems(ctx context.Context) ([]reachListItem, 
 			&item.CurrentCFS, &item.FlowLabel, &item.GaugeID,
 			&item.GaugeExternalID, &item.GaugeSource, &item.GaugeName,
 			&item.GaugeStatus, &item.FlowStatus,
-			&ownerID, &item.AuthorHandle,
+			&item.IsSpecial, &item.AuthorHandle,
 		); err != nil {
 			continue
 		}
-		// Sentinel-owned twins are the curated/official records.
-		item.IsOfficial = (ownerID == "00000000-0000-0000-0000-000000000001")
 		items = append(items, item)
 	}
 	return items, rows.Err()
@@ -685,7 +707,7 @@ type reachDetail struct {
 	Rapids                []rapidRow     `json:"rapids"`
 	Access                []accessRow    `json:"access"`
 	Related               []relatedReach `json:"related"`
-	IsOfficial            bool           `json:"is_official"`
+	IsSpecial             bool           `json:"is_special"`
 	AuthorHandle          *string        `json:"author_handle"`
 }
 

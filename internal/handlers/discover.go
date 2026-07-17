@@ -19,21 +19,21 @@ func NewDiscoverHandler(db *pgxpool.Pool) *DiscoverHandler {
 }
 
 type discoverRun struct {
-	ID                  string    `json:"id"`
-	Slug                string    `json:"slug"`
-	Name                string    `json:"name"`
-	Handle              string    `json:"handle"`
-	IsOfficial          bool      `json:"is_official"`
-	ClassMin            *float64  `json:"class_min"`
-	ClassMax            *float64  `json:"class_max"`
-	LengthMi            *float64  `json:"length_mi"`
-	UpvoteCount         int64     `json:"upvote_count"`
-	LastForkedAt        *time.Time `json:"last_forked_at"`
-	GaugeName           *string   `json:"gauge_name"`
-	PutInLng            *float64  `json:"put_in_lng"`
-	PutInLat            *float64  `json:"put_in_lat"`
-	OriginalAuthorHandle *string  `json:"original_author_handle"`
-	ForkCount           int       `json:"fork_count"`
+	ID                   string     `json:"id"`
+	Slug                 string     `json:"slug"`
+	Name                 string     `json:"name"`
+	Handle               string     `json:"handle"`
+	IsSpecial            bool       `json:"is_special"`
+	ClassMin             *float64   `json:"class_min"`
+	ClassMax             *float64   `json:"class_max"`
+	LengthMi             *float64   `json:"length_mi"`
+	UpvoteCount          int64      `json:"upvote_count"`
+	LastForkedAt         *time.Time `json:"last_forked_at"`
+	GaugeName            *string    `json:"gauge_name"`
+	PutInLng             *float64   `json:"put_in_lng"`
+	PutInLat             *float64   `json:"put_in_lat"`
+	OriginalAuthorHandle *string    `json:"original_author_handle"`
+	ForkCount            int        `json:"fork_count"`
 }
 
 // ListRuns handles GET /api/v1/discover/runs.
@@ -67,9 +67,9 @@ func (h *DiscoverHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 		offset = o
 	}
 
-	rows, err := h.db.Query(r.Context(), `
+	query := `
 		SELECT
-			id, slug, name, handle, is_official,
+			id, slug, name, handle, is_special,
 			class_min, class_max, length_mi,
 			upvote_count, last_forked_at, gauge_name,
 			put_in_lng, put_in_lat,
@@ -77,15 +77,14 @@ func (h *DiscoverHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 			fork_count,
 			text_rank
 		FROM (
-			-- All runs live in user_reaches; curated h2oflows runs are sentinel-owned
-			-- twins. Official = the h2oflows sentinel owner (runs-unify Phase 4); the
-			-- legacy reaches UNION branch was retired.
+			-- All runs live in user_reaches; curated h2oflows runs are one of
+			-- possibly several special-user accounts (#314).
 			SELECT
 				ur.id::text                         AS id,
 				ur.slug                             AS slug,
 				ur.name                             AS name,
 				COALESCE(up.handle, 'h2oflows')     AS handle,
-				(ur.owner_id = '00000000-0000-0000-0000-000000000001') AS is_official,
+				COALESCE(up.is_special, false)      AS is_special,
 				ur.class_min                        AS class_min,
 				ur.class_max                        AS class_max,
 				CASE
@@ -121,10 +120,12 @@ func (h *DiscoverHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 			  AND ($3::float8 IS NULL OR ur.class_min <= $3)
 			  AND (NOT $4::bool OR (g.id IS NOT NULL OR cg.id IS NOT NULL))
 			  AND ($5 = '' OR up.handle = $5)
+	` + anonPublicOnMapFilter(r, "ur.owner_id") + `
 		) combined
-		ORDER BY upvote_count DESC, is_official DESC, text_rank DESC, last_forked_at DESC NULLS LAST
+		ORDER BY upvote_count DESC, is_special DESC, text_rank DESC, last_forked_at DESC NULLS LAST
 		LIMIT $6 OFFSET $7
-	`, q, minClass, maxClass, hasGauge, handle, limit+1, offset)
+	`
+	rows, err := h.db.Query(r.Context(), query, q, minClass, maxClass, hasGauge, handle, limit+1, offset)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
 		return
@@ -136,7 +137,7 @@ func (h *DiscoverHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 		var run discoverRun
 		var textRank int
 		if err := rows.Scan(
-			&run.ID, &run.Slug, &run.Name, &run.Handle, &run.IsOfficial,
+			&run.ID, &run.Slug, &run.Name, &run.Handle, &run.IsSpecial,
 			&run.ClassMin, &run.ClassMax, &run.LengthMi,
 			&run.UpvoteCount, &run.LastForkedAt, &run.GaugeName,
 			&run.PutInLng, &run.PutInLat,

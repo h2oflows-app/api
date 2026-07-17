@@ -11,7 +11,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-
 // UserProfileHandler serves public user profile endpoints.
 type UserProfileHandler struct {
 	db *pgxpool.Pool
@@ -22,15 +21,15 @@ func NewUserProfileHandler(db *pgxpool.Pool) *UserProfileHandler {
 }
 
 type userProfileRun struct {
-	ID         string     `json:"id"`
-	Slug       string     `json:"slug"`
-	Name       string     `json:"name"`
-	RiverName  *string    `json:"river_name"`
-	ClassMin   *float64   `json:"class_min"`
-	ClassMax   *float64   `json:"class_max"`
-	CurrentCFS *float64   `json:"current_cfs"`
-	FlowStatus string     `json:"flow_status"`
-	CreatedAt  time.Time  `json:"created_at"`
+	ID         string    `json:"id"`
+	Slug       string    `json:"slug"`
+	Name       string    `json:"name"`
+	RiverName  *string   `json:"river_name"`
+	ClassMin   *float64  `json:"class_min"`
+	ClassMax   *float64  `json:"class_max"`
+	CurrentCFS *float64  `json:"current_cfs"`
+	FlowStatus string    `json:"flow_status"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 type userProfileResponse struct {
@@ -87,6 +86,7 @@ func (h *UserProfileHandler) GetProfile(w http.ResponseWriter, r *http.Request) 
 		) fr
 		WHERE ur.owner_id = $1 AND ur.visibility = 'public' AND ur.deleted_at IS NULL
 		  AND ur.forked_from_user_reach_id IS NULL
+	`+anonPublicOnMapFilter(r, "ur.owner_id")+`
 		ORDER BY ur.created_at DESC
 	`, ownerID)
 	if err != nil {
@@ -171,6 +171,7 @@ func (h *UserProfileHandler) MapAllByHandle(w http.ResponseWriter, r *http.Reque
 		) fr
 		WHERE ur.owner_id = $1 AND ur.visibility = 'public' AND ur.deleted_at IS NULL
 		  AND ur.forked_from_user_reach_id IS NULL
+	`+anonPublicOnMapFilter(r, "ur.owner_id")+`
 	`, ownerID, callerID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
@@ -187,9 +188,9 @@ func (h *UserProfileHandler) MapAllByHandle(w http.ResponseWriter, r *http.Reque
 		FlowStatus  string   `json:"flow_status"`
 		CurrentCFS  *float64 `json:"current_cfs"`
 		GaugeID     *string  `json:"gauge_id"`
-		IsUserReach  bool     `json:"is_user_reach"`
-		UpvoteCount  int64    `json:"upvote_count"`
-		UserUpvoted  bool     `json:"user_upvoted"`
+		IsUserReach bool     `json:"is_user_reach"`
+		UpvoteCount int64    `json:"upvote_count"`
+		UserUpvoted bool     `json:"user_upvoted"`
 	}
 	type feature struct {
 		Type       string          `json:"type"`
@@ -200,17 +201,17 @@ func (h *UserProfileHandler) MapAllByHandle(w http.ResponseWriter, r *http.Reque
 	features := make([]feature, 0)
 	for rows.Next() {
 		var (
-			id, slug, name       string
-			riverName            *string
-			centerlineJSON       *string
-			putInLng, putInLat   float64
+			id, slug, name         string
+			riverName              *string
+			centerlineJSON         *string
+			putInLng, putInLat     float64
 			takeOutLng, takeOutLat float64
-			currentCFS           *float64
-			flowStatus           string
-			gaugeID              *string
-			classMax             *float64
-			upvoteCount          int64
-			userUpvoted          bool
+			currentCFS             *float64
+			flowStatus             string
+			gaugeID                *string
+			classMax               *float64
+			upvoteCount            int64
+			userUpvoted            bool
 		)
 		if err := rows.Scan(
 			&id, &slug, &name, &riverName,

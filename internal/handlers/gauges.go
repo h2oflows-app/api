@@ -755,7 +755,7 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 					NULL::smallint AS river_order,
 					up.handle AS author_handle,
 					ur_rv.id::text AS river_id,
-					CASE WHEN ur.owner_id = '00000000-0000-0000-0000-000000000001' THEN 0 ELSE 1 END AS _prio
+					CASE WHEN up.is_special THEN 0 ELSE 1 END AS _prio
 				FROM user_reaches ur
 				LEFT JOIN rivers ur_rv ON ur_rv.id = ur.river_id
 				JOIN user_profiles up ON up.owner_id = ur.owner_id

@@ -92,7 +92,9 @@ func (h *WatchlistHandler) List(w http.ResponseWriter, r *http.Request) {
 
 // Add handles POST /api/v1/watchlist
 // Body: { "gauge_id": "<uuid>", "reach_slug": "<slug>", "dashboard_id": "<uuid>" }
-//    or { "custom_gauge_id": "<uuid>", "reach_slug": "<slug>", "dashboard_id": "<uuid>" }
+//
+//	or { "custom_gauge_id": "<uuid>", "reach_slug": "<slug>", "dashboard_id": "<uuid>" }
+//
 // If dashboard_id is omitted, defaults to the user's first dashboard (position=0).
 // Idempotent — re-adding the same pair is a no-op.
 func (h *WatchlistHandler) Add(w http.ResponseWriter, r *http.Request) {
@@ -163,10 +165,14 @@ func (h *WatchlistHandler) Add(w http.ResponseWriter, r *http.Request) {
 			userID, *body.ReachSlug,
 		).Scan(&ownedID)
 		if ownErr != nil {
-			// Not owned by caller — check if curated reach exists; if yes, fork.
+			// Not owned by caller — check if a special-user (curated) reach exists;
+			// if yes, fork.
 			var curatedID string
 			cErr := tx.QueryRow(r.Context(),
-				`SELECT id FROM user_reaches WHERE slug = $1 AND owner_id = '00000000-0000-0000-0000-000000000001' AND deleted_at IS NULL`, *body.ReachSlug,
+				`SELECT id FROM user_reaches
+				 WHERE slug = $1
+				   AND owner_id IN (SELECT owner_id FROM user_profiles WHERE is_special)
+				   AND deleted_at IS NULL`, *body.ReachSlug,
 			).Scan(&curatedID)
 			if cErr == nil {
 				// Check if user already has a fork of this curated reach — reuse it
@@ -180,7 +186,7 @@ func (h *WatchlistHandler) Add(w http.ResponseWriter, r *http.Request) {
 				if existingForkErr == nil {
 					finalReachSlug = &existingForkSlug
 				} else {
-					_, newSlug, fErr := forkCuratedReachTx(r.Context(), tx, userID, *body.ReachSlug)
+					_, newSlug, fErr := forkRunTx(r.Context(), tx, userID, curatedID)
 					if fErr != nil {
 						errorResponse(w, http.StatusInternalServerError, "fork failed: "+fErr.Error())
 						return

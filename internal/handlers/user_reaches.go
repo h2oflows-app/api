@@ -120,28 +120,41 @@ func (h *UserReachHandler) ownerID(r *http.Request) (string, bool) {
 	return "", false
 }
 
-// h2oflowsSentinelOwnerID is the owner_id of the h2oflows curator account
-// (seeded by mig 105). Runs owned by it are official curator content.
-const h2oflowsSentinelOwnerID = "00000000-0000-0000-0000-000000000001"
-
 // userReachSlugRe validates user-editable run slugs: lowercase alphanumeric + hyphens,
 // starts and ends with alphanumeric.
 var userReachSlugRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$`)
 
 // authorOwnerID resolves the owner a run is authored under. When the request
-// carries ?as=h2oflows AND the caller has data_admin rights, the run is
-// authored as the h2oflows curator (official content); otherwise it is owned by
-// the authenticated user. Returns ("", false) when unauthenticated.
+// carries ?as={handle}, the handle must name an existing special user AND the
+// caller must hold an app role equal to that handle (loaded from user_roles
+// by the LoadAppRoles middleware) — NOT data_admin/site_admin generally. When
+// both hold, the run is authored as that special user (official/curated
+// content); otherwise it is owned by the authenticated caller. Returns
+// ("", false, false) when unauthenticated. ?as=h2oflows keeps working through
+// this same path since h2oflows is seeded as a special user (mig 000130) and
+// iankco is seeded with the h2oflows role (mig 000131).
 //
-// The bool second return reports whether the run is being authored as h2oflows,
-// so callers can force official/public visibility.
-func (h *UserReachHandler) authorOwnerID(r *http.Request) (ownerID string, asH2oflows bool, ok bool) {
+// The bool second return reports whether the run is being authored as a
+// special user, so callers can force official/public visibility.
+func (h *UserReachHandler) authorOwnerID(r *http.Request) (ownerID string, asSpecial bool, ok bool) {
 	id, ok := h.ownerID(r)
 	if !ok {
 		return "", false, false
 	}
-	if r.URL.Query().Get("as") == "h2oflows" && auth.IsDataAdminFromContext(r.Context()) {
-		return h2oflowsSentinelOwnerID, true, true
+	if as := r.URL.Query().Get("as"); as != "" {
+		for _, role := range auth.AppRolesFromContext(r.Context()) {
+			if role != as {
+				continue
+			}
+			var specialOwnerID string
+			err := h.db.QueryRow(r.Context(),
+				`SELECT owner_id FROM user_profiles WHERE is_special AND handle = $1`, as,
+			).Scan(&specialOwnerID)
+			if err == nil {
+				return specialOwnerID, true, true
+			}
+			break
+		}
 	}
 	return id, false, true
 }
@@ -185,7 +198,7 @@ type userReachSummary struct {
 	IsFork          bool       `json:"is_fork"`
 	UpvoteCount     int        `json:"upvote_count"`
 	AuthorHandle    *string    `json:"author_handle"`
-	IsOfficial      bool       `json:"is_official"`
+	IsSpecial       bool       `json:"is_special"`
 }
 
 type userReachRapid struct {
@@ -409,7 +422,7 @@ func (h *UserReachHandler) MapAll(w http.ResponseWriter, r *http.Request) {
 // Returns GeoJSON FeatureCollection of all public user reaches (is_private=FALSE).
 // Same shape as MapAll. Public endpoint — no auth required.
 func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.db.Query(r.Context(), `
+	query := `
 		WITH geo_clusters AS (
 			-- Geometry-based clustering: same COMID + within 1mi at put-in and take-out.
 			SELECT a.id AS run_id, MIN(b.id::text) AS cluster_id
@@ -462,7 +475,7 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 			ur.primary_gauge_id::text AS gauge_id,
 			ur.class_max,
 			up.handle AS author_handle,
-			(ur.owner_id = '00000000-0000-0000-0000-000000000001') AS is_official,
+			COALESCE(up.is_special, false) AS is_special,
 			COALESCE(cgrp.cluster_id, ur.id::text) AS cluster_id,
 			(ur.forked_from_user_reach_id IS NOT NULL) AS is_fork,
 			(SELECT COUNT(*)::int FROM user_reaches f
@@ -501,7 +514,8 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 				END AS band_color
 		) fr
 		WHERE ur.visibility = 'public' AND ur.deleted_at IS NULL
-	`)
+	` + anonPublicOnMapFilter(r, "ur.owner_id")
+	rows, err := h.db.Query(r.Context(), query)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
 		return
@@ -520,7 +534,7 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 		GaugeID      *string  `json:"gauge_id"`
 		IsUserReach  bool     `json:"is_user_reach"`
 		AuthorHandle *string  `json:"author_handle"`
-		IsOfficial   bool     `json:"is_official"`
+		IsSpecial    bool     `json:"is_special"`
 		ClusterID    string   `json:"cluster_id"`
 		IsFork       bool     `json:"is_fork"`
 		ForkCount    int      `json:"fork_count"`
@@ -545,7 +559,7 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 			gaugeID                *string
 			classMax               *float64
 			authorHandle           *string
-			isOfficial             bool
+			isSpecial              bool
 			clusterID              string
 			isFork                 bool
 			forkCount              int
@@ -556,7 +570,7 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 			&centerlineJSON,
 			&putInLng, &putInLat, &takeOutLng, &takeOutLat,
 			&currentCFS, &flowStatus, &gaugeID, &classMax,
-			&authorHandle, &isOfficial,
+			&authorHandle, &isSpecial,
 			&clusterID, &isFork, &forkCount, &rankScore,
 		); err != nil {
 			continue
@@ -592,7 +606,7 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 				GaugeID:      gaugeID,
 				IsUserReach:  true,
 				AuthorHandle: authorHandle,
-				IsOfficial:   isOfficial,
+				IsSpecial:    isSpecial,
 				ClusterID:    clusterID,
 				IsFork:       isFork,
 				ForkCount:    forkCount,
@@ -818,12 +832,13 @@ func (h *UserReachHandler) ReferencedRuns(w http.ResponseWriter, r *http.Request
 
 // GET /api/v1/me/reaches/{slug}
 func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
-	ownerID, ok := h.ownerID(r)
+	callerID, ok := h.ownerID(r)
 	if !ok {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
 	slug := chi.URLParam(r, "slug")
+	ids := editableOwnerIDs(r.Context(), h.db, callerID)
 
 	var d userReachDetail
 	var geojsonBytes []byte
@@ -897,9 +912,9 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 					COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END)
 				END AS band_color
 		) fr
-		WHERE (ur.owner_id = $1 OR (ur.owner_id = $2 AND $3::boolean)) AND ur.slug = $4
-		ORDER BY (ur.owner_id = $1) DESC LIMIT 1
-	`, ownerID, h2oflowsSentinelOwnerID, auth.IsDataAdminFromContext(r.Context()), slug).Scan(
+		WHERE ur.owner_id = ANY($1::text[]) AND ur.slug = $2
+		ORDER BY (ur.owner_id = $3) DESC LIMIT 1
+	`, ids, slug, callerID).Scan(
 		&d.ID, &d.Slug, &d.Name, &d.LongName, &d.RiverName,
 		&d.PutInLng, &d.PutInLat, &d.TakeOutLng, &d.TakeOutLat,
 		&d.Note, &d.CreatedAt,
@@ -994,12 +1009,12 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 
 	// Upvotes
 	_ = h.db.QueryRow(r.Context(), `SELECT COUNT(*) FROM run_upvotes WHERE user_reach_id = $1`, d.ID).Scan(&d.UpvoteCount)
-	_ = h.db.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM run_upvotes WHERE user_reach_id = $1 AND user_id = $2)`, d.ID, ownerID).Scan(&d.UserUpvoted)
+	_ = h.db.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM run_upvotes WHERE user_reach_id = $1 AND user_id = $2)`, d.ID, callerID).Scan(&d.UserUpvoted)
 
 	// Reference count: how many distinct non-owner users have this run on a dashboard.
 	_ = h.db.QueryRow(r.Context(),
 		`SELECT COUNT(DISTINCT user_id) FROM user_watchlists WHERE referenced_user_reach_id = $1 AND user_id <> $2`,
-		d.ID, ownerID,
+		d.ID, callerID,
 	).Scan(&d.ReferenceCount)
 
 	jsonResponse(w, http.StatusOK, d)
@@ -1079,6 +1094,7 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 			COALESCE(fr_reach.long_name, fr_reach.name) AS forked_from_name,
 			ur.owner_id,
 			up.handle AS author_handle,
+			COALESCE(up.is_special, false) AS is_special,
 			ur.original_author_handle,
 			ur.original_forked_at,
 			ur.last_modified_after_fork_at,
@@ -1127,7 +1143,7 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 		&d.RiverSlug, &d.RiverStateAbbr, &d.RiverBasin,
 		&d.Visibility,
 		&d.ForkedFromSlug, &d.ForkedFromName,
-		&authorID, &d.AuthorHandle,
+		&authorID, &d.AuthorHandle, &d.IsSpecial,
 		&d.OriginalAuthorHandle, &d.OriginalForkedAt, &d.LastModifiedAfterForkAt,
 		&d.DeletedAt,
 	)
@@ -1137,9 +1153,14 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 	}
 
 	d.IsPrivate = d.Visibility != "public"
-	d.IsOfficial = (authorID == h2oflowsSentinelOwnerID)
-	d.IsOwn = callerID != "" && (callerID == authorID ||
-		(authorID == h2oflowsSentinelOwnerID && auth.IsDataAdminFromContext(r.Context())))
+	if callerID != "" {
+		for _, id := range editableOwnerIDs(r.Context(), h.db, callerID) {
+			if id == authorID {
+				d.IsOwn = true
+				break
+			}
+		}
+	}
 
 	if geojsonBytes != nil {
 		raw := json.RawMessage(geojsonBytes)
@@ -1218,9 +1239,13 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 
 // POST /api/v1/me/reaches
 func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
-	ownerID, asH2oflows, ok := h.authorOwnerID(r)
+	ownerID, asSpecial, ok := h.authorOwnerID(r)
 	if !ok {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if rlErr := recordRunWrite(r.Context(), h.db, ownerID); rlErr != nil {
+		errorResponse(w, http.StatusTooManyRequests, rlErr.Error())
 		return
 	}
 
@@ -1291,7 +1316,7 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	// Per-run privacy dropped — all runs public (community model).
 	createVisibility := "public"
-	_ = asH2oflows // retained; no longer affects visibility
+	_ = asSpecial // retained; no longer affects visibility (all runs public already)
 
 	var reachID string
 	err := h.db.QueryRow(ctx, `
@@ -1496,13 +1521,31 @@ func (h *UserReachHandler) SlugCheck(w http.ResponseWriter, r *http.Request) {
 
 // PATCH /api/v1/me/reaches/{slug}
 func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
-	ownerID, ok := h.ownerID(r)
+	callerID, ok := h.ownerID(r)
 	if !ok {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	isAdmin := auth.IsDataAdminFromContext(r.Context())
 	slug := chi.URLParam(r, "slug")
+	ctx := r.Context()
+	ids := editableOwnerIDs(ctx, h.db, callerID)
+
+	// Resolve the actual owner of this slug among the caller's editable
+	// accounts (their own, plus any special account their role grants them).
+	// Prefer the caller's own row on a slug collision.
+	var ownerID string
+	if err := h.db.QueryRow(ctx,
+		`SELECT owner_id FROM user_reaches WHERE owner_id = ANY($1::text[]) AND slug = $2
+		 ORDER BY (owner_id = $3) DESC LIMIT 1`,
+		ids, slug, callerID,
+	).Scan(&ownerID); err != nil {
+		errorResponse(w, http.StatusNotFound, "user reach not found")
+		return
+	}
+	if rlErr := recordRunWrite(ctx, h.db, ownerID); rlErr != nil {
+		errorResponse(w, http.StatusTooManyRequests, rlErr.Error())
+		return
+	}
 
 	type latLng struct {
 		Lat float64 `json:"lat"`
@@ -1536,7 +1579,9 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		riverName = &rn
 	}
 
-	// Validate and uniqueness-check new slug when provided.
+	// Validate and uniqueness-check new slug when provided. Scoped to the
+	// resolved target owner (not necessarily the caller) — renaming a
+	// special-user's run must not collide within THAT account's namespace.
 	var newSlug *string
 	if body.NewSlug != nil && *body.NewSlug != slug {
 		ns := strings.TrimSpace(*body.NewSlug)
@@ -1545,7 +1590,6 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Reject if another run already uses this slug.
-		ctx := r.Context()
 		var conflict bool
 		_ = h.db.QueryRow(ctx,
 			`SELECT EXISTS(SELECT 1 FROM user_reaches WHERE owner_id = $1 AND slug = $2 AND deleted_at IS NULL)`,
@@ -1557,8 +1601,6 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		}
 		newSlug = &ns
 	}
-
-	ctx := r.Context()
 
 	// Resolve visibility update: accept both old is_private and new visibility field.
 	var newVisibility *string
@@ -1598,13 +1640,12 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 				WHEN original_forked_at IS NOT NULL THEN NOW()
 				ELSE last_modified_after_fork_at
 			END
-		WHERE (owner_id = $1 OR (owner_id = $15 AND $16::boolean)) AND slug = $2
+		WHERE owner_id = $1 AND slug = $2
 	`, ownerID, slug, body.Name, newSlug != nil, newSlug, body.Note,
 		body.RiverName != nil, riverName,
 		body.ClassMin != nil, body.ClassMin,
 		body.ClassMax != nil, body.ClassMax,
-		newVisibility != nil, newVisibility,
-		h2oflowsSentinelOwnerID, isAdmin)
+		newVisibility != nil, newVisibility)
 	if err != nil || tag.RowsAffected() == 0 {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
 		return
@@ -1623,8 +1664,8 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		rid := resolveOrCreateRiver(ctx, h.db, *riverName, gnisID, 0, 0)
 		if rid != "" {
 			_, _ = h.db.Exec(ctx,
-				`UPDATE user_reaches SET river_id = $3 WHERE (owner_id = $1 OR (owner_id = $4 AND $5::boolean)) AND slug = $2`,
-				ownerID, slug, rid, h2oflowsSentinelOwnerID, isAdmin)
+				`UPDATE user_reaches SET river_id = $3 WHERE owner_id = $1 AND slug = $2`,
+				ownerID, slug, rid)
 		}
 	}
 
@@ -1638,18 +1679,17 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 				up_comid   = NULLIF($7, ''),
 				down_comid = NULLIF($8, ''),
 				updated_at = NOW()
-			WHERE (owner_id = $1 OR (owner_id = $9 AND $10::boolean)) AND slug = $2
+			WHERE owner_id = $1 AND slug = $2
 		`, ownerID, slug,
 			body.PutIn.Lng, body.PutIn.Lat,
 			body.TakeOut.Lng, body.TakeOut.Lat,
-			*body.UpComID, *body.DownComID,
-			h2oflowsSentinelOwnerID, isAdmin)
+			*body.UpComID, *body.DownComID)
 	}
 
 	// Recompute completeness after any field change. (V18)
 	var runID string
-	if h.db.QueryRow(ctx, `SELECT id FROM user_reaches WHERE (owner_id = $1 OR (owner_id = $3 AND $4::boolean)) AND slug = $2`,
-		ownerID, slug, h2oflowsSentinelOwnerID, isAdmin).Scan(&runID) == nil {
+	if h.db.QueryRow(ctx, `SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2`,
+		ownerID, slug).Scan(&runID) == nil {
 		saveCompleteness(ctx, h.db, runID)
 	}
 
@@ -1661,21 +1701,21 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 // DELETE /api/v1/me/reaches/{slug}
 // Tombstones when referenced by other users; hard-deletes when zero refs. (V11, V13)
 func (h *UserReachHandler) Delete(w http.ResponseWriter, r *http.Request) {
-	ownerID, ok := h.ownerID(r)
+	callerID, ok := h.ownerID(r)
 	if !ok {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	isAdmin := auth.IsDataAdminFromContext(r.Context())
 	slug := chi.URLParam(r, "slug")
 	ctx := r.Context()
+	ids := editableOwnerIDs(ctx, h.db, callerID)
 
 	var runID string
 	if err := h.db.QueryRow(ctx,
 		`SELECT id FROM user_reaches
-		 WHERE (owner_id = $1 OR (owner_id = $3 AND $4::boolean)) AND slug = $2 AND deleted_at IS NULL
-		 ORDER BY (owner_id = $1) DESC LIMIT 1`,
-		ownerID, slug, h2oflowsSentinelOwnerID, isAdmin,
+		 WHERE owner_id = ANY($1::text[]) AND slug = $2 AND deleted_at IS NULL
+		 ORDER BY (owner_id = $3) DESC LIMIT 1`,
+		ids, slug, callerID,
 	).Scan(&runID); err != nil {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
 		return
@@ -1795,20 +1835,25 @@ func (h *UserReachHandler) GetPublicFlowRangesByHandle(w http.ResponseWriter, r 
 
 // PUT /api/v1/me/reaches/{slug}/flow-ranges
 func (h *UserReachHandler) SetFlowRanges(w http.ResponseWriter, r *http.Request) {
-	ownerID, _, ok := h.authorOwnerID(r)
+	callerID, ok := h.ownerID(r)
 	if !ok {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	isAdmin := auth.IsDataAdminFromContext(r.Context())
 	slug := chi.URLParam(r, "slug")
+	ctx := r.Context()
+	ids := editableOwnerIDs(ctx, h.db, callerID)
 
-	var reachID string
-	if err := h.db.QueryRow(r.Context(),
-		`SELECT id FROM user_reaches WHERE (owner_id = $1 OR (owner_id = $3 AND $4::boolean)) AND slug = $2
-		 ORDER BY (owner_id = $1) DESC LIMIT 1`,
-		ownerID, slug, h2oflowsSentinelOwnerID, isAdmin).Scan(&reachID); err != nil {
+	var reachID, resolvedOwnerID string
+	if err := h.db.QueryRow(ctx,
+		`SELECT id, owner_id FROM user_reaches WHERE owner_id = ANY($1::text[]) AND slug = $2
+		 ORDER BY (owner_id = $3) DESC LIMIT 1`,
+		ids, slug, callerID).Scan(&reachID, &resolvedOwnerID); err != nil {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
+		return
+	}
+	if rlErr := recordRunWrite(ctx, h.db, resolvedOwnerID); rlErr != nil {
+		errorResponse(w, http.StatusTooManyRequests, rlErr.Error())
 		return
 	}
 
@@ -1822,7 +1867,6 @@ func (h *UserReachHandler) SetFlowRanges(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	ctx := r.Context()
 	_, err := h.db.Exec(ctx,
 		`UPDATE user_reaches SET base_label = $1, base_color = $2 WHERE id = $3`,
 		body.BaseLabel, body.BaseColor, reachID,
@@ -1878,20 +1922,24 @@ type rapidInput struct {
 // Body: { "rapids": [ {rapid}, ... ] }
 // Wholesale-replaces every rapid on the run.
 func (h *UserReachHandler) SetRapids(w http.ResponseWriter, r *http.Request) {
-	ownerID, _, ok := h.authorOwnerID(r)
+	callerID, ok := h.ownerID(r)
 	if !ok {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	isAdmin := auth.IsDataAdminFromContext(r.Context())
 	slug := chi.URLParam(r, "slug")
+	ids := editableOwnerIDs(r.Context(), h.db, callerID)
 
-	var reachID string
+	var reachID, resolvedOwnerID string
 	if err := h.db.QueryRow(r.Context(),
-		`SELECT id FROM user_reaches WHERE (owner_id = $1 OR (owner_id = $3 AND $4::boolean)) AND slug = $2
-		 ORDER BY (owner_id = $1) DESC LIMIT 1`,
-		ownerID, slug, h2oflowsSentinelOwnerID, isAdmin).Scan(&reachID); err != nil {
+		`SELECT id, owner_id FROM user_reaches WHERE owner_id = ANY($1::text[]) AND slug = $2
+		 ORDER BY (owner_id = $3) DESC LIMIT 1`,
+		ids, slug, callerID).Scan(&reachID, &resolvedOwnerID); err != nil {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
+		return
+	}
+	if rlErr := recordRunWrite(r.Context(), h.db, resolvedOwnerID); rlErr != nil {
+		errorResponse(w, http.StatusTooManyRequests, rlErr.Error())
 		return
 	}
 
@@ -1973,20 +2021,24 @@ type accessPointInput struct {
 // put_in/take_out rows (owned by the run's put_in/take_out columns) are
 // preserved untouched.
 func (h *UserReachHandler) SetAccessPoints(w http.ResponseWriter, r *http.Request) {
-	ownerID, _, ok := h.authorOwnerID(r)
+	callerID, ok := h.ownerID(r)
 	if !ok {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	isAdmin := auth.IsDataAdminFromContext(r.Context())
 	slug := chi.URLParam(r, "slug")
+	ids := editableOwnerIDs(r.Context(), h.db, callerID)
 
-	var reachID string
+	var reachID, resolvedOwnerID string
 	if err := h.db.QueryRow(r.Context(),
-		`SELECT id FROM user_reaches WHERE (owner_id = $1 OR (owner_id = $3 AND $4::boolean)) AND slug = $2
-		 ORDER BY (owner_id = $1) DESC LIMIT 1`,
-		ownerID, slug, h2oflowsSentinelOwnerID, isAdmin).Scan(&reachID); err != nil {
+		`SELECT id, owner_id FROM user_reaches WHERE owner_id = ANY($1::text[]) AND slug = $2
+		 ORDER BY (owner_id = $3) DESC LIMIT 1`,
+		ids, slug, callerID).Scan(&reachID, &resolvedOwnerID); err != nil {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
+		return
+	}
+	if rlErr := recordRunWrite(r.Context(), h.db, resolvedOwnerID); rlErr != nil {
+		errorResponse(w, http.StatusTooManyRequests, rlErr.Error())
 		return
 	}
 
@@ -2064,26 +2116,33 @@ func (h *UserReachHandler) SetAccessPoints(w http.ResponseWriter, r *http.Reques
 
 // DELETE /api/v1/me/reaches/{slug}/gauge
 func (h *UserReachHandler) ClearGauge(w http.ResponseWriter, r *http.Request) {
-	ownerID, ok := h.ownerID(r)
+	callerID, ok := h.ownerID(r)
 	if !ok {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
 	slug := chi.URLParam(r, "slug")
 	ctx := r.Context()
-	tag, err := h.db.Exec(ctx, `
-		UPDATE user_reaches
-		SET primary_gauge_id = NULL, custom_gauge_id = NULL, updated_at = NOW()
-		WHERE owner_id = $1 AND slug = $2
-	`, ownerID, slug)
-	if err != nil || tag.RowsAffected() == 0 {
+	ids := editableOwnerIDs(ctx, h.db, callerID)
+
+	var reachID string
+	if err := h.db.QueryRow(ctx,
+		`SELECT id FROM user_reaches WHERE owner_id = ANY($1::text[]) AND slug = $2
+		 ORDER BY (owner_id = $3) DESC LIMIT 1`,
+		ids, slug, callerID).Scan(&reachID); err != nil {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
 		return
 	}
-	var rid string
-	if h.db.QueryRow(ctx, `SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2`, ownerID, slug).Scan(&rid) == nil {
-		saveCompleteness(ctx, h.db, rid)
+	_, err := h.db.Exec(ctx, `
+		UPDATE user_reaches
+		SET primary_gauge_id = NULL, custom_gauge_id = NULL, updated_at = NOW()
+		WHERE id = $1
+	`, reachID)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "update failed")
+		return
 	}
+	saveCompleteness(ctx, h.db, reachID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -2093,16 +2152,19 @@ func (h *UserReachHandler) ClearGauge(w http.ResponseWriter, r *http.Request) {
 // Body: { "up_comid": "...", "down_comid": "...", "start_lat": ..., ... }
 // Delegates to the NLDI handler's centerline fetch logic via internal fetch.
 func (h *UserReachHandler) SetCenterline(w http.ResponseWriter, r *http.Request) {
-	ownerID, _, ok := h.authorOwnerID(r)
+	callerID, ok := h.ownerID(r)
 	if !ok {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
 	slug := chi.URLParam(r, "slug")
+	ids := editableOwnerIDs(r.Context(), h.db, callerID)
 
 	var reachID string
 	if err := h.db.QueryRow(r.Context(),
-		`SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2`, ownerID, slug).Scan(&reachID); err != nil {
+		`SELECT id FROM user_reaches WHERE owner_id = ANY($1::text[]) AND slug = $2
+		 ORDER BY (owner_id = $3) DESC LIMIT 1`,
+		ids, slug, callerID).Scan(&reachID); err != nil {
 		errorResponse(w, http.StatusNotFound, "user reach not found")
 		return
 	}
@@ -2129,19 +2191,29 @@ func (h *UserReachHandler) SetCenterline(w http.ResponseWriter, r *http.Request)
 
 // DELETE /api/v1/me/reaches/{slug}/centerline
 func (h *UserReachHandler) ClearCenterline(w http.ResponseWriter, r *http.Request) {
-	ownerID, ok := h.ownerID(r)
+	callerID, ok := h.ownerID(r)
 	if !ok {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
 	slug := chi.URLParam(r, "slug")
-	tag, err := h.db.Exec(r.Context(), `
+	ids := editableOwnerIDs(r.Context(), h.db, callerID)
+
+	var reachID string
+	if err := h.db.QueryRow(r.Context(),
+		`SELECT id FROM user_reaches WHERE owner_id = ANY($1::text[]) AND slug = $2
+		 ORDER BY (owner_id = $3) DESC LIMIT 1`,
+		ids, slug, callerID).Scan(&reachID); err != nil {
+		errorResponse(w, http.StatusNotFound, "user reach not found")
+		return
+	}
+	_, err := h.db.Exec(r.Context(), `
 		UPDATE user_reaches
 		SET centerline = NULL, up_comid = NULL, down_comid = NULL, updated_at = NOW()
-		WHERE owner_id = $1 AND slug = $2
-	`, ownerID, slug)
-	if err != nil || tag.RowsAffected() == 0 {
-		errorResponse(w, http.StatusNotFound, "user reach not found")
+		WHERE id = $1
+	`, reachID)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "update failed")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -2156,12 +2228,22 @@ func (h *UserReachHandler) ClearCenterline(w http.ResponseWriter, r *http.Reques
 //	{ "custom_gauge_id": "<uuid>" }
 //	{ "external_id": "...", "source": "...", "name": "...", "lat": 0.0, "lng": 0.0 }
 func (h *UserReachHandler) SetGauge(w http.ResponseWriter, r *http.Request) {
-	ownerID, _, ok := h.authorOwnerID(r)
+	callerID, ok := h.ownerID(r)
 	if !ok {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
 	slug := chi.URLParam(r, "slug")
+	ids := editableOwnerIDs(r.Context(), h.db, callerID)
+
+	var reachID string
+	if err := h.db.QueryRow(r.Context(),
+		`SELECT id FROM user_reaches WHERE owner_id = ANY($1::text[]) AND slug = $2
+		 ORDER BY (owner_id = $3) DESC LIMIT 1`,
+		ids, slug, callerID).Scan(&reachID); err != nil {
+		errorResponse(w, http.StatusNotFound, "user reach not found")
+		return
+	}
 
 	var body struct {
 		GaugeID       *string  `json:"gauge_id"`
@@ -2209,29 +2291,25 @@ func (h *UserReachHandler) SetGauge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var tag interface{ RowsAffected() int64 }
 	var err error
 	if body.GaugeID != nil {
-		tag, err = h.db.Exec(r.Context(), `
+		_, err = h.db.Exec(r.Context(), `
 			UPDATE user_reaches
-			SET primary_gauge_id = $3::uuid, custom_gauge_id = NULL, updated_at = NOW()
-			WHERE owner_id = $1 AND slug = $2
-		`, ownerID, slug, body.GaugeID)
+			SET primary_gauge_id = $2::uuid, custom_gauge_id = NULL, updated_at = NOW()
+			WHERE id = $1
+		`, reachID, body.GaugeID)
 	} else {
-		tag, err = h.db.Exec(r.Context(), `
+		_, err = h.db.Exec(r.Context(), `
 			UPDATE user_reaches
-			SET custom_gauge_id = $3::uuid, primary_gauge_id = NULL, updated_at = NOW()
-			WHERE owner_id = $1 AND slug = $2
-		`, ownerID, slug, body.CustomGaugeID)
+			SET custom_gauge_id = $2::uuid, primary_gauge_id = NULL, updated_at = NOW()
+			WHERE id = $1
+		`, reachID, body.CustomGaugeID)
 	}
-	if err != nil || tag.RowsAffected() == 0 {
-		errorResponse(w, http.StatusNotFound, "user reach not found or gauge invalid")
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "gauge update failed")
 		return
 	}
-	var rid string
-	if h.db.QueryRow(r.Context(), `SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2`, ownerID, slug).Scan(&rid) == nil {
-		saveCompleteness(r.Context(), h.db, rid)
-	}
+	saveCompleteness(r.Context(), h.db, reachID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -2281,7 +2359,8 @@ func (h *UserReachHandler) ImportKML(w http.ResponseWriter, r *http.Request) {
 // ── ForkUserRun ───────────────────────────────────────────────────────────────
 
 // POST /api/v1/user-runs/{runId}/fork
-// Clones a public user_reach into a new user_reach owned by the caller.
+// Clones a public (or the caller's own) user_reach into a new user_reach
+// owned by the caller.
 func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 	ownerID, ok := h.ownerID(r)
 	if !ok {
@@ -2291,6 +2370,49 @@ func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 	runID := chi.URLParam(r, "runId")
 	ctx := r.Context()
 
+	newID, newSlug, err := forkRunTx(ctx, h.db, ownerID, runID)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			errorResponse(w, http.StatusNotFound, "run not found")
+			return
+		}
+		errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	var gaugeID *string
+	_ = h.db.QueryRow(ctx, `SELECT primary_gauge_id::text FROM user_reaches WHERE id = $1`, newID).Scan(&gaugeID)
+
+	saveCompleteness(ctx, h.db, newID)
+	jsonResponse(w, http.StatusCreated, map[string]string{"id": newID, "slug": newSlug, "gauge_id": func() string {
+		if gaugeID != nil {
+			return *gaugeID
+		}
+		return ""
+	}()})
+}
+
+// ── Fork ─────────────────────────────────────────────────────────────────────
+
+// pgxQueryer is satisfied by both *pgxpool.Pool and pgx.Tx — lets fork logic
+// run inside a transaction (watchlist auto-fork) or standalone (ForkReach).
+type pgxQueryer interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+// forkRunTx forks any forkable run — public, or the caller's own — into a new
+// user_reaches row owned by ownerID. Always snapshots
+// original_author_handle/original_author_owner_id so provenance survives
+// repeated forking (the old curated-only fork helper this replaces skipped
+// that for curated sources; #314 unifies the two fork paths and fixes that
+// gap). Copies
+// centerline, base flow bands + thresholds, and every rapid/access-point
+// feature (copyRunFeatures). The fork is always created public.
+//
+// Shared by ForkUserRun (self-service), ForkReach (special-user curated-slug
+// routes), and the watchlist auto-fork path (watchlist.go).
+func forkRunTx(ctx context.Context, q pgxQueryer, ownerID, srcRunID string) (newID, newSlug string, err error) {
 	type srcRow struct {
 		ID           string
 		Name         string
@@ -2309,7 +2431,7 @@ func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 		Centerline   []byte
 	}
 	var src srcRow
-	err := h.db.QueryRow(ctx, `
+	err = q.QueryRow(ctx, `
 		SELECT
 			ur.id::text, ur.name, ur.owner_id::text,
 			up.handle,
@@ -2321,8 +2443,9 @@ func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 			ST_AsGeoJSON(ur.centerline::geometry)
 		FROM user_reaches ur
 		LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
-		WHERE ur.id = $1 AND ur.visibility = 'public' AND ur.deleted_at IS NULL
-	`, runID).Scan(
+		WHERE ur.id = $1 AND ur.deleted_at IS NULL
+		  AND (ur.visibility = 'public' OR ur.owner_id = $2)
+	`, srcRunID, ownerID).Scan(
 		&src.ID, &src.Name, &src.OwnerID, &src.AuthorHandle,
 		&src.RiverID, &src.RiverName, &src.Note,
 		&src.ClassMin, &src.ClassMax,
@@ -2332,156 +2455,10 @@ func (h *UserReachHandler) ForkUserRun(w http.ResponseWriter, r *http.Request) {
 		&src.Centerline,
 	)
 	if err != nil {
-		errorResponse(w, http.StatusNotFound, "run not found")
-		return
+		return "", "", fmt.Errorf("run not found: %w", err)
 	}
 
 	baseSlug := kmlimport.Slugify(src.Name)
-	slug := baseSlug
-	for i := 2; i <= 20; i++ {
-		var existing string
-		if e := h.db.QueryRow(ctx,
-			`SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2`, ownerID, slug,
-		).Scan(&existing); e != nil {
-			break
-		}
-		slug = fmt.Sprintf("%s-%d", baseSlug, i)
-	}
-
-	var newID string
-	if err = h.db.QueryRow(ctx, `
-		INSERT INTO user_reaches
-			(owner_id, slug, name, river_id, river_name, note,
-			 put_in, take_out,
-			 class_min, class_max, primary_gauge_id,
-			 forked_from_user_reach_id,
-			 original_author_handle, original_author_owner_id, original_forked_at,
-			 river_confirmed, visibility, published_at)
-		VALUES
-			($1, $2, $3, $4::uuid, $5, $17,
-			 ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography,
-			 ST_SetSRID(ST_MakePoint($8, $9), 4326)::geography,
-			 $10, $11, $12::uuid,
-			 $13::uuid,
-			 $14, $15::uuid, NOW(),
-			 $16, 'public'::run_visibility, NOW())
-		RETURNING id
-	`, ownerID, slug, src.Name, src.RiverID, src.RiverName,
-		src.PutInLng, src.PutInLat,
-		src.TakeOutLng, src.TakeOutLat,
-		src.ClassMin, src.ClassMax, src.GaugeID,
-		src.ID,
-		src.AuthorHandle, src.OwnerID,
-		src.RiverID != nil,
-		src.Note,
-	).Scan(&newID); err != nil {
-		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("fork failed: %v", err))
-		return
-	}
-
-	if len(src.Centerline) > 0 {
-		_, _ = h.db.Exec(ctx, `
-			UPDATE user_reaches
-			SET centerline = ST_GeomFromGeoJSON($2)::geography
-			WHERE id = $1
-		`, newID, string(src.Centerline))
-	}
-
-	// Copy base band config + thresholds verbatim (V12).
-	_, _ = h.db.Exec(ctx, `
-		UPDATE user_reaches dst
-		SET base_label = src.base_label, base_color = src.base_color
-		FROM user_reaches src
-		WHERE dst.id = $1 AND src.id = $2
-	`, newID, src.ID)
-	_, _ = h.db.Exec(ctx, `
-		INSERT INTO user_reach_flow_ranges (user_reach_id, label, value, color)
-		SELECT $1, label, value, color
-		FROM user_reach_flow_ranges
-		WHERE user_reach_id = $2
-	`, newID, src.ID)
-
-	// Copy all features (rapids + access points) so a fork carries the whole run (#312).
-	copyRunFeatures(ctx, h.db, newID, src.ID)
-
-	saveCompleteness(ctx, h.db, newID)
-	jsonResponse(w, http.StatusCreated, map[string]string{"id": newID, "slug": slug, "gauge_id": func() string {
-		if src.GaugeID != nil {
-			return *src.GaugeID
-		}
-		return ""
-	}()})
-}
-
-// ── Fork ─────────────────────────────────────────────────────────────────────
-
-// pgxQueryer is satisfied by both *pgxpool.Pool and pgx.Tx — lets fork logic
-// run inside a transaction (watchlist auto-fork) or standalone (ForkReach).
-type pgxQueryer interface {
-	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
-	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
-}
-
-// forkCuratedReachTx forks a curated reaches row into user_reaches for ownerID.
-// Returns (newID, newSlug, nil) on success. Returns ErrNotFound-style error if
-// the source slug doesn't exist. Callers handle the http status mapping.
-func forkCuratedReachTx(ctx context.Context, q pgxQueryer, ownerID, sourceSlug string) (newID, newSlug string, err error) {
-	type srcRow struct {
-		ID         string
-		Name       string
-		LongName   *string
-		RiverID    *string
-		RiverName  *string
-		Note       *string
-		ClassMin   *float64
-		ClassMax   *float64
-		GaugeID    *string
-		PutInLng   float64
-		PutInLat   float64
-		TakeOutLng float64
-		TakeOutLat float64
-		Centerline []byte
-	}
-	var src srcRow
-	err = q.QueryRow(ctx, `
-		SELECT
-			id,
-			name,
-			long_name,
-			river_id::text,
-			river_name,
-			note,
-			class_min,
-			class_max,
-			primary_gauge_id::text,
-			ST_X(put_in::geometry),
-			ST_Y(put_in::geometry),
-			ST_X(take_out::geometry),
-			ST_Y(take_out::geometry),
-			ST_AsGeoJSON(centerline::geometry)
-		FROM user_reaches
-		WHERE slug = $1
-		  AND owner_id = '00000000-0000-0000-0000-000000000001'
-		  AND deleted_at IS NULL
-	`, sourceSlug).Scan(
-		&src.ID, &src.Name, &src.LongName,
-		&src.RiverID, &src.RiverName, &src.Note,
-		&src.ClassMin, &src.ClassMax,
-		&src.GaugeID,
-		&src.PutInLng, &src.PutInLat,
-		&src.TakeOutLng, &src.TakeOutLat,
-		&src.Centerline,
-	)
-	if err != nil {
-		return "", "", fmt.Errorf("reach not found: %w", err)
-	}
-
-	forkName := src.Name
-	if src.LongName != nil && *src.LongName != "" {
-		forkName = *src.LongName
-	}
-
-	baseSlug := kmlimport.Slugify(forkName)
 	newSlug = baseSlug
 	for i := 2; i <= 20; i++ {
 		var existing string
@@ -2498,21 +2475,24 @@ func forkCuratedReachTx(ctx context.Context, q pgxQueryer, ownerID, sourceSlug s
 			(owner_id, slug, name, river_id, river_name, note,
 			 put_in, take_out,
 			 class_min, class_max, primary_gauge_id,
-			 forked_from_user_reach_id, original_forked_at,
+			 forked_from_user_reach_id,
+			 original_author_handle, original_author_owner_id, original_forked_at,
 			 river_confirmed, visibility, published_at)
 		VALUES
-			($1, $2, $3, $4::uuid, $5, $15,
+			($1, $2, $3, $4::uuid, $5, $17,
 			 ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography,
 			 ST_SetSRID(ST_MakePoint($8, $9), 4326)::geography,
 			 $10, $11, $12::uuid,
-			 $13::uuid, NOW(),
-			 $14, 'public'::run_visibility, NOW())
+			 $13::uuid,
+			 $14, $15::uuid, NOW(),
+			 $16, 'public'::run_visibility, NOW())
 		RETURNING id
-	`, ownerID, newSlug, forkName, src.RiverID, src.RiverName,
+	`, ownerID, newSlug, src.Name, src.RiverID, src.RiverName,
 		src.PutInLng, src.PutInLat,
 		src.TakeOutLng, src.TakeOutLat,
 		src.ClassMin, src.ClassMax, src.GaugeID,
 		src.ID,
+		src.AuthorHandle, src.OwnerID,
 		src.RiverID != nil,
 		src.Note,
 	).Scan(&newID); err != nil {
@@ -2527,14 +2507,12 @@ func forkCuratedReachTx(ctx context.Context, q pgxQueryer, ownerID, sourceSlug s
 		`, newID, string(src.Centerline))
 	}
 
-	// Copy base band config + thresholds verbatim from sentinel twin (V12).
+	// Copy base band config + thresholds verbatim (V12).
 	_, _ = q.Exec(ctx, `
-		UPDATE user_reaches ur
-		SET base_label = r.base_label, base_color = r.base_color
-		FROM user_reaches r
-		WHERE ur.id = $1 AND r.id = $2
-		  AND r.owner_id = '00000000-0000-0000-0000-000000000001'
-		  AND r.deleted_at IS NULL
+		UPDATE user_reaches dst
+		SET base_label = src.base_label, base_color = src.base_color
+		FROM user_reaches src
+		WHERE dst.id = $1 AND src.id = $2
 	`, newID, src.ID)
 	_, _ = q.Exec(ctx, `
 		INSERT INTO user_reach_flow_ranges (user_reach_id, label, value, color)
@@ -2583,9 +2561,11 @@ func copyRunFeatures(ctx context.Context, q pgxQueryer, dstID, srcID string) {
 	`, dstID, srcID)
 }
 
-// POST /api/v1/me/reaches/fork-reach/{slug}
-// Clones a curated reach (reaches table) into a new user_reaches row owned by
-// the authenticated user. Copies name, geometry, centerline, class, and gauge.
+// POST /api/v1/me/reaches/fork-reach/{slug} (and /me/runs/fork-reach/{slug})
+// Clones a special-user (curated) run into a new user_reaches row owned by
+// the authenticated user. These slug routes exist specifically for curated
+// forks — special-user account slugs only, not arbitrary community runs
+// (use ForkUserRun by ID for those).
 func (h *UserReachHandler) ForkReach(w http.ResponseWriter, r *http.Request) {
 	ownerID, ok := h.ownerID(r)
 	if !ok {
@@ -2593,7 +2573,20 @@ func (h *UserReachHandler) ForkReach(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sourceSlug := chi.URLParam(r, "slug")
-	newID, newSlug, err := forkCuratedReachTx(r.Context(), h.db, ownerID, sourceSlug)
+	ctx := r.Context()
+
+	var srcRunID string
+	if err := h.db.QueryRow(ctx, `
+		SELECT id FROM user_reaches
+		WHERE slug = $1
+		  AND owner_id IN (SELECT owner_id FROM user_profiles WHERE is_special)
+		  AND deleted_at IS NULL
+	`, sourceSlug).Scan(&srcRunID); err != nil {
+		errorResponse(w, http.StatusNotFound, "reach not found")
+		return
+	}
+
+	newID, newSlug, err := forkRunTx(ctx, h.db, ownerID, srcRunID)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			errorResponse(w, http.StatusNotFound, "reach not found")
@@ -2602,7 +2595,7 @@ func (h *UserReachHandler) ForkReach(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	saveCompleteness(r.Context(), h.db, newID)
+	saveCompleteness(ctx, h.db, newID)
 	jsonResponse(w, http.StatusCreated, map[string]string{"id": newID, "slug": newSlug})
 }
 
@@ -2627,7 +2620,7 @@ func (h *UserReachHandler) ListCommunity(w http.ResponseWriter, r *http.Request)
 	}
 
 	search := "%" + q + "%"
-	rows, err := h.db.Query(r.Context(), `
+	query := `
 		SELECT
 			ur.id, ur.slug, ur.name, ur.long_name, ur.river_name,
 			rv.state_abbr, rv.basin AS basin_group,
@@ -2652,7 +2645,7 @@ func (h *UserReachHandler) ListCommunity(w http.ResponseWriter, r *http.Request)
 			cg.name AS custom_gauge_name,
 			ur.visibility,
 			up.handle AS author_handle,
-			(ur.owner_id = '00000000-0000-0000-0000-000000000001') AS is_official,
+			COALESCE(up.is_special, false) AS is_special,
 			(SELECT COUNT(*)::int FROM user_reaches f
 			 WHERE f.forked_from_user_reach_id = ur.id
 			   AND f.visibility = 'public' AND f.deleted_at IS NULL) AS fork_count
@@ -2686,12 +2679,14 @@ func (h *UserReachHandler) ListCommunity(w http.ResponseWriter, r *http.Request)
 		  AND ur.completeness_score >= 0.2
 		  AND ur.forked_from_user_reach_id IS NULL
 		  AND ($1 = '%%' OR ur.name ILIKE $1 OR ur.river_name ILIKE $1)
+	` + anonPublicOnMapFilter(r, "ur.owner_id") + `
 		ORDER BY
 			(5.0 * ur.completeness_score + COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0)::float)
 			/ GREATEST(5.0 + COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0)::float, 1.0) DESC,
 			ur.created_at DESC, ur.id
 		LIMIT $2 OFFSET $3
-	`, search, limit+1, offset)
+	`
+	rows, err := h.db.Query(r.Context(), query, search, limit+1, offset)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
 		return
@@ -2710,7 +2705,7 @@ func (h *UserReachHandler) ListCommunity(w http.ResponseWriter, r *http.Request)
 			&s.CurrentCFS, &s.LastReadAt,
 			&s.FlowStatus, &s.FlowBand,
 			&s.GaugeID, &s.CustomGaugeID, &s.CustomGaugeSlug, &s.CustomGaugeName,
-			&s.Visibility, &s.AuthorHandle, &s.IsOfficial, &s.ForkCount,
+			&s.Visibility, &s.AuthorHandle, &s.IsSpecial, &s.ForkCount,
 		); err == nil {
 			s.IsPrivate = s.Visibility != "public"
 			items = append(items, s)

@@ -292,8 +292,9 @@ func main() {
 			// NOTE: rivers-mgmt writes (CreateRiver/DeleteRiver/ReorderReachesForRiver)
 			// retired in runs-unify 5b — they wrote the legacy reaches table and had
 			// no live UI caller (admin UI only reads GET /admin/rivers).
-			r.Get("/admin/river-corrections", corrections.ListRiverCorrections)
-			r.Patch("/admin/river-corrections/{id}", corrections.ReviewRiverCorrection)
+			// NOTE: /admin/river-corrections GET+PATCH removed (#315) — the review
+			// queue had no live caller; POST /me/river-corrections (user-facing
+			// submission) is retained in corrections.go.
 			r.Get("/admin/moderation/queue", moderation.Queue)
 			r.Post("/admin/moderation/flags/{flagId}/dismiss", moderation.Dismiss)
 			r.Post("/admin/moderation/flags/{flagId}/action", moderation.Action)
@@ -309,9 +310,10 @@ func main() {
 			r.Get("/admin/nldi/river-name", nldiH.RiverName)
 			r.Get("/admin/nldi/preview-centerline", nldiH.PreviewCenterline)
 			r.Get("/admin/nldi/nearby-gauges", nldiH.NearbyGauges)
-			r.Get("/admin/reaches/flow-band-override-queue", flowBandOverrides.AdminQueue)
+			// NOTE: /admin/reaches/flow-band-override-queue and
+			// /admin/reaches/{slug}/apply-override-median removed (#315) — no live
+			// caller. /admin/reaches/{slug}/flow-band-overrides (read) is retained.
 			r.Get("/admin/reaches/{slug}/flow-band-overrides", flowBandOverrides.AdminListForReach)
-			r.Post("/admin/reaches/{slug}/apply-override-median", flowBandOverrides.AdminApplyMedian)
 		})
 
 		// Site admin only — role management.
@@ -320,12 +322,29 @@ func main() {
 			r.Get("/admin/users/roles", admin.ListUserRoles)
 			r.Post("/admin/users/roles", admin.AssignRole)
 			r.Delete("/admin/users/roles/{roleId}", admin.RevokeRole)
+
+			// Special users (#314): opt-in "official" accounts (h2oflows curator +
+			// future partner orgs) with authoring rights granted via user_roles.
+			r.Get("/admin/special-users", admin.ListSpecialUsers)
+			r.Post("/admin/special-users", admin.CreateSpecialUser)
+			r.Patch("/admin/special-users/{ownerId}", admin.UpdateSpecialUser)
+			r.Delete("/admin/special-users/{ownerId}", admin.DeleteSpecialUser)
+			r.Post("/admin/special-users/{ownerId}/rotate-key", admin.RotateAPIKey)
+			r.Post("/admin/users/{ownerId}/rotate-key", admin.RotateAPIKey)
+
+			r.Get("/admin/roles", admin.ListRoles)
+			r.Post("/admin/roles/{role}/members", admin.AddRoleMember)
+			r.Delete("/admin/roles/{role}/members/{userId}", admin.RemoveRoleMember)
+
+			r.Get("/admin/users", admin.ListDirectoryUsers)
+			r.Patch("/admin/users/{ownerId}/rate-limit", admin.UpdateRateLimit)
 		})
 
 		// Authenticated user — own role info.
 		r.Group(func(r chi.Router) {
 			r.Use(auth.Required(verifier))
 			r.Get("/admin/me/roles", admin.GetMyRoles)
+			r.Get("/me/authorable-accounts", admin.AuthorableAccounts)
 		})
 
 		// NOTE: legacy /reaches/{slug}/{contributions,trip-reports} + /proximity-events
