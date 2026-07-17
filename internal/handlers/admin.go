@@ -193,7 +193,7 @@ func (h *AdminHandler) AssignRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !isValidRoleName(r.Context(), h.db, body.Role) {
-		errorResponse(w, http.StatusBadRequest, "role must be site_admin, data_admin, or an existing special-user handle")
+		errorResponse(w, http.StatusBadRequest, "role must be site_admin or an existing special-user handle")
 		return
 	}
 

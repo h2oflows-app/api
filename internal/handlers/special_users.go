@@ -53,7 +53,7 @@ type RoleMember struct {
 	DisplayName *string `json:"display_name"`
 }
 
-// Role is either a system role (site_admin, data_admin) or a special user's
+// Role is either the site_admin system role or a special user's
 // handle (system=false).
 type Role struct {
 	Name    string       `json:"name"`
@@ -414,7 +414,7 @@ func (h *AdminHandler) RotateAPIKey(w http.ResponseWriter, r *http.Request) {
 // ── Roles ────────────────────────────────────────────────────────────────────
 
 // ListRoles handles GET /api/v1/admin/roles — system roles (site_admin,
-// data_admin) plus one Role per special user (name=handle, system=false).
+// removed) plus one Role per special user (name=handle, system=false).
 func (h *AdminHandler) ListRoles(w http.ResponseWriter, r *http.Request) {
 	roles := make([]Role, 0)
 
@@ -440,7 +440,7 @@ func (h *AdminHandler) ListRoles(w http.ResponseWriter, r *http.Request) {
 		return members
 	}
 
-	for _, sysRole := range []string{"site_admin", "data_admin"} {
+	for _, sysRole := range []string{"site_admin"} {
 		roles = append(roles, Role{Name: sysRole, System: true, Members: roleMembers(sysRole)})
 	}
 

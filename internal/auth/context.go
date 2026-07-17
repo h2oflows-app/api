@@ -76,16 +76,10 @@ func IsAdminFromContext(ctx context.Context) bool {
 	return IsSiteAdminFromContext(ctx)
 }
 
-// IsDataAdminFromContext returns true when the user has at least data_admin rights
-// (either site_admin or data_admin role).
+// IsDataAdminFromContext reports admin access to the data/moderation surface
+// (gauges, flags). The separate data_admin moderator tier was removed (#314) —
+// there is now a single admin role (site_admin), so this is an alias for it.
+// The name is kept so the RequireDataAdmin-gated routes don't all churn.
 func IsDataAdminFromContext(ctx context.Context) bool {
-	if IsSiteAdminFromContext(ctx) {
-		return true
-	}
-	for _, r := range AppRolesFromContext(ctx) {
-		if r == "data_admin" {
-			return true
-		}
-	}
-	return false
+	return IsSiteAdminFromContext(ctx)
 }

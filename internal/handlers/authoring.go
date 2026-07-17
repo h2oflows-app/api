@@ -52,7 +52,7 @@ func editableOwnerIDs(ctx context.Context, db *pgxpool.Pool, callerID string) []
 // admin roles-members endpoints: a legacy system role, or the handle of an
 // existing special user.
 func isValidRoleName(ctx context.Context, db *pgxpool.Pool, role string) bool {
-	if role == "site_admin" || role == "data_admin" {
+	if role == "site_admin" {
 		return true
 	}
 	var exists bool
