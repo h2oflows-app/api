@@ -280,7 +280,7 @@ func main() {
 		r.Get("/me/custom-gauges/{slug}/share", customGauges.Share)
 		r.Get("/me/custom-gauges/{slug}/readings", customGauges.Readings)
 
-		// Data admin routes — require data_admin or site_admin role.
+		// Admin data/moderation routes — require the site_admin role.
 		r.Group(func(r chi.Router) {
 			r.Use(auth.RequireDataAdmin)
 			// NOTE: curated-reach authoring/editing surface removed in runs-unify 3.3

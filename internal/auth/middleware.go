@@ -91,7 +91,9 @@ func LoadAppRoles(querier func(r *http.Request, userID string) ([]string, error)
 	}
 }
 
-// RequireDataAdmin rejects requests from users without at least data_admin rights.
+// RequireDataAdmin gates the data/moderation surface (gauges, flags). Since the
+// data_admin tier was removed (#314) this now requires site_admin (see
+// IsDataAdminFromContext).
 // Returns 401 for unauthenticated requests and 403 for authenticated non-admin users.
 func RequireDataAdmin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
