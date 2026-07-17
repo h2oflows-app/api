@@ -89,3 +89,14 @@ JOIN reach_access ra ON ra.user_reach_id = dst.forked_from_user_reach_id
 JOIN user_reaches src ON src.id = dst.forked_from_user_reach_id
 JOIN user_profiles sp ON sp.owner_id = src.owner_id AND sp.handle = 'h2oflows'
 ON CONFLICT DO NOTHING;
+
+-- ── 3. Admin-role seed (single-source-of-truth hardening) ───────────────────
+-- The admin console reads/writes user_roles only; the Supabase JWT
+-- app_metadata.role check remains break-glass bootstrap. Ensure the primary
+-- admin holds explicit site_admin + data_admin rows so the UI reflects
+-- reality. Idempotent; no-op where the handle doesn't exist.
+INSERT INTO user_roles (user_id, role)
+SELECT owner_id, r.role
+FROM user_profiles, (VALUES ('site_admin'), ('data_admin')) AS r(role)
+WHERE handle = 'iankco'
+ON CONFLICT DO NOTHING;
