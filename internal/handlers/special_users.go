@@ -557,7 +557,8 @@ func (h *AdminHandler) ListDirectoryUsers(w http.ResponseWriter, r *http.Request
 			) AS roles
 		FROM user_profiles up
 		LEFT JOIN user_api_access a ON a.owner_id = up.owner_id
-		WHERE ($1 = '' OR up.handle ILIKE $2 OR up.display_name ILIKE $2)
+		WHERE NOT up.is_special
+		  AND ($1 = '' OR up.handle ILIKE $2 OR up.display_name ILIKE $2)
 		ORDER BY up.created_at DESC
 		LIMIT $3 OFFSET $4
 	`, q, pattern, limit, offset)
