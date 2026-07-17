@@ -209,10 +209,13 @@ func (h *AdminHandler) CreateSpecialUser(w http.ResponseWriter, r *http.Request)
 			RequestsPerMinute: specialRequestsPerMinute, ConcurrentJobs: specialConcurrentJobs,
 		},
 	}
-	jsonResponse(w, http.StatusCreated, map[string]any{
-		"special_user": su,
-		"api_key":      fullKey,
-	})
+	// Flattened response per the web contract: SpecialUser fields inline plus
+	// api_key (shown once). The earlier nested {special_user, api_key} shape
+	// broke the client, which appends this response to its list directly.
+	jsonResponse(w, http.StatusCreated, struct {
+		SpecialUser
+		APIKey string `json:"api_key"`
+	}{su, fullKey})
 }
 
 // UpdateSpecialUser handles PATCH /api/v1/admin/special-users/{ownerId}.
