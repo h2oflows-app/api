@@ -135,3 +135,15 @@ func FetchCenterlinePreview(ctx context.Context, upComID, downComID string) (str
 	}
 	return cl.GeoJSON, nil
 }
+
+// FetchCenterlineFromPoints snaps put-in + take-out to NHD, walks the
+// downstream mainstem between them, and returns the untrimmed GeoJSON LineString
+// plus the resolved up/down ComIDs. Callers should trim to the exact pins via PostGIS.
+// Used by the #155 run-upload endpoint when the client supplies no ComID hints.
+func FetchCenterlineFromPoints(ctx context.Context, putInLon, putInLat, takeOutLon, takeOutLat float64) (geojson, upComID, downComID string, err error) {
+	cl, err := fetchNLDIRiverLine(ctx, putInLon, putInLat, takeOutLon, takeOutLat)
+	if err != nil {
+		return "", "", "", err
+	}
+	return cl.GeoJSON, cl.PutInComID, cl.TakeOutComID, nil
+}

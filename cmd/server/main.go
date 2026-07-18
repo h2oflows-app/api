@@ -45,7 +45,7 @@ func main() {
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins: []string{"http://localhost:3000", "https://h2oflows.app", "https://*.h2oflows.app", "https://*.netlify.app"},
 		AllowedMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowedHeaders: []string{"Accept", "Authorization", "Content-Type"},
+		AllowedHeaders: []string{"Accept", "Authorization", "Content-Type", "X-API-Key"},
 		MaxAge:         300,
 	}))
 
@@ -247,6 +247,14 @@ func main() {
 		r.Get("/me/runs/{slug}/reports", reports.ListByUserReach)
 		r.Get("/me/runs/{slug}/flow-proposals", flowProposals.ListForOwnRun)
 		r.Post("/me/runs/{slug}/flow-proposals", flowProposals.UpsertForOwnRun)
+
+		// #155: authenticated public run-upload — API-key auth (X-API-Key), not JWT.
+		r.Group(func(r chi.Router) {
+			r.Use(auth.APIKey(pool))
+			r.Post("/upload/runs", userReaches.UploadRuns)
+			r.Patch("/upload/runs/{slug}", userReaches.UploadUpdate)
+		})
+
 		r.Post("/flow-proposals/{proposalId}/vote", flowProposals.ToggleVote)
 		r.Get("/user-runs/{runId}/flow-proposals", flowProposals.ListByRunID)
 		r.Post("/user-runs/{runId}/flow-proposals", flowProposals.UpsertByRunID)
