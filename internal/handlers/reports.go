@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
+	"github.com/h2oflow/h2oflow/apps/api/internal/flow"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -124,82 +125,10 @@ func (h *ReportHandler) ensureProfile(ctx context.Context, ownerID, email string
 }
 
 // ── Flow band helpers ─────────────────────────────────────────────────────────
-
-// bandLabelForCFS applies V9 logic: highest threshold where cfs >= value; else base_label.
-func bandLabelForCFS(cfs float64, baseLabel string, thresholds []FlowBandThreshold) *string {
-	best := ""
-	bestVal := -1.0
-	for _, t := range thresholds {
-		if cfs >= t.Value && t.Value > bestVal {
-			best = t.Label
-			bestVal = t.Value
-		}
-	}
-	if best == "" {
-		best = baseLabel
-	}
-	s := best
-	return &s
-}
-
-// stampCFSAndBand queries the gauge reading nearest to `at` for the user_reach's
-// primary gauge, then derives the flow band from user_reach_flow_ranges.
-// runs-unify 5a: userReachID is a user_reaches.id (sentinel-owned twin).
-func (h *ReportHandler) stampCFSAndBand(ctx context.Context, userReachID string, at time.Time) (*float64, *string) {
-	var cfs float64
-	err := h.db.QueryRow(ctx, `
-		SELECT gr.value
-		FROM user_reaches ur
-		JOIN gauge_readings gr ON gr.gauge_id = ur.primary_gauge_id
-		WHERE ur.id = $1 AND ur.primary_gauge_id IS NOT NULL
-		ORDER BY ABS(EXTRACT(EPOCH FROM (gr.timestamp - $2::TIMESTAMPTZ))) ASC
-		LIMIT 1
-	`, userReachID, at).Scan(&cfs)
-	if err != nil {
-		return nil, nil
-	}
-
-	var baseLabel string
-	_ = h.db.QueryRow(ctx, `SELECT base_label FROM user_reaches WHERE id = $1`, userReachID).Scan(&baseLabel)
-	if baseLabel == "" {
-		return &cfs, nil
-	}
-
-	frRows, err := h.db.Query(ctx,
-		`SELECT value, label FROM user_reach_flow_ranges WHERE user_reach_id = $1 ORDER BY value ASC`, userReachID,
-	)
-	if err != nil {
-		return &cfs, nil
-	}
-	defer frRows.Close()
-
-	var thresholds []FlowBandThreshold
-	for frRows.Next() {
-		var t FlowBandThreshold
-		if frRows.Scan(&t.Value, &t.Label) == nil {
-			thresholds = append(thresholds, t)
-		}
-	}
-
-	band := bandLabelForCFS(cfs, baseLabel, thresholds)
-	return &cfs, band
-}
-
-// reportObservedAt converts report_date + optional report_time to UTC.
-// Defaults to noon UTC when time is absent.
-func reportObservedAt(date, timeStr string) time.Time {
-	if timeStr != "" {
-		t, err := time.Parse("2006-01-02 15:04", date+" "+timeStr)
-		if err == nil {
-			return t.UTC()
-		}
-	}
-	d, err := time.Parse("2006-01-02", date)
-	if err != nil {
-		return time.Now().UTC()
-	}
-	return time.Date(d.Year(), d.Month(), d.Day(), 12, 0, 0, 0, time.UTC)
-}
+//
+// bandLabelForCFS / stampCFSAndBand / reportObservedAt were extracted to
+// internal/flow (issue #246 A1) as flow.BandLabelForCFS / flow.StampCFSAndBand
+// / flow.ObservedAt — see that package for the current implementation.
 
 // uniqueSlug appends -2, -3, … until the (ownerID, slug) pair is free.
 func (h *ReportHandler) uniqueSlug(ctx context.Context, ownerID, base string) string {
@@ -282,8 +211,8 @@ func (h *ReportHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 	reportSlug = h.uniqueSlug(ctx, ownerID, reportSlug)
 
-	at := reportObservedAt(body.ReportDate, body.ReportTime)
-	cfs, band := h.stampCFSAndBand(ctx, userReachID, at)
+	at := flow.ObservedAt(body.ReportDate, body.ReportTime)
+	cfs, band := flow.StampCFSAndBand(ctx, h.db, userReachID, at)
 
 	var reportTimeVal *string
 	if body.ReportTime != "" {
@@ -957,16 +886,27 @@ func (h *ReportHandler) CreateForUserReach(w http.ResponseWriter, r *http.Reques
 		reportTimeVal = &body.ReportTime
 	}
 
+	// #246 A1 fix: stamp flow like Create does — this endpoint previously
+	// inserted without flow_cfs/flow_band, leaving user-run reports blank.
+	// ClampReportBand guards the INSERT: BandLabelForCFS can return free-text
+	// labels (reach author's base_label / flow-range labels) outside the
+	// live reports_flow_band_check CHECK ('low','running','high'); rather
+	// than 500 on an out-of-set label we store the cfs reading with a NULL
+	// band.
+	at := flow.ObservedAt(body.ReportDate, body.ReportTime)
+	cfs, band := flow.StampCFSAndBand(ctx, h.db, userReachID, at)
+	band = flow.ClampReportBand(band)
+
 	var id string
 	err = h.db.QueryRow(ctx, `
 		INSERT INTO reports
 			(owner_id, slug, user_reach_id, name, report_date, report_time,
-			 content, paddled)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+			 content, paddled, flow_cfs, flow_band)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
 		RETURNING id
 	`,
 		ownerID, reportSlug, userReachID, body.Name, body.ReportDate, reportTimeVal,
-		body.Content, body.Paddled,
+		body.Content, body.Paddled, cfs, band,
 	).Scan(&id)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("create failed: %v", err))
