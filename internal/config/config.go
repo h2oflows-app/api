@@ -23,6 +23,8 @@ type Config struct {
 	USGSPollInterval string
 	DWRPollInterval  string
 	MigrationsPath   string
+	ResendAPIKey     string // #246 A4: unset -> invite emails degrade to mail.NoopMailer (logs instead of sending)
+	MailFrom         string // #246 A4: RFC 5322 From header, e.g. "H2OFlows <trips@h2oflows.app>" — must be set together with ResendAPIKey
 }
 
 func Load() Config {
@@ -42,6 +44,8 @@ func Load() Config {
 		USGSPollInterval: env("USGS_POLL_INTERVAL", "15m"),
 		DWRPollInterval:  env("DWR_POLL_INTERVAL", "15m"),
 		MigrationsPath:   env("MIGRATIONS_PATH", "migrations"),
+		ResendAPIKey:     env("RESEND_API_KEY", ""),
+		MailFrom:         env("MAIL_FROM", ""),
 	}
 }
 

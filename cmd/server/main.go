@@ -22,6 +22,7 @@ import (
 	"github.com/h2oflow/h2oflow/apps/api/internal/db"
 	gauge "github.com/h2oflow/h2oflow/apps/api/internal/gaugecore"
 	"github.com/h2oflow/h2oflow/apps/api/internal/handlers"
+	"github.com/h2oflow/h2oflow/apps/api/internal/mail"
 	"github.com/h2oflow/h2oflow/apps/api/internal/poller"
 )
 
@@ -83,6 +84,16 @@ func main() {
 		describer = ai.NewTripDescriber(pool, cfg.AnthropicAPIKey)
 	}
 
+	// #246 A4: invite email — degrades to NoopMailer (logs instead of
+	// sending) when RESEND_API_KEY is unset, same nil/degrade shape as the
+	// ai.* clients above.
+	var mailer mail.Mailer = mail.NoopMailer{}
+	if cfg.ResendAPIKey != "" {
+		mailer = mail.NewResendMailer(cfg.ResendAPIKey, cfg.MailFrom)
+	} else {
+		log.Println("RESEND_API_KEY not set — invite emails disabled (logging instead)")
+	}
+
 	// Supabase JWT verifier — optional. When unset, all requests stay anonymous
 	// and the existing device_id flow continues to work unchanged.
 	var verifier *auth.Verifier
@@ -124,7 +135,8 @@ func main() {
 	meGauges := handlers.NewUserGaugesHandler(pool, devFallbackID).WithPoller(p)
 	userProfiles := handlers.NewUserProfileHandler(pool)
 	moderation := handlers.NewModerationHandler(pool, devFallbackID)
-	plans := handlers.NewPlanHandler(pool, devFallbackID)
+	plans := handlers.NewPlanHandler(pool, devFallbackID).WithMailer(mailer)
+	invites := handlers.NewInviteHandler(pool, devFallbackID, mailer)
 	discover := handlers.NewDiscoverHandler(pool)
 	preferences := handlers.NewPreferencesHandler(pool, devFallbackID)
 	profile := handlers.NewProfileHandler(pool, devFallbackID)
@@ -176,6 +188,9 @@ func main() {
 		r.Post("/ask", reaches.GlobalAsk)
 		r.Get("/stats", reaches.Stats)
 		r.Get("/discover/runs", discover.ListRuns)
+		// #246 A4: public crew-call browse — anon OK, gated by the plan's
+		// own visibility+looking_for_crew (contract decision #7).
+		r.Get("/discover/plans", discover.ListPlans)
 		r.Get("/admin/slug-check", admin.SlugCheck)
 		// NLDI upstream-tributaries is public — run detail page needs it without auth.
 		r.Get("/nldi/upstream-tributaries", nldiH.UpstreamTributaries)
@@ -294,9 +309,20 @@ func main() {
 		r.Patch("/plan-runs/{id}", plans.UpdateRun)
 		r.Delete("/plan-runs/{id}", plans.DeleteRun)
 		r.Post("/plan-runs/{id}/flag", moderation.FlagPlanRun)
+		r.Post("/plan-runs/{id}/log-mine", plans.LogMine)
 
 		r.Get("/me/calendar", plans.Calendar)
 		r.Get("/me/calendar/day", plans.CalendarDay)
+
+		// #246 A4: invites + crew (plan_members) + mail/.ics.
+		r.Post("/plans/{id}/invite", invites.InviteToPlan)
+		r.Get("/me/invites", invites.MyInvites)
+		r.Post("/invites/{memberId}/accept", invites.AcceptInvite)
+		r.Post("/invites/{memberId}/dismiss", invites.DismissInvite)
+		r.Post("/plans/{id}/join", invites.JoinPlan)
+		r.Get("/plans/{id}/crew", invites.CrewList)
+		r.Post("/plans/{id}/crew/{memberId}/accept", invites.CrewAccept)
+		r.Post("/plans/{id}/crew/{memberId}/decline", invites.CrewDecline)
 
 		// Custom gauges — private to owner, auth gated via ownerID() + devFallbackID.
 		r.Get("/me/custom-gauges", customGauges.List)

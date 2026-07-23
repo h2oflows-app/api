@@ -161,3 +161,153 @@ func (h *DiscoverHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 		"next_offset": offset + len(items),
 	})
 }
+
+// ── GET /discover/plans (#246 A4) ──────────────────────────────────────────
+
+type discoverPlanRun struct {
+	UserReachID *string  `json:"user_reach_id,omitempty"`
+	Name        *string  `json:"name,omitempty"`
+	ClassMin    *float64 `json:"class_min,omitempty"`
+	ClassMax    *float64 `json:"class_max,omitempty"`
+	FlowBand    *string  `json:"flow_band,omitempty"`
+	FlowColor   *string  `json:"flow_color,omitempty"`
+	GaugeCFS    *float64 `json:"gauge_cfs,omitempty"`
+}
+
+type discoverPlan struct {
+	ID         string            `json:"id"`
+	Slug       string            `json:"slug"`
+	Name       string            `json:"name"`
+	Type       string            `json:"type"`
+	HostHandle string            `json:"host_handle"`
+	Location   *string           `json:"location,omitempty"`
+	StartDate  string            `json:"start_date"`
+	EndDate    string            `json:"end_date"`
+	RunCount   int               `json:"run_count"`
+	Run        *discoverPlanRun  `json:"run,omitempty"`
+	Crew       discoverCrewMeter `json:"crew"`
+}
+
+type discoverCrewMeter struct {
+	Filled int  `json:"filled"`
+	Max    *int `json:"max"`
+}
+
+// ListPlans handles GET /api/v1/discover/plans — public crew-call browse,
+// anon OK (contract decision #7: gated by the plan's own visibility +
+// looking_for_crew, no anonPublicOnMapFilter/public_on_map owner gate — this
+// intentionally diverges from ListRuns above).
+// Params: q, min_class, max_class, location, limit, offset.
+func (h *DiscoverHandler) ListPlans(w http.ResponseWriter, r *http.Request) {
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	location := strings.TrimSpace(r.URL.Query().Get("location"))
+
+	var minClass *float64
+	if v := r.URL.Query().Get("min_class"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			minClass = &f
+		}
+	}
+	var maxClass *float64
+	if v := r.URL.Query().Get("max_class"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			maxClass = &f
+		}
+	}
+
+	limit := 20
+	if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && l > 0 && l <= 50 {
+		limit = l
+	}
+	offset := 0
+	if o, err := strconv.Atoi(r.URL.Query().Get("offset")); err == nil && o >= 0 {
+		offset = o
+	}
+
+	query := `
+		SELECT
+			p.id, p.slug, p.name, p.type::text,
+			COALESCE(up.handle, 'h2oflows')   AS host_handle,
+			p.location, p.start_date::text, p.end_date::text,
+			COALESCE(rc.run_count, 0)         AS run_count,
+			fr.user_reach_id::text, fr.name, fr.class_min, fr.class_max,
+			fr.flow_band, fr.flow_color, fr.gauge_cfs,
+			COALESCE(cm.filled, 0)            AS crew_filled,
+			p.max_crew
+		FROM plans p
+		LEFT JOIN user_profiles up ON up.owner_id = p.owner_id
+		LEFT JOIN LATERAL (
+			SELECT COUNT(*) AS run_count
+			FROM plan_runs pr2
+			WHERE pr2.plan_id = p.id AND pr2.deleted_at IS NULL
+		) rc ON true
+		LEFT JOIN LATERAL (
+			-- earliest upcoming run (run_date >= today), else the earliest
+			-- run overall — contract: "first upcoming run summary".
+			SELECT pr.user_reach_id, ur.name, ur.class_min, ur.class_max,
+			       pr.flow_band, pr.flow_color, pr.gauge_cfs
+			FROM plan_runs pr
+			LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
+			WHERE pr.plan_id = p.id AND pr.deleted_at IS NULL
+			ORDER BY (pr.run_date < CURRENT_DATE), pr.run_date ASC
+			LIMIT 1
+		) fr ON true
+		LEFT JOIN LATERAL (
+			SELECT COUNT(*) AS filled FROM plan_members pm
+			WHERE pm.plan_id = p.id AND pm.status = 'accepted'
+		) cm ON true
+		WHERE p.visibility = 'public' AND p.looking_for_crew AND p.deleted_at IS NULL
+		  -- Anon callers have no tz (no user_calendar_prefs row to resolve);
+		  -- plain CURRENT_DATE is used here deliberately rather than
+		  -- userToday(), unlike every authed date guard elsewhere in this
+		  -- package — worst case a plan lingers in (or drops out of) the
+		  -- feed a few hours off local midnight, which is acceptable for a
+		  -- public browse list (contract §4).
+		  AND p.end_date >= CURRENT_DATE
+		  AND ($1 = '' OR p.name ILIKE '%' || $1 || '%' OR COALESCE(p.location, '') ILIKE '%' || $1 || '%')
+		  AND ($2::float8 IS NULL OR fr.class_max >= $2)
+		  AND ($3::float8 IS NULL OR fr.class_min <= $3)
+		  AND ($4 = '' OR COALESCE(p.location, '') ILIKE '%' || $4 || '%')
+		ORDER BY p.start_date ASC
+		LIMIT $5 OFFSET $6
+	`
+	rows, err := h.db.Query(r.Context(), query, q, minClass, maxClass, location, limit+1, offset)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "query failed")
+		return
+	}
+	defer rows.Close()
+
+	items := make([]discoverPlan, 0)
+	for rows.Next() {
+		var dp discoverPlan
+		var run discoverPlanRun
+		if err := rows.Scan(
+			&dp.ID, &dp.Slug, &dp.Name, &dp.Type,
+			&dp.HostHandle,
+			&dp.Location, &dp.StartDate, &dp.EndDate,
+			&dp.RunCount,
+			&run.UserReachID, &run.Name, &run.ClassMin, &run.ClassMax,
+			&run.FlowBand, &run.FlowColor, &run.GaugeCFS,
+			&dp.Crew.Filled,
+			&dp.Crew.Max,
+		); err != nil {
+			continue
+		}
+		if run.UserReachID != nil {
+			dp.Run = &run
+		}
+		items = append(items, dp)
+	}
+
+	hasMore := len(items) > limit
+	if hasMore {
+		items = items[:limit]
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"items":       items,
+		"has_more":    hasMore,
+		"next_offset": offset + len(items),
+	})
+}
