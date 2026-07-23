@@ -23,10 +23,27 @@ type Queryer interface {
 // Threshold is a single CFS threshold in the flexible band model: the band
 // applies when cfs >= Value. Deliberately shape-compatible with (but
 // independent of) handlers.FlowBandThreshold — this package must not import
-// internal/handlers.
+// internal/handlers. Color is populated only by the StampFull path (#246
+// A3) — BandLabelForCFS/StampCFSAndBand callers leave it zero-valued.
 type Threshold struct {
 	Value float64
 	Label string
+	Color string
+}
+
+// StampResult is the full flow snapshot captured by StampFull: the cfs
+// reading, derived band label, resolved swatch color (the matched
+// user_reach_flow_ranges row's "p<n>" palette-index color — see
+// feedback_flowbands_validator_palette_index.md — or user_reaches.base_color
+// when cfs falls below every threshold), and which `gauges` row (if any) the
+// reading was sourced from. plan_runs.gauge_id is a real FK into `gauges`,
+// so a custom-gauge-sourced snapshot leaves GaugeID nil — there is nothing
+// for the FK to point at.
+type StampResult struct {
+	CFS     *float64
+	Band    *string
+	Color   *string
+	GaugeID *string
 }
 
 // allowedReportBands is the set of flow_band values the live `reports` table
@@ -130,6 +147,86 @@ func StampCFSAndBand(ctx context.Context, db Queryer, userReachID string, at tim
 
 	band := BandLabelForCFS(cfs, baseLabel, thresholds)
 	return &cfs, band
+}
+
+// BandAndColorForCFS is BandLabelForCFS extended to also resolve the matched
+// threshold's color (or baseColor when cfs falls below every threshold, same
+// "V9 logic" fallback).
+func BandAndColorForCFS(cfs float64, baseLabel, baseColor string, thresholds []Threshold) (string, string) {
+	bestLabel, bestColor := baseLabel, baseColor
+	bestVal := -1.0
+	for _, t := range thresholds {
+		if cfs >= t.Value && t.Value > bestVal {
+			bestLabel, bestColor = t.Label, t.Color
+			bestVal = t.Value
+		}
+	}
+	return bestLabel, bestColor
+}
+
+// StampFull is StampCFSAndBand extended for plan_runs (#246 A3): it also
+// resolves flow_color and reports which gauge (if any, and only when it's a
+// real `gauges` row) the reading came from, so callers can stamp
+// plan_runs.gauge_id. Mirrors StampCFSAndBand's reading-lookup/fallback
+// shape (primary gauge nearest-reading, else custom-gauge live snapshot).
+func StampFull(ctx context.Context, db Queryer, userReachID string, at time.Time) StampResult {
+	var primaryGaugeID *string
+	var baseLabel, baseColor string
+	if err := db.QueryRow(ctx,
+		`SELECT primary_gauge_id::text, base_label, base_color FROM user_reaches WHERE id = $1`,
+		userReachID,
+	).Scan(&primaryGaugeID, &baseLabel, &baseColor); err != nil {
+		return StampResult{}
+	}
+
+	var cfs float64
+	var gaugeID *string
+	if primaryGaugeID != nil {
+		if err := db.QueryRow(ctx, `
+			SELECT gr.value
+			FROM gauge_readings gr
+			WHERE gr.gauge_id = $1
+			ORDER BY ABS(EXTRACT(EPOCH FROM (gr.timestamp - $2::TIMESTAMPTZ))) ASC
+			LIMIT 1
+		`, *primaryGaugeID, at).Scan(&cfs); err == nil {
+			gaugeID = primaryGaugeID
+		}
+	}
+	if gaugeID == nil {
+		if err := db.QueryRow(ctx, `
+			SELECT cg.last_value_cfs
+			FROM user_reaches ur
+			JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
+			WHERE ur.id = $1 AND ur.custom_gauge_id IS NOT NULL AND cg.last_value_cfs IS NOT NULL
+		`, userReachID).Scan(&cfs); err != nil {
+			return StampResult{}
+		}
+	}
+
+	if baseLabel == "" {
+		return StampResult{CFS: &cfs, GaugeID: gaugeID}
+	}
+
+	rows, err := db.Query(ctx,
+		`SELECT value, label, color FROM user_reach_flow_ranges WHERE user_reach_id = $1 ORDER BY value ASC`,
+		userReachID,
+	)
+	if err != nil {
+		band, color := baseLabel, baseColor
+		return StampResult{CFS: &cfs, Band: &band, Color: &color, GaugeID: gaugeID}
+	}
+	defer rows.Close()
+
+	var thresholds []Threshold
+	for rows.Next() {
+		var t Threshold
+		if rows.Scan(&t.Value, &t.Label, &t.Color) == nil {
+			thresholds = append(thresholds, t)
+		}
+	}
+
+	band, color := BandAndColorForCFS(cfs, baseLabel, baseColor, thresholds)
+	return StampResult{CFS: &cfs, Band: &band, Color: &color, GaugeID: gaugeID}
 }
 
 // ObservedAt converts a date + optional time string to UTC. Defaults to noon

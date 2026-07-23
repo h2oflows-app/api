@@ -136,6 +136,77 @@ func (h *ModerationHandler) FlagReport(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusCreated, map[string]string{"id": flagID, "status": "flagged"})
 }
 
+// ── POST /api/v1/plan-runs/{id}/flag ─────────────────────────────────────────
+
+func (h *ModerationHandler) FlagPlanRun(w http.ResponseWriter, r *http.Request) {
+	planRunID := chi.URLParam(r, "id")
+
+	reporterID, ok := h.reporterID(r)
+	if !ok {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	var body struct {
+		Reason string `json:"reason"`
+		Note   string `json:"note"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		errorResponse(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if body.Reason == "" {
+		body.Reason = "inappropriate"
+	}
+
+	ctx := r.Context()
+
+	// Gate on plan visibility (not just parent deleted_at) so a private plan's
+	// plan_run UUID isn't an existence oracle for non-members: 404 unless the
+	// plan is public, or the reporter is the host or an accepted/invited
+	// member — mirrors renderPlan's visibility check (plans.go) and FlagRun's
+	// public gate above.
+	var exists bool
+	if err := h.db.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM plan_runs pr
+			JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
+			WHERE pr.id = $1 AND pr.deleted_at IS NULL
+			  AND (
+			    p.visibility = 'public'
+			    OR p.owner_id = $2
+			    OR EXISTS(
+			      SELECT 1 FROM plan_members pm
+			      WHERE pm.plan_id = p.id AND pm.member_owner_id = $2
+			        AND pm.status IN ('invited','accepted')
+			    )
+			  )
+		)
+	`, planRunID, reporterID).Scan(&exists); err != nil || !exists {
+		errorResponse(w, http.StatusNotFound, "plan run not found")
+		return
+	}
+
+	var flagID string
+	var noteVal *string
+	if body.Note != "" {
+		noteVal = &body.Note
+	}
+	err := h.db.QueryRow(ctx, `
+		INSERT INTO abuse_flags (target_type, target_id, reporter_id, reason, note)
+		VALUES ('plan_run', $1, $2, $3, $4)
+		ON CONFLICT (target_type, target_id, reporter_id) DO UPDATE
+			SET reason = EXCLUDED.reason, note = EXCLUDED.note
+		RETURNING id
+	`, planRunID, reporterID, body.Reason, noteVal).Scan(&flagID)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("flag failed: %v", err))
+		return
+	}
+
+	jsonResponse(w, http.StatusCreated, map[string]string{"id": flagID, "status": "flagged"})
+}
+
 // ── GET /admin/moderation/queue ───────────────────────────────────────────────
 
 func (h *ModerationHandler) Queue(w http.ResponseWriter, r *http.Request) {
@@ -151,12 +222,18 @@ func (h *ModerationHandler) Queue(w http.ResponseWriter, r *http.Request) {
 					THEN (SELECT ur.name FROM user_reaches ur WHERE ur.id = af.target_id)
 				WHEN af.target_type = 'report'
 					THEN (SELECT rp.name FROM reports rp WHERE rp.id = af.target_id)
+				WHEN af.target_type = 'plan_run'
+					THEN (SELECT p.name || ' — ' || pr.run_date::text
+					      FROM plan_runs pr JOIN plans p ON p.id = pr.plan_id
+					      WHERE pr.id = af.target_id)
 			END AS target_name,
 			CASE
 				WHEN af.target_type = 'run'
 					THEN (SELECT ur.slug FROM user_reaches ur WHERE ur.id = af.target_id)
 				WHEN af.target_type = 'report'
 					THEN (SELECT rp.slug FROM reports rp WHERE rp.id = af.target_id)
+				WHEN af.target_type = 'plan_run'
+					THEN (SELECT pr.slug FROM plan_runs pr WHERE pr.id = af.target_id)
 			END AS target_slug
 		FROM abuse_flags af
 		LEFT JOIN user_profiles up ON up.owner_id = af.reporter_id
@@ -256,6 +333,9 @@ func (h *ModerationHandler) Action(w http.ResponseWriter, r *http.Request) {
 	case "report":
 		_, deleteErr = h.db.Exec(ctx,
 			`UPDATE reports SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL`, targetID)
+	case "plan_run":
+		_, deleteErr = h.db.Exec(ctx,
+			`UPDATE plan_runs SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL`, targetID)
 	default:
 		errorResponse(w, http.StatusBadRequest, "unknown target type")
 		return

@@ -124,6 +124,7 @@ func main() {
 	meGauges := handlers.NewUserGaugesHandler(pool, devFallbackID).WithPoller(p)
 	userProfiles := handlers.NewUserProfileHandler(pool)
 	moderation := handlers.NewModerationHandler(pool, devFallbackID)
+	plans := handlers.NewPlanHandler(pool, devFallbackID)
 	discover := handlers.NewDiscoverHandler(pool)
 	preferences := handlers.NewPreferencesHandler(pool, devFallbackID)
 	profile := handlers.NewProfileHandler(pool, devFallbackID)
@@ -277,6 +278,25 @@ func main() {
 		r.Post("/user-runs/{runId}/flag", moderation.FlagRun)
 		r.Post("/reports/{reportId}/flag", moderation.FlagReport)
 		r.Post("/me/river-corrections", corrections.CreateRiverCorrection)
+
+		// #246 A3: Trip Calendar — plans + calendar runs + /me/calendar.
+		// Auth optional here; handlers self-gate via ownerID(), same as
+		// reports/dashboards/etc. Public plans are anon-readable.
+		r.Post("/plans", plans.Create)
+		r.Get("/plans/{handle}/{slug}", plans.GetByHandleSlug)
+		r.Get("/plans/{id}", plans.GetByID)
+		r.Get("/me/plans", plans.ListMine)
+		r.Patch("/plans/{id}", plans.Update)
+		r.Delete("/plans/{id}", plans.Delete)
+
+		r.Post("/plans/{id}/runs", plans.CreateRun)
+		r.Get("/plan-runs/{param}", plans.GetRun)
+		r.Patch("/plan-runs/{id}", plans.UpdateRun)
+		r.Delete("/plan-runs/{id}", plans.DeleteRun)
+		r.Post("/plan-runs/{id}/flag", moderation.FlagPlanRun)
+
+		r.Get("/me/calendar", plans.Calendar)
+		r.Get("/me/calendar/day", plans.CalendarDay)
 
 		// Custom gauges — private to owner, auth gated via ownerID() + devFallbackID.
 		r.Get("/me/custom-gauges", customGauges.List)
