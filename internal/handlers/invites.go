@@ -18,6 +18,7 @@ import (
 	"github.com/h2oflow/h2oflow/apps/api/internal/ics"
 	"github.com/h2oflow/h2oflow/apps/api/internal/mail"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -437,11 +438,11 @@ func (h *InviteHandler) AcceptInvite(w http.ResponseWriter, r *http.Request) {
 	email, _ := auth.EmailFromContext(ctx)
 
 	var curMemberOwnerID, curEmail, curTokenHash *string
-	var status string
+	var status, planID string
 	if err := h.db.QueryRow(ctx, `
-		SELECT member_owner_id, invite_email, invite_token_hash, status::text
+		SELECT member_owner_id, invite_email, invite_token_hash, status::text, plan_id::text
 		FROM plan_members WHERE id = $1::uuid AND origin = 'invite'
-	`, memberID).Scan(&curMemberOwnerID, &curEmail, &curTokenHash, &status); err != nil {
+	`, memberID).Scan(&curMemberOwnerID, &curEmail, &curTokenHash, &status, &planID); err != nil {
 		errorResponse(w, http.StatusNotFound, "invite not found")
 		return
 	}
@@ -470,24 +471,67 @@ func (h *InviteHandler) AcceptInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Serialize against concurrent CrewAccept/JoinPlan/AcceptInvite on the
+	// same plan and recheck filled<max_crew inside the lock — invites count
+	// against the cap same as crew requests (contract: max_crew caps total
+	// accepted paddlers regardless of origin, see CrewList/CrewAccept).
+	tx, err := h.db.Begin(ctx)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "tx failed")
+		return
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
+
+	var maxCrew *int
+	if err := tx.QueryRow(ctx,
+		`SELECT max_crew FROM plans WHERE id = $1::uuid AND deleted_at IS NULL FOR UPDATE`, planID,
+	).Scan(&maxCrew); err != nil {
+		errorResponse(w, http.StatusNotFound, "plan not found")
+		return
+	}
+
+	if status != "accepted" {
+		var filled int
+		tx.QueryRow(ctx, `SELECT COUNT(*) FROM plan_members WHERE plan_id = $1::uuid AND status = 'accepted'`, planID).Scan(&filled)
+		if maxCrew != nil && filled >= *maxCrew {
+			errorResponse(w, http.StatusConflict, "crew is full")
+			return
+		}
+	}
+
 	// Binding member_owner_id is the point an email-token invite becomes a
 	// real member row — accept REQUIRES an account (contract decision #8);
-	// the token is only ever a landing/lookup key.
-	tag, err := h.db.Exec(ctx, `
+	// the token is only ever a landing/lookup key. The member_owner_id guard
+	// in the WHERE clause plus nulling invite_token_hash makes the email
+	// link single-use, so a forwarded/leaked invite link can't reassign an
+	// already-accepted membership away from its current holder.
+	tag, err := tx.Exec(ctx, `
 		UPDATE plan_members
-		SET member_owner_id = $1, status = 'accepted', responded_at = NOW(), updated_at = NOW()
+		SET member_owner_id = $1, status = 'accepted', responded_at = NOW(), updated_at = NOW(), invite_token_hash = NULL
 		WHERE id = $2::uuid AND origin = 'invite' AND status <> 'declined'
+		  AND (member_owner_id IS NULL OR member_owner_id = $1)
 	`, ownerID, memberID)
 	if err != nil {
 		// Binding member_owner_id can collide with plan_members_owner_uk if
 		// the caller is already a member of this plan via a separate row
 		// (e.g. accepted a handle-invite, now also holds an email-invite
-		// link) — surface as 409, not a bare 500.
-		errorResponse(w, http.StatusConflict, "already a member of this plan")
+		// link) — surface as 409. Any other DB error (timeout, connection
+		// drop) is a genuine 500, not a duplicate-membership conflict.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			errorResponse(w, http.StatusConflict, "already a member of this plan")
+		} else {
+			errorResponse(w, http.StatusInternalServerError, "accept failed")
+		}
 		return
 	}
 	if tag.RowsAffected() == 0 {
 		errorResponse(w, http.StatusConflict, "invite cannot be accepted")
+		return
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		errorResponse(w, http.StatusInternalServerError, "commit failed")
 		return
 	}
 	jsonResponse(w, http.StatusOK, map[string]string{"status": "accepted"})
