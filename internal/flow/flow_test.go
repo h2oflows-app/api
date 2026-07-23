@@ -44,16 +44,21 @@ func TestBandLabelForCFS_NoThresholds(t *testing.T) {
 }
 
 func TestClampReportBand(t *testing.T) {
-	low := "low"
-	high := "High" // not in AllowedReportBands (wrong case, and not a threshold-family word)
-
 	if got := ClampReportBand(nil); got != nil {
 		t.Errorf("ClampReportBand(nil) = %v, want nil", got)
 	}
-	if got := ClampReportBand(&low); got == nil || *got != "low" {
-		t.Errorf("ClampReportBand(%q) = %v, want unchanged", low, got)
+	// case-insensitive fold onto the reports CHECK set
+	for in, want := range map[string]string{"low": "low", "Running": "running", "High": "high"} {
+		in := in
+		if got := ClampReportBand(&in); got == nil || *got != want {
+			t.Errorf("ClampReportBand(%q) = %v, want %q", in, got, want)
+		}
 	}
-	if got := ClampReportBand(&high); got != nil {
-		t.Errorf("ClampReportBand(%q) = %v, want nil", high, got)
+	// labels outside the CHECK set clamp to nil
+	for _, in := range []string{"Too Low", "Very High", "Custom Label"} {
+		in := in
+		if got := ClampReportBand(&in); got != nil {
+			t.Errorf("ClampReportBand(%q) = %v, want nil", in, got)
+		}
 	}
 }

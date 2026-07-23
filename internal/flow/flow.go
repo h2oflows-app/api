@@ -7,6 +7,7 @@ package flow
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -28,21 +29,28 @@ type Threshold struct {
 	Label string
 }
 
-// AllowedReportBands is the set of flow_band values the live `reports` table
+// allowedReportBands is the set of flow_band values the live `reports` table
 // CHECK constraint (reports_flow_band_check) accepts. BandLabelForCFS can
 // return arbitrary free-text labels (reach authors set their own base_label
 // and user_reach_flow_ranges.label) — anything outside this set will 500 on
 // INSERT into `reports`. plan_runs.flow_band (issue #246) drops the CHECK
 // entirely, but reports.go is staying live-but-dormant for now, so callers
 // writing to `reports` should run the band through ClampReportBand first.
-var AllowedReportBands = map[string]bool{"low": true, "running": true, "high": true}
+var allowedReportBands = map[string]bool{"low": true, "running": true, "high": true}
 
-// ClampReportBand returns band unchanged when nil or already a value the
-// `reports` table's CHECK constraint accepts; otherwise nil, so the caller
-// stores the cfs reading without a band instead of failing the INSERT.
+// ClampReportBand maps band onto the values the `reports` table's CHECK
+// constraint accepts, comparing case-insensitively so the Title-Case labels
+// the app actually emits ("Running", "High") still stamp. Anything that
+// doesn't fold onto the allowed set ("Too Low", "Very High", custom labels)
+// becomes nil, so the caller stores the cfs reading without a band instead
+// of failing the INSERT.
 func ClampReportBand(band *string) *string {
-	if band == nil || AllowedReportBands[*band] {
-		return band
+	if band == nil {
+		return nil
+	}
+	folded := strings.ToLower(*band)
+	if allowedReportBands[folded] {
+		return &folded
 	}
 	return nil
 }
