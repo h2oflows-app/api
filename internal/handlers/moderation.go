@@ -161,14 +161,28 @@ func (h *ModerationHandler) FlagPlanRun(w http.ResponseWriter, r *http.Request) 
 
 	ctx := r.Context()
 
+	// Gate on plan visibility (not just parent deleted_at) so a private plan's
+	// plan_run UUID isn't an existence oracle for non-members: 404 unless the
+	// plan is public, or the reporter is the host or an accepted/invited
+	// member — mirrors renderPlan's visibility check (plans.go) and FlagRun's
+	// public gate above.
 	var exists bool
 	if err := h.db.QueryRow(ctx, `
 		SELECT EXISTS(
 			SELECT 1 FROM plan_runs pr
 			JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
 			WHERE pr.id = $1 AND pr.deleted_at IS NULL
+			  AND (
+			    p.visibility = 'public'
+			    OR p.owner_id = $2
+			    OR EXISTS(
+			      SELECT 1 FROM plan_members pm
+			      WHERE pm.plan_id = p.id AND pm.member_owner_id = $2
+			        AND pm.status IN ('invited','accepted')
+			    )
+			  )
 		)
-	`, planRunID).Scan(&exists); err != nil || !exists {
+	`, planRunID, reporterID).Scan(&exists); err != nil || !exists {
 		errorResponse(w, http.StatusNotFound, "plan run not found")
 		return
 	}

@@ -320,6 +320,18 @@ func (h *PlanHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
+	// user_profiles must exist before the plans INSERT — plans.owner_id has
+	// a hard FK to user_profiles(owner_id) (mig 000138), unlike reports.owner_id
+	// which has no FK. Ensure the profile row up front rather than after
+	// commit, mirroring reports.go:202, or a first-time user's first trip
+	// 500s on the FK and never reaches ensureHandle at all.
+	email, _ := auth.EmailFromContext(ctx)
+	handle, herr := h.ensureHandle(ctx, ownerID, email)
+	if herr != nil {
+		errorResponse(w, http.StatusInternalServerError, "could not assign user profile")
+		return
+	}
+
 	slugBase := kmlimport.Slugify(name)
 	if slugBase == "" {
 		slugBase = "plan"
@@ -358,14 +370,6 @@ func (h *PlanHandler) Create(w http.ResponseWriter, r *http.Request) {
 	if err := tx.Commit(ctx); err != nil {
 		errorResponse(w, http.StatusInternalServerError, "commit failed")
 		return
-	}
-
-	email, _ := auth.EmailFromContext(ctx)
-	handle, herr := h.ensureHandle(ctx, ownerID, email)
-	if herr != nil {
-		// Plan is already committed — degrade the URL rather than fail
-		// the whole request over a handle-assignment hiccup.
-		handle = ownerID
 	}
 
 	jsonResponse(w, http.StatusCreated, map[string]string{

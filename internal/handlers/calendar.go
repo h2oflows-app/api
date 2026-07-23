@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"net/http"
+	"time"
 )
 
 // ── GET /me/calendar?from=&to=&tz= ────────────────────────────────────────
@@ -36,14 +37,21 @@ func (h *PlanHandler) Calendar(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if tz != "" {
-		// Best-effort — an upsert failure shouldn't block rendering the
-		// calendar; the guard below just keeps using whatever tz (or the
-		// America/Denver default) is already on file.
-		_, _ = h.db.Exec(ctx, `
-			INSERT INTO user_calendar_prefs (owner_id, tz, updated_at)
-			VALUES ($1, $2, NOW())
-			ON CONFLICT (owner_id) DO UPDATE SET tz = EXCLUDED.tz, updated_at = NOW()
-		`, ownerID, tz)
+		// Validate as an IANA zone before persisting — user_calendar_prefs.tz
+		// is a plain TEXT column with no DB-side check, and a bogus value
+		// would 500 every later `AT TIME ZONE tz` in userToday/localNoonUTC
+		// (postgres "time zone not recognized") until overwritten. An
+		// invalid zone is simply ignored rather than upserted.
+		if _, tzErr := time.LoadLocation(tz); tzErr == nil {
+			// Best-effort — an upsert failure shouldn't block rendering the
+			// calendar; the guard below just keeps using whatever tz (or the
+			// America/Denver default) is already on file.
+			_, _ = h.db.Exec(ctx, `
+				INSERT INTO user_calendar_prefs (owner_id, tz, updated_at)
+				VALUES ($1, $2, NOW())
+				ON CONFLICT (owner_id) DO UPDATE SET tz = EXCLUDED.tz, updated_at = NOW()
+			`, ownerID, tz)
+		}
 	}
 
 	type calRun struct {
@@ -100,8 +108,10 @@ func (h *PlanHandler) Calendar(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// plans[] = own plans in range PLUS plans where caller is a plan_members
-	// invitee (origin='invite', status IN invited/accepted). role: own |
-	// member (accepted) | invited. Ordered by column position (2 UNION ALL
+	// member, regardless of how membership was obtained: an invitee
+	// (origin='invite', status IN invited/accepted) or an accepted crew
+	// request (origin='request', status='accepted'). role: own | member
+	// (accepted) | invited. Ordered by column position (2 UNION ALL
 	// branches — ORDER BY name is ambiguous across a union).
 	type calPlan struct {
 		ID           string  `json:"id"`
@@ -128,7 +138,11 @@ func (h *PlanHandler) Calendar(w http.ResponseWriter, r *http.Request) {
 		       pm.status::text AS member_status
 		FROM plan_members pm
 		JOIN plans p ON p.id = pm.plan_id AND p.deleted_at IS NULL
-		WHERE pm.member_owner_id = $1 AND pm.origin = 'invite' AND pm.status IN ('invited','accepted')
+		WHERE pm.member_owner_id = $1
+		  AND (
+		    (pm.origin = 'invite' AND pm.status IN ('invited','accepted'))
+		    OR (pm.origin = 'request' AND pm.status = 'accepted')
+		  )
 		  AND p.start_date <= $3::date AND p.end_date >= $2::date
 		ORDER BY 5
 	`, ownerID, from, to)
