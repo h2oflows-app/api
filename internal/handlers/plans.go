@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
 	"github.com/h2oflow/h2oflow/apps/api/internal/kmlimport"
+	"github.com/h2oflow/h2oflow/apps/api/internal/mail"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -24,10 +25,21 @@ type PlanHandler struct {
 	db            *pgxpool.Pool
 	devFallbackID string
 	rl            *reportRateLimiter // reused: generic (owner,limit,window) limiter — see reports.go
+	mailer        mail.Mailer        // #246 A4: invites[] on POST /plans; defaults to NoopMailer until WithMailer
 }
 
 func NewPlanHandler(db *pgxpool.Pool, devFallbackID string) *PlanHandler {
-	return &PlanHandler{db: db, devFallbackID: devFallbackID, rl: newReportRateLimiter()}
+	return &PlanHandler{db: db, devFallbackID: devFallbackID, rl: newReportRateLimiter(), mailer: mail.NoopMailer{}}
+}
+
+// WithMailer wires the shared Mailer for invites embedded in POST /plans'
+// `invites` array — mirrors the WithPoller()/WithAnthropicKey() wither
+// pattern used by other handlers in main.go.
+func (h *PlanHandler) WithMailer(m mail.Mailer) *PlanHandler {
+	if m != nil {
+		h.mailer = m
+	}
+	return h
 }
 
 func (h *PlanHandler) ownerID(r *http.Request) (string, bool) {
@@ -262,10 +274,7 @@ func (h *PlanHandler) Create(w http.ResponseWriter, r *http.Request) {
 		LookingForCrew *bool               `json:"looking_for_crew"`
 		MaxCrew        *int                `json:"max_crew"`
 		Runs           []createPlanRunBody `json:"runs"`
-		// TODO(A4): invite machinery (email/handle invites + .ics) lands in
-		// the next PR — accepted here so old-client bodies don't 400, but
-		// silently ignored.
-		Invites json.RawMessage `json:"invites"`
+		Invites        []inviteBody        `json:"invites"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid JSON")
@@ -367,9 +376,40 @@ func (h *PlanHandler) Create(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// invites[] reuses the same inviteOne code path as the standalone POST
+	// /plans/{id}/invite (internal/handlers/invites.go) — run inside this
+	// same tx so a failed invite rolls back the whole plan create. Any email
+	// sends are collected and fired AFTER commit (task 6: "email sends fire
+	// after commit, not inside the tx").
+	var pendingMails []pendingInviteMail
+	if len(body.Invites) > 0 {
+		loc := ""
+		if body.Location != nil {
+			loc = *body.Location
+		}
+		planInfo := invitedPlanInfo{
+			ID: planID, Slug: slug, Name: name, Location: loc,
+			StartDate: body.StartDate, EndDate: body.EndDate, HostHandle: handle,
+		}
+		for _, ib := range body.Invites {
+			_, pending, ierr := inviteOne(ctx, tx, planInfo, ownerID, ib)
+			if ierr != nil {
+				h.respondAPIError(w, ierr)
+				return
+			}
+			if pending != nil {
+				pendingMails = append(pendingMails, *pending)
+			}
+		}
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		errorResponse(w, http.StatusInternalServerError, "commit failed")
 		return
+	}
+
+	for _, p := range pendingMails {
+		go sendInviteMail(h.mailer, p)
 	}
 
 	jsonResponse(w, http.StatusCreated, map[string]string{
@@ -701,6 +741,28 @@ func (h *PlanHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if newLookingForCrew && (newMaxCrew == nil || *newMaxCrew <= 0) {
 		errorResponse(w, http.StatusBadRequest, "max_crew is required (and must be > 0) when looking_for_crew is true")
 		return
+	}
+
+	// #246 A4 carry-over fix: shrinking [start_date,end_date] must not stray
+	// from a live child plan_run's run_date — orphaning a scheduled run
+	// outside its own plan's dates silently breaks validateRunDateInRange's
+	// invariant everywhere else. 422, not a silent clamp.
+	if body.StartDate != nil || body.EndDate != nil {
+		var outOfRange bool
+		if err := h.db.QueryRow(ctx, `
+			SELECT EXISTS(
+				SELECT 1 FROM plan_runs
+				WHERE plan_id = $1::uuid AND deleted_at IS NULL
+				  AND (run_date < $2::date OR run_date > $3::date)
+			)
+		`, id, newStart, newEnd).Scan(&outOfRange); err != nil {
+			errorResponse(w, http.StatusInternalServerError, "date-range check failed")
+			return
+		}
+		if outOfRange {
+			errorResponse(w, http.StatusUnprocessableEntity, "cannot shrink plan dates: one or more scheduled runs fall outside the new range")
+			return
+		}
 	}
 
 	_, err = h.db.Exec(ctx, `

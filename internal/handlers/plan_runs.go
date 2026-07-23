@@ -3,12 +3,15 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
 	"github.com/h2oflow/h2oflow/apps/api/internal/flow"
+	"github.com/jackc/pgx/v5"
 )
 
 // createPlanRunBody is the shared request shape for a calendar run, used
@@ -388,8 +391,15 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 		stamp = flow.StampFull(ctx, h.db, curUserReachID, flow.ObservedAt(newRunDate, runTimeStr))
 	}
 
+	// #246 A4 carry-over fix: StampFull returning no reading (nil CFS — no
+	// gauge/no data at the target time) must never blank out a previously
+	// stamped snapshot. restampFlow (not the bare restamp intent) gates the
+	// flow columns, so a re-stamp attempt that finds nothing simply keeps
+	// whatever was already on the row.
+	restampFlow := restamp && stamp.CFS != nil
+
 	var stampedAt *time.Time
-	if restamp {
+	if restampFlow {
 		now := time.Now().UTC()
 		stampedAt = &now
 	}
@@ -412,7 +422,7 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 		WHERE id = $14 AND owner_id = $15
 	`,
 		body.RunDate, body.RunTime, body.Notes, body.Companions, body.SortOrder,
-		restamp, stamp.CFS, stamp.Band, stamp.Color, stamp.GaugeID, stampedAt,
+		restampFlow, stamp.CFS, stamp.Band, stamp.Color, stamp.GaugeID, stampedAt,
 		markPaddled, paddledAt,
 		runID, ownerID,
 	)
@@ -448,4 +458,155 @@ func (h *PlanHandler) DeleteRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// ── POST /plan-runs/{id}/log-mine ────────────────────────────────────────
+// Invite-accept hybrid (contract decision #1, §6): the caller — the host or
+// an accepted crew member of the parent plan — gets their own paddled log
+// of this same river run without touching the host's plan: "your logged
+// flows stay yours." Reuses (or creates) a 1-run Personal plan for that
+// date, matching the A6 backfill's per-day natural key + 'log-{date}' slug
+// convention (contract §1/§3 "one plans row per (owner_id, report_date)").
+
+func (h *PlanHandler) LogMine(w http.ResponseWriter, r *http.Request) {
+	sourceRunID := chi.URLParam(r, "id")
+	ownerID, ok := h.ownerID(r)
+	if !ok {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	ctx := r.Context()
+
+	var planID, hostOwnerID, userReachID, runDate, reachSlug string
+	err := h.db.QueryRow(ctx, `
+		SELECT pr.plan_id, p.owner_id, COALESCE(pr.user_reach_id::text, ''), pr.run_date::text, COALESCE(ur.slug, '')
+		FROM plan_runs pr
+		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
+		LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
+		WHERE pr.id = $1::uuid AND pr.deleted_at IS NULL
+	`, sourceRunID).Scan(&planID, &hostOwnerID, &userReachID, &runDate, &reachSlug)
+	if err != nil {
+		errorResponse(w, http.StatusNotFound, "plan run not found")
+		return
+	}
+	if userReachID == "" {
+		errorResponse(w, http.StatusUnprocessableEntity, "this run has no river run attached to log")
+		return
+	}
+
+	allowed := ownerID == hostOwnerID
+	if !allowed {
+		h.db.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM plan_members WHERE plan_id = $1::uuid AND member_owner_id = $2 AND status = 'accepted')`,
+			planID, ownerID,
+		).Scan(&allowed)
+	}
+	if !allowed {
+		errorResponse(w, http.StatusForbidden, "must be the host or an accepted crew member to log this run")
+		return
+	}
+
+	today, terr := userToday(ctx, h.db, ownerID)
+	if terr != nil {
+		errorResponse(w, http.StatusInternalServerError, "could not resolve local date")
+		return
+	}
+	rd, perr := parseDate(runDate)
+	if perr != nil {
+		errorResponse(w, http.StatusInternalServerError, "invalid run_date on source run")
+		return
+	}
+	if rd.After(today) {
+		errorResponse(w, http.StatusUnprocessableEntity, "cannot log a future run")
+		return
+	}
+
+	// Idempotent-ish: caller already logged this reach+date as paddled ->
+	// 200 existing (no dup row).
+	var existingPlanID, existingRunID string
+	if err := h.db.QueryRow(ctx, `
+		SELECT pr2.plan_id, pr2.id
+		FROM plan_runs pr2
+		JOIN plans p2 ON p2.id = pr2.plan_id AND p2.deleted_at IS NULL
+		WHERE pr2.owner_id = $1 AND pr2.user_reach_id = $2::uuid AND pr2.run_date = $3::date
+		  AND pr2.paddled AND pr2.deleted_at IS NULL
+		LIMIT 1
+	`, ownerID, userReachID, runDate).Scan(&existingPlanID, &existingRunID); err == nil {
+		jsonResponse(w, http.StatusOK, map[string]string{"plan_id": existingPlanID, "plan_run_id": existingRunID})
+		return
+	}
+
+	// plans.owner_id has a hard FK to user_profiles(owner_id) — ensure the
+	// caller's profile exists before the plan INSERT, same as Create.
+	email, _ := auth.EmailFromContext(ctx)
+	if _, herr := h.ensureHandle(ctx, ownerID, email); herr != nil {
+		errorResponse(w, http.StatusInternalServerError, "could not assign user profile")
+		return
+	}
+
+	tx, err := h.db.Begin(ctx)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "tx failed")
+		return
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
+
+	logSlug := "log-" + runDate
+	var myPlanID string
+	err = tx.QueryRow(ctx,
+		`SELECT id FROM plans WHERE owner_id = $1 AND slug = $2 AND deleted_at IS NULL`,
+		ownerID, logSlug,
+	).Scan(&myPlanID)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			errorResponse(w, http.StatusInternalServerError, "plan lookup failed")
+			return
+		}
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO plans (owner_id, slug, name, type, visibility, start_date, end_date)
+			VALUES ($1, $2, $3, 'personal', 'public', $4::date, $4::date)
+			RETURNING id
+		`, ownerID, logSlug, "Paddle "+runDate, runDate).Scan(&myPlanID); err != nil {
+			errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("create personal plan failed: %v", err))
+			return
+		}
+	}
+
+	noon, nerr := localNoonUTC(ctx, tx, ownerID, runDate)
+	if nerr != nil {
+		errorResponse(w, http.StatusInternalServerError, "could not resolve local time")
+		return
+	}
+	stamp := flow.StampFull(ctx, tx, userReachID, noon)
+	stampedAt := time.Now().UTC()
+	paddledAt := time.Now().UTC()
+
+	slugBase := reachSlug
+	if slugBase == "" {
+		slugBase = "run"
+	}
+	mySlug := h.uniqueRunSlug(ctx, tx, ownerID, slugBase+"-"+runDate)
+
+	var myRunID string
+	err = tx.QueryRow(ctx, `
+		INSERT INTO plan_runs
+			(plan_id, owner_id, user_reach_id, slug, run_date,
+			 gauge_cfs, flow_band, flow_color, gauge_id, stamped_at,
+			 paddled, paddled_at)
+		VALUES ($1,$2,$3::uuid,$4,$5::date,$6,$7,$8,$9::uuid,$10,TRUE,$11)
+		RETURNING id
+	`, myPlanID, ownerID, userReachID, mySlug, runDate,
+		stamp.CFS, stamp.Band, stamp.Color, stamp.GaugeID, stampedAt, paddledAt,
+	).Scan(&myRunID)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("create logged run failed: %v", err))
+		return
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		errorResponse(w, http.StatusInternalServerError, "commit failed")
+		return
+	}
+
+	jsonResponse(w, http.StatusCreated, map[string]string{"plan_id": myPlanID, "plan_run_id": myRunID})
 }
