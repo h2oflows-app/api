@@ -117,18 +117,44 @@ func scanCandidates(ctx context.Context, db dbQueryer, ownerID, from, to string,
 	return out, rows.Err()
 }
 
+// resolveOwnerLocation resolves ownerID's IANA calendar tz (user_calendar_prefs.tz,
+// default America/Denver — mirrors userToday/localNoonUTC's COALESCE) ONCE as
+// a *time.Location, so a caller looping resolveInBand over many candidates
+// computes each candidate's local noon in Go instead of re-querying
+// user_calendar_prefs.tz per candidate (that per-candidate round trip was the
+// N+1 flagged in the #246 review — every candidate re-read the SAME owner's
+// tz row). Callers resolve this once per request and pass it through.
+func resolveOwnerLocation(ctx context.Context, db dbQueryer, ownerID string) (*time.Location, error) {
+	var tz *string
+	if err := db.QueryRow(ctx,
+		`SELECT tz FROM user_calendar_prefs WHERE owner_id = $1`, ownerID,
+	).Scan(&tz); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, err
+	}
+	zone := "America/Denver"
+	if tz != nil && *tz != "" {
+		zone = *tz
+	}
+	return time.LoadLocation(zone)
+}
+
 // resolveInBand stamps cand's flow reading nearest local noon of its
-// run_date and reports whether it's "in band". In-band rule (documented
-// once, used everywhere): internal/flow.BandAndColorForCFS ("V9 logic")
-// returns the reach's base_label as a fallback whenever cfs never clears the
-// lowest configured threshold — that fallback is exactly the "no threshold
-// range matched" case, so in-band means the resolved label is non-nil AND
-// differs from base_label (a real threshold range matched).
-func resolveInBand(ctx context.Context, db dbQueryer, ownerID string, cand tierCandidate) (flow.StampResult, bool) {
-	noon, err := localNoonUTC(ctx, db, ownerID, cand.RunDate)
+// run_date (in loc, the owner's tz resolved once via resolveOwnerLocation —
+// never re-queried per candidate) and reports whether it's "in band".
+// In-band rule (documented once, used everywhere): internal/flow.BandAndColorForCFS
+// ("V9 logic") returns the reach's base_label as a fallback whenever cfs
+// never clears the lowest configured threshold — that fallback is exactly
+// the "no threshold range matched" case, so in-band means the resolved
+// label is non-nil AND differs from base_label (a real threshold range
+// matched).
+func resolveInBand(ctx context.Context, db dbQueryer, loc *time.Location, cand tierCandidate) (flow.StampResult, bool) {
+	rd, err := parseDate(cand.RunDate)
 	if err != nil {
 		return flow.StampResult{}, false
 	}
+	// Mirrors localNoonUTC's SQL: date + TIME '12:00' interpreted in the
+	// owner's tz, i.e. local noon of run_date.
+	noon := time.Date(rd.Year(), rd.Month(), rd.Day(), 12, 0, 0, 0, loc)
 	stamp := flow.StampFull(ctx, db, cand.UserReachID, noon)
 	inBand := stamp.Band != nil && *stamp.Band != cand.BaseLabel
 	return stamp, inBand
@@ -182,9 +208,15 @@ func (h *NudgeHandler) Candidate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	loc, lerr := resolveOwnerLocation(ctx, h.db, ownerID)
+	if lerr != nil {
+		errorResponse(w, http.StatusInternalServerError, "could not resolve local timezone")
+		return
+	}
+
 	var member *nudgeMember
 	for _, c := range cands {
-		stamp, inBand := resolveInBand(ctx, h.db, ownerID, c)
+		stamp, inBand := resolveInBand(ctx, h.db, loc, c)
 		if !inBand {
 			continue
 		}
@@ -452,16 +484,17 @@ func (c *seasonCache) set(key string, data seasonResponse) {
 }
 
 type seasonHighestFlow struct {
-	CFS     float64 `json:"cfs"`
-	RunID   string  `json:"run_id"`
-	RunName string  `json:"run_name"`
-	Date    string  `json:"date"`
+	CFS       float64 `json:"cfs"`
+	PlanRunID string  `json:"plan_run_id"`
+	Slug      string  `json:"slug"`
+	RunName   string  `json:"run_name"`
+	Date      string  `json:"date"`
 }
 
 type seasonNewRun struct {
-	RunID string `json:"run_id"`
-	Name  string `json:"name"`
-	Date  string `json:"date"`
+	Slug string `json:"slug"`
+	Name string `json:"name"`
+	Date string `json:"date"`
 }
 
 type seasonRecentRun struct {
@@ -566,10 +599,16 @@ func (h *NudgeHandler) Season(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// highest_flow must carry the specific paddled plan_run's own id (routable
+	// via GET /plan-runs/{param}, id-first resolution) plus the reach's slug
+	// (routable via GET /me/reaches/{slug}) — NOT the user_reach UUID, which
+	// resolves via neither route. pr.id/pr.slug are NOT NULL; ur.slug can be
+	// NULL when user_reach_id was cleared (ON DELETE SET NULL).
 	var hfCFS *float64
-	var hfRunID, hfName, hfDate *string
+	var hfRunID string
+	var hfSlug, hfName, hfDate *string
 	if err := h.db.QueryRow(ctx, `
-		SELECT pr.gauge_cfs, pr.user_reach_id::text, ur.name, pr.run_date::text
+		SELECT pr.gauge_cfs, pr.id::text, ur.slug, ur.name, pr.run_date::text
 		FROM plan_runs pr
 		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
 		LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
@@ -577,10 +616,10 @@ func (h *NudgeHandler) Season(w http.ResponseWriter, r *http.Request) {
 		  AND pr.run_date BETWEEN $2::date AND $3::date
 		ORDER BY pr.gauge_cfs DESC
 		LIMIT 1
-	`, ownerID, yearStart, yearEnd).Scan(&hfCFS, &hfRunID, &hfName, &hfDate); err == nil && hfCFS != nil {
-		resp.HighestFlow = &seasonHighestFlow{CFS: *hfCFS}
-		if hfRunID != nil {
-			resp.HighestFlow.RunID = *hfRunID
+	`, ownerID, yearStart, yearEnd).Scan(&hfCFS, &hfRunID, &hfSlug, &hfName, &hfDate); err == nil && hfCFS != nil {
+		resp.HighestFlow = &seasonHighestFlow{CFS: *hfCFS, PlanRunID: hfRunID}
+		if hfSlug != nil {
+			resp.HighestFlow.Slug = *hfSlug
 		}
 		if hfName != nil {
 			resp.HighestFlow.RunName = *hfName
@@ -596,13 +635,16 @@ func (h *NudgeHandler) Season(w http.ResponseWriter, r *http.Request) {
 	// new_runs: reaches whose FIRST-ever paddled date (all-time, not just
 	// this year) falls within the selected year — scans all paddled history
 	// to find the true first date, filters the group on the year via HAVING.
+	// Grouped/keyed by the user_reach itself (a reach, not a single dated
+	// plan_run), so the routable identifier is ur.slug — reach pages resolve
+	// on GET /me/reaches/{slug}, never by user_reach id.
 	newRows, err := h.db.Query(ctx, `
-		SELECT ur.id::text, ur.name, MIN(pr.run_date)::text AS first_date
+		SELECT ur.slug, ur.name, MIN(pr.run_date)::text AS first_date
 		FROM plan_runs pr
 		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
 		JOIN user_reaches ur ON ur.id = pr.user_reach_id
 		WHERE pr.owner_id = $1 AND pr.paddled AND pr.deleted_at IS NULL
-		GROUP BY ur.id, ur.name
+		GROUP BY ur.id, ur.slug, ur.name
 		HAVING MIN(pr.run_date) BETWEEN $2::date AND $3::date
 		ORDER BY MIN(pr.run_date)
 	`, ownerID, yearStart, yearEnd)
@@ -612,7 +654,7 @@ func (h *NudgeHandler) Season(w http.ResponseWriter, r *http.Request) {
 	}
 	for newRows.Next() {
 		var nr seasonNewRun
-		if err := newRows.Scan(&nr.RunID, &nr.Name, &nr.Date); err != nil {
+		if err := newRows.Scan(&nr.Slug, &nr.Name, &nr.Date); err != nil {
 			newRows.Close()
 			errorResponse(w, http.StatusInternalServerError, "new-runs scan failed")
 			return
