@@ -43,6 +43,26 @@ func TestBandLabelForCFS_NoThresholds(t *testing.T) {
 	}
 }
 
+func TestBandAndColorForCFS(t *testing.T) {
+	thresholds := []Threshold{
+		{Value: 300, Label: "Running", Color: "p3"},
+		{Value: 800, Label: "High", Color: "p4"},
+	}
+
+	if band, color := BandAndColorForCFS(100, "Too Low", "p0", thresholds); band != "Too Low" || color != "p0" {
+		t.Errorf("below lowest threshold: got (%q,%q), want (Too Low,p0)", band, color)
+	}
+	if band, color := BandAndColorForCFS(300, "Too Low", "p0", thresholds); band != "Running" || color != "p3" {
+		t.Errorf("exact match lowest: got (%q,%q), want (Running,p3)", band, color)
+	}
+	if band, color := BandAndColorForCFS(5000, "Too Low", "p0", thresholds); band != "High" || color != "p4" {
+		t.Errorf("above highest: got (%q,%q), want (High,p4)", band, color)
+	}
+	if band, color := BandAndColorForCFS(500, "Base", "p0", nil); band != "Base" || color != "p0" {
+		t.Errorf("no thresholds: got (%q,%q), want (Base,p0)", band, color)
+	}
+}
+
 func TestClampReportBand(t *testing.T) {
 	if got := ClampReportBand(nil); got != nil {
 		t.Errorf("ClampReportBand(nil) = %v, want nil", got)
