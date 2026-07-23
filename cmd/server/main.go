@@ -137,6 +137,7 @@ func main() {
 	moderation := handlers.NewModerationHandler(pool, devFallbackID)
 	plans := handlers.NewPlanHandler(pool, devFallbackID).WithMailer(mailer)
 	invites := handlers.NewInviteHandler(pool, devFallbackID, mailer)
+	nudges := handlers.NewNudgeHandler(pool, devFallbackID)
 	discover := handlers.NewDiscoverHandler(pool)
 	preferences := handlers.NewPreferencesHandler(pool, devFallbackID)
 	profile := handlers.NewProfileHandler(pool, devFallbackID)
@@ -324,6 +325,15 @@ func main() {
 		r.Post("/plans/{id}/crew/{memberId}/accept", invites.CrewAccept)
 		r.Post("/plans/{id}/crew/{memberId}/decline", invites.CrewDecline)
 
+		// #246 A5: nudge + season + calendar prefs.
+		r.Get("/me/nudge/candidate", nudges.Candidate)
+		r.Post("/me/nudge/shown", nudges.Shown)
+		r.Post("/me/nudge/dismiss", nudges.Dismiss)
+		r.Post("/me/nudge/confirm", nudges.Confirm)
+		r.Get("/me/season", nudges.Season)
+		r.Get("/me/calendar-prefs", nudges.GetPrefs)
+		r.Patch("/me/calendar-prefs", nudges.UpdatePrefs)
+
 		// Custom gauges — private to owner, auth gated via ownerID() + devFallbackID.
 		r.Get("/me/custom-gauges", customGauges.List)
 		r.Post("/me/custom-gauges", customGauges.Create)
@@ -438,6 +448,7 @@ func main() {
 	r.Get("/og/reaches/{slug}", ogh.Reach)
 	r.Get("/og/reports/{id}", ogh.Report)
 	r.Get("/og/gauges/{id}", ogh.Gauge)
+	r.Get("/og/plan-runs/{id}", ogh.PlanRun)
 
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%s", cfg.Port),

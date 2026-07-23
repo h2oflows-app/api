@@ -190,6 +190,81 @@ func (h *OGHandler) Report(w http.ResponseWriter, r *http.Request) {
 	writePNG(w, png)
 }
 
+// PlanRun renders the OG image for a plan_run (calendar run). Path:
+// /og/plan-runs/{id}.png (#246 A5). Public only: the parent plan must be
+// public and live — /og is an unauthenticated scraper endpoint with no
+// session to check plan_members membership against, so a private plan's
+// plan_run simply 404s rather than leaking via OG. Fixes the handle bug the
+// contract calls out in Report above: that query selects `rep.handle`
+// straight off `reports` (a denormalized, easily-stale column); this one
+// resolves the host's handle live via a proper user_profiles JOIN on
+// plans.owner_id.
+func (h *OGHandler) PlanRun(w http.ResponseWriter, r *http.Request) {
+	id := paramTrimExt(r, "id")
+	if id == "" {
+		http.Error(w, "missing id", http.StatusBadRequest)
+		return
+	}
+
+	d := og.PlanRunData{ID: id}
+	var (
+		title      string
+		planName   string
+		handle     *string
+		runDate    string
+		gaugeCfs   *float64
+		flowBand   *string
+		paddled    bool
+		visibility string
+	)
+	err := h.db.QueryRow(r.Context(), `
+		SELECT
+			COALESCE(ur.long_name, ur.name, 'Paddle'),
+			p.name,
+			up.handle,
+			pr.run_date::text,
+			pr.gauge_cfs,
+			pr.flow_band,
+			pr.paddled,
+			p.visibility::text
+		FROM plan_runs pr
+		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
+		LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
+		LEFT JOIN user_profiles up ON up.owner_id = p.owner_id
+		WHERE pr.id = $1::uuid AND pr.deleted_at IS NULL
+	`, id).Scan(&title, &planName, &handle, &runDate, &gaugeCfs, &flowBand, &paddled, &visibility)
+	if err != nil {
+		http.Error(w, "plan run not found", http.StatusNotFound)
+		return
+	}
+	if visibility != "public" {
+		http.Error(w, "plan run not found", http.StatusNotFound)
+		return
+	}
+
+	d.Title = title
+	d.ReachName = planName
+	if handle != nil {
+		d.Handle = *handle
+	}
+	d.RunDate = runDate
+	d.Paddled = paddled
+	if gaugeCfs != nil {
+		d.FlowCfs = *gaugeCfs
+		d.HasCfs = true
+	}
+	if flowBand != nil {
+		d.FlowBand = *flowBand
+	}
+
+	png, err := og.RenderPlanRun(d)
+	if err != nil {
+		http.Error(w, "render failed", http.StatusInternalServerError)
+		return
+	}
+	writePNG(w, png)
+}
+
 // Gauge renders the OG image for a gauge. Path: /og/gauges/{id}.png
 func (h *OGHandler) Gauge(w http.ResponseWriter, r *http.Request) {
 	id := paramTrimExt(r, "id")

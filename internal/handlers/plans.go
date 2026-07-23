@@ -90,6 +90,25 @@ func parseDate(s string) (time.Time, error) {
 	return time.Parse("2006-01-02", s)
 }
 
+// maxDateStr/minDateStr compare "YYYY-MM-DD" date strings lexically — valid
+// because ISO-8601 date strings sort identically as strings and as dates.
+// Used to intersect a caller-supplied [from,to] range with the fixed 14-day
+// Tier-A nudge lookback window (nudges.go/calendar.go) without a round trip
+// through time.Time.
+func maxDateStr(a, b string) string {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func minDateStr(a, b string) string {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // validateRunDateInRange enforces "run_date ∈ [plan.start_date, plan.end_date]"
 // (app-enforced — cross-row CHECK isn't expressible in Postgres).
 func validateRunDateInRange(runDate, planStart, planEnd string) error {
@@ -142,11 +161,13 @@ func localNoonUTC(ctx context.Context, q dbQueryer, ownerID, runDate string) (ti
 // ensureHandle mirrors ReportHandler.ensureProfile (reports.go) — a plan's
 // share URL embeds the host's handle, lazily creating a user_profiles row
 // from their email on first use, same as the first report/dashboard/etc.
-// Duplicated rather than shared across handler types, matching this
-// codebase's per-file-helper convention (see reportRateLimiter).
-func (h *PlanHandler) ensureHandle(ctx context.Context, ownerID, email string) (string, error) {
+// Package-level (not a *PlanHandler method) so it's reusable from
+// findOrCreatePaddledLog (plan_runs.go), which needs it from both
+// PlanHandler.LogMine and NudgeHandler.Confirm (#246 A5 task 1: "extract
+// shared helper rather than duplicating").
+func ensureHandle(ctx context.Context, db *pgxpool.Pool, ownerID, email string) (string, error) {
 	var handle string
-	err := h.db.QueryRow(ctx,
+	err := db.QueryRow(ctx,
 		`SELECT handle FROM user_profiles WHERE owner_id = $1`, ownerID,
 	).Scan(&handle)
 	if err == nil {
@@ -162,7 +183,7 @@ func (h *PlanHandler) ensureHandle(ctx context.Context, ownerID, email string) (
 		if i > 0 {
 			candidate = fmt.Sprintf("%s-%d", base, i+1)
 		}
-		if _, insErr := h.db.Exec(ctx,
+		if _, insErr := db.Exec(ctx,
 			`INSERT INTO user_profiles (owner_id, handle) VALUES ($1, $2)`,
 			ownerID, candidate,
 		); insErr == nil {
@@ -188,7 +209,10 @@ func (h *PlanHandler) uniquePlanSlug(ctx context.Context, ownerID, base string) 
 	return fmt.Sprintf("%s-%d", base, time.Now().UnixMilli())
 }
 
-func (h *PlanHandler) uniqueRunSlug(ctx context.Context, q dbQueryer, ownerID, base string) string {
+// uniqueRunSlug is package-level (not a *PlanHandler method) so it's callable
+// from findOrCreatePaddledLog (plan_runs.go) on behalf of both
+// PlanHandler.LogMine and NudgeHandler.Confirm.
+func uniqueRunSlug(ctx context.Context, q dbQueryer, ownerID, base string) string {
 	candidate := base
 	for i := 2; i < 100; i++ {
 		var exists bool
@@ -202,6 +226,24 @@ func (h *PlanHandler) uniqueRunSlug(ctx context.Context, q dbQueryer, ownerID, b
 		candidate = fmt.Sprintf("%s-%d", base, i)
 	}
 	return fmt.Sprintf("%s-%d", base, time.Now().UnixMilli())
+}
+
+// crewFilled counts plan_members rows with status='accepted' for planID —
+// the shared crew-meter read used by renderPlan (plans.go) and
+// CrewList/CrewAccept/JoinPlan/AcceptInvite (invites.go). #246 A4 carry-over
+// fix (task 6a): every call site used to `.Scan(&filled)` and discard the
+// error, silently fail-open to filled=0 on a DB error — at every gating call
+// site (JoinPlan/CrewAccept/AcceptInvite's `filled>=max_crew` check) that
+// would let an over-cap join through on a transient DB error instead of
+// rejecting it. Scan errors now propagate to the caller as a real 500.
+func crewFilled(ctx context.Context, q dbQueryer, planID string) (int, error) {
+	var filled int
+	if err := q.QueryRow(ctx,
+		`SELECT COUNT(*) FROM plan_members WHERE plan_id = $1::uuid AND status = 'accepted'`, planID,
+	).Scan(&filled); err != nil {
+		return 0, fmt.Errorf("crewFilled: %w", err)
+	}
+	return filled, nil
 }
 
 // ── Response shapes ──────────────────────────────────────────────────────
@@ -335,7 +377,7 @@ func (h *PlanHandler) Create(w http.ResponseWriter, r *http.Request) {
 	// commit, mirroring reports.go:202, or a first-time user's first trip
 	// 500s on the FK and never reaches ensureHandle at all.
 	email, _ := auth.EmailFromContext(ctx)
-	handle, herr := h.ensureHandle(ctx, ownerID, email)
+	handle, herr := ensureHandle(ctx, h.db, ownerID, email)
 	if herr != nil {
 		errorResponse(w, http.StatusInternalServerError, "could not assign user profile")
 		return
@@ -558,10 +600,11 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, planID 
 		}
 	}
 
-	var filled int
-	h.db.QueryRow(ctx,
-		`SELECT COUNT(*) FROM plan_members WHERE plan_id = $1 AND status = 'accepted'`, planID,
-	).Scan(&filled)
+	filled, ferr := crewFilled(ctx, h.db, planID)
+	if ferr != nil {
+		errorResponse(w, http.StatusInternalServerError, "crew count failed")
+		return
+	}
 
 	jsonResponse(w, http.StatusOK, map[string]any{
 		"plan":      pd,
