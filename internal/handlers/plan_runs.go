@@ -12,6 +12,7 @@ import (
 	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
 	"github.com/h2oflow/h2oflow/apps/api/internal/flow"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // createPlanRunBody is the shared request shape for a calendar run, used
@@ -110,7 +111,7 @@ func (h *PlanHandler) insertPlanRun(
 	if slugBase == "" {
 		slugBase = "run"
 	}
-	slug = h.uniqueRunSlug(ctx, q, hostOwnerID, slugBase+"-"+body.RunDate)
+	slug = uniqueRunSlug(ctx, q, hostOwnerID, slugBase+"-"+body.RunDate)
 
 	err = q.QueryRow(ctx, `
 		INSERT INTO plan_runs
@@ -521,61 +522,100 @@ func (h *PlanHandler) LogMine(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	myPlanID, myRunID, existed, ferr := findOrCreatePaddledLog(ctx, h.db, ownerID, userReachID, reachSlug, runDate, nil)
+	if ferr != nil {
+		errorResponse(w, http.StatusInternalServerError, ferr.Error())
+		return
+	}
+	status := http.StatusCreated
+	if existed {
+		status = http.StatusOK
+	}
+	jsonResponse(w, status, map[string]string{"plan_id": myPlanID, "plan_run_id": myRunID})
+}
+
+// findOrCreatePaddledLog is the "log-mine" find-or-create machinery shared
+// by PlanHandler.LogMine (POST /plan-runs/{id}/log-mine — the host or an
+// accepted crew member logging their own paddle of a visible plan_run) and
+// NudgeHandler.Confirm (POST /me/nudge/confirm — a user confirming a Tier-A
+// nudge candidate they paddled). Both need the identical "reuse-or-create
+// today's Personal plan, insert a paddled plan_run" transaction, so it's
+// extracted once here rather than duplicated (#246 A5 task 1).
+//
+// Idempotent: if the caller already has a live paddled plan_run for this
+// exact reach+date, returns that existing row instead of creating a
+// duplicate (existed=true — callers use this to pick 200 vs 201).
+func findOrCreatePaddledLog(
+	ctx context.Context, db *pgxpool.Pool,
+	ownerID, userReachID, reachSlug, runDate string, notes *string,
+) (planID, runID string, existed bool, err error) {
 	// Idempotent-ish: caller already logged this reach+date as paddled ->
-	// 200 existing (no dup row).
+	// return the existing row, no dup.
 	var existingPlanID, existingRunID string
-	if err := h.db.QueryRow(ctx, `
+	if qerr := db.QueryRow(ctx, `
 		SELECT pr2.plan_id, pr2.id
 		FROM plan_runs pr2
 		JOIN plans p2 ON p2.id = pr2.plan_id AND p2.deleted_at IS NULL
 		WHERE pr2.owner_id = $1 AND pr2.user_reach_id = $2::uuid AND pr2.run_date = $3::date
 		  AND pr2.paddled AND pr2.deleted_at IS NULL
 		LIMIT 1
-	`, ownerID, userReachID, runDate).Scan(&existingPlanID, &existingRunID); err == nil {
-		jsonResponse(w, http.StatusOK, map[string]string{"plan_id": existingPlanID, "plan_run_id": existingRunID})
-		return
+	`, ownerID, userReachID, runDate).Scan(&existingPlanID, &existingRunID); qerr == nil {
+		return existingPlanID, existingRunID, true, nil
 	}
 
 	// plans.owner_id has a hard FK to user_profiles(owner_id) — ensure the
 	// caller's profile exists before the plan INSERT, same as Create.
 	email, _ := auth.EmailFromContext(ctx)
-	if _, herr := h.ensureHandle(ctx, ownerID, email); herr != nil {
-		errorResponse(w, http.StatusInternalServerError, "could not assign user profile")
-		return
+	if _, herr := ensureHandle(ctx, db, ownerID, email); herr != nil {
+		return "", "", false, fmt.Errorf("could not assign user profile: %w", herr)
 	}
 
-	tx, err := h.db.Begin(ctx)
-	if err != nil {
-		errorResponse(w, http.StatusInternalServerError, "tx failed")
-		return
+	tx, berr := db.Begin(ctx)
+	if berr != nil {
+		return "", "", false, fmt.Errorf("tx failed: %w", berr)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
 
 	logSlug := "log-" + runDate
 	var myPlanID string
-	err = tx.QueryRow(ctx,
-		`SELECT id FROM plans WHERE owner_id = $1 AND slug = $2 AND deleted_at IS NULL`,
+	var deletedAt *time.Time
+	lookupErr := tx.QueryRow(ctx,
+		`SELECT id, deleted_at FROM plans WHERE owner_id = $1 AND slug = $2`,
 		ownerID, logSlug,
-	).Scan(&myPlanID)
-	if err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) {
-			errorResponse(w, http.StatusInternalServerError, "plan lookup failed")
-			return
+	).Scan(&myPlanID, &deletedAt)
+	switch {
+	case lookupErr == nil && deletedAt != nil:
+		// #246 A5 carry-over fix (task 6b): UNIQUE(owner_id,slug) on `plans`
+		// is non-partial, so a tombstoned "log-{date}" plan (the user
+		// previously deleted that whole day's log) would collide with a
+		// 23505 unique violation on a bare re-INSERT below. We un-tombstone
+		// rather than slug-suffixing: "log-{date}" is the same natural-key
+		// day-plan every other log-mine/nudge-confirm/backfill caller
+		// expects to find at that slug, and reviving the row also
+		// reattaches any surviving (non-deleted) child plan_runs instead of
+		// orphaning them behind a newly minted "log-{date}-2" plan.
+		if _, uerr := tx.Exec(ctx,
+			`UPDATE plans SET deleted_at = NULL, updated_at = NOW() WHERE id = $1`, myPlanID,
+		); uerr != nil {
+			return "", "", false, fmt.Errorf("un-tombstone personal plan: %w", uerr)
 		}
-		if err := tx.QueryRow(ctx, `
+	case lookupErr != nil && !errors.Is(lookupErr, pgx.ErrNoRows):
+		return "", "", false, fmt.Errorf("plan lookup failed: %w", lookupErr)
+	case errors.Is(lookupErr, pgx.ErrNoRows):
+		if ierr := tx.QueryRow(ctx, `
 			INSERT INTO plans (owner_id, slug, name, type, visibility, start_date, end_date)
 			VALUES ($1, $2, $3, 'personal', 'public', $4::date, $4::date)
 			RETURNING id
-		`, ownerID, logSlug, "Paddle "+runDate, runDate).Scan(&myPlanID); err != nil {
-			errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("create personal plan failed: %v", err))
-			return
+		`, ownerID, logSlug, "Paddle "+runDate, runDate).Scan(&myPlanID); ierr != nil {
+			return "", "", false, fmt.Errorf("create personal plan failed: %w", ierr)
 		}
+	default:
+		// lookupErr == nil && deletedAt == nil -> live plan already exists, reuse as-is.
 	}
 
 	noon, nerr := localNoonUTC(ctx, tx, ownerID, runDate)
 	if nerr != nil {
-		errorResponse(w, http.StatusInternalServerError, "could not resolve local time")
-		return
+		return "", "", false, fmt.Errorf("could not resolve local time: %w", nerr)
 	}
 	stamp := flow.StampFull(ctx, tx, userReachID, noon)
 	stampedAt := time.Now().UTC()
@@ -585,28 +625,24 @@ func (h *PlanHandler) LogMine(w http.ResponseWriter, r *http.Request) {
 	if slugBase == "" {
 		slugBase = "run"
 	}
-	mySlug := h.uniqueRunSlug(ctx, tx, ownerID, slugBase+"-"+runDate)
+	mySlug := uniqueRunSlug(ctx, tx, ownerID, slugBase+"-"+runDate)
 
 	var myRunID string
-	err = tx.QueryRow(ctx, `
+	if ierr := tx.QueryRow(ctx, `
 		INSERT INTO plan_runs
 			(plan_id, owner_id, user_reach_id, slug, run_date,
 			 gauge_cfs, flow_band, flow_color, gauge_id, stamped_at,
-			 paddled, paddled_at)
-		VALUES ($1,$2,$3::uuid,$4,$5::date,$6,$7,$8,$9::uuid,$10,TRUE,$11)
+			 paddled, paddled_at, notes)
+		VALUES ($1,$2,$3::uuid,$4,$5::date,$6,$7,$8,$9::uuid,$10,TRUE,$11,$12)
 		RETURNING id
 	`, myPlanID, ownerID, userReachID, mySlug, runDate,
-		stamp.CFS, stamp.Band, stamp.Color, stamp.GaugeID, stampedAt, paddledAt,
-	).Scan(&myRunID)
-	if err != nil {
-		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("create logged run failed: %v", err))
-		return
+		stamp.CFS, stamp.Band, stamp.Color, stamp.GaugeID, stampedAt, paddledAt, notes,
+	).Scan(&myRunID); ierr != nil {
+		return "", "", false, fmt.Errorf("create logged run failed: %w", ierr)
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		errorResponse(w, http.StatusInternalServerError, "commit failed")
-		return
+	if cerr := tx.Commit(ctx); cerr != nil {
+		return "", "", false, fmt.Errorf("commit failed: %w", cerr)
 	}
-
-	jsonResponse(w, http.StatusCreated, map[string]string{"plan_id": myPlanID, "plan_run_id": myRunID})
+	return myPlanID, myRunID, false, nil
 }

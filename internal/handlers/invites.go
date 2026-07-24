@@ -491,8 +491,11 @@ func (h *InviteHandler) AcceptInvite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if status != "accepted" {
-		var filled int
-		tx.QueryRow(ctx, `SELECT COUNT(*) FROM plan_members WHERE plan_id = $1::uuid AND status = 'accepted'`, planID).Scan(&filled)
+		filled, ferr := crewFilled(ctx, tx, planID)
+		if ferr != nil {
+			errorResponse(w, http.StatusInternalServerError, "crew count failed")
+			return
+		}
 		if maxCrew != nil && filled >= *maxCrew {
 			errorResponse(w, http.StatusConflict, "crew is full")
 			return
@@ -623,8 +626,11 @@ func (h *InviteHandler) JoinPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var filled int
-	h.db.QueryRow(ctx, `SELECT COUNT(*) FROM plan_members WHERE plan_id = $1::uuid AND status = 'accepted'`, planID).Scan(&filled)
+	filled, ferr := crewFilled(ctx, h.db, planID)
+	if ferr != nil {
+		errorResponse(w, http.StatusInternalServerError, "crew count failed")
+		return
+	}
 	if maxCrew == nil || filled >= *maxCrew {
 		errorResponse(w, http.StatusConflict, "crew is full")
 		return
@@ -716,8 +722,11 @@ func (h *InviteHandler) CrewList(w http.ResponseWriter, r *http.Request) {
 		members = append(members, cm)
 	}
 
-	var filled int
-	h.db.QueryRow(ctx, `SELECT COUNT(*) FROM plan_members WHERE plan_id = $1::uuid AND status = 'accepted'`, planID).Scan(&filled)
+	filled, ferr := crewFilled(ctx, h.db, planID)
+	if ferr != nil {
+		errorResponse(w, http.StatusInternalServerError, "crew count failed")
+		return
+	}
 
 	jsonResponse(w, http.StatusOK, map[string]any{
 		"members": members,
@@ -774,8 +783,11 @@ func (h *InviteHandler) CrewAccept(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if curStatus != "accepted" {
-		var filled int
-		tx.QueryRow(ctx, `SELECT COUNT(*) FROM plan_members WHERE plan_id = $1::uuid AND status = 'accepted'`, planID).Scan(&filled)
+		filled, ferr := crewFilled(ctx, tx, planID)
+		if ferr != nil {
+			errorResponse(w, http.StatusInternalServerError, "crew count failed")
+			return
+		}
 		if maxCrew == nil || filled >= *maxCrew {
 			errorResponse(w, http.StatusConflict, "crew is full")
 			return
@@ -794,8 +806,17 @@ func (h *InviteHandler) CrewAccept(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var filled int
-	h.db.QueryRow(ctx, `SELECT COUNT(*) FROM plan_members WHERE plan_id = $1::uuid AND status = 'accepted'`, planID).Scan(&filled)
+	// The accept itself already committed above — a count-read failure here
+	// only affects the meter numbers in this response body, not whether the
+	// accept succeeded. Still surfaced as 500 (not a silent filled=0) so a
+	// caller doesn't render a bogus "0 of N" meter as ground truth; the
+	// membership change is durable regardless and a follow-up GET
+	// /plans/{id}/crew will reflect it.
+	filled, ferr := crewFilled(ctx, h.db, planID)
+	if ferr != nil {
+		errorResponse(w, http.StatusInternalServerError, "crew count failed")
+		return
+	}
 	jsonResponse(w, http.StatusOK, map[string]any{"status": "accepted", "filled": filled, "max": maxCrew})
 }
 

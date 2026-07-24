@@ -254,6 +254,97 @@ func RenderReport(d ReportData) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// PlanRunData is the input to RenderPlanRun (#246 A5) — the calendar-run
+// equivalent of ReportData. Cloned rather than shared with RenderReport
+// because the badge text and URL footer path differ ("PLAN" vs "REPORT",
+// /plan-runs/ vs /reports/) and threading those two strings through a
+// shared render func would add a branch for no real reuse benefit — the
+// contract explicitly calls for "clone the existing OG report renderer
+// path", not a shared one.
+type PlanRunData struct {
+	Title     string
+	ReachName string // plan name — shown as the eyebrow above Title (the reach's own name)
+	Handle    string // without leading @
+	RunDate   string // "2026-05-18"
+	FlowCfs   float64
+	HasCfs    bool
+	FlowBand  string
+	Paddled   bool
+	ID        string
+}
+
+// RenderPlanRun produces a PNG share card for a plan_run (calendar run).
+func RenderPlanRun(d PlanRunData) ([]byte, error) {
+	dc := gg.NewContext(Width, Height)
+	dc.SetColor(bgColor)
+	dc.Clear()
+
+	// Top bar
+	dc.SetColor(accentColor)
+	dc.DrawCircle(80, 70, 18)
+	dc.Fill()
+	dc.SetColor(fgColor)
+	dc.SetFontFace(face(boldFont, 28))
+	dc.DrawString("H2OFlows", 110, 80)
+
+	// "PLAN" badge top-right
+	dc.SetColor(mutedColor)
+	dc.SetFontFace(face(boldFont, 22))
+	dc.DrawStringAnchored("PLAN", float64(Width-80), 80, 1.0, 0.5)
+
+	// Eyebrow (plan name) — sits above the title with clear gap
+	if d.ReachName != "" {
+		dc.SetColor(accentColor)
+		dc.SetFontFace(face(boldFont, 24))
+		dc.DrawString(strUpper(d.ReachName), 80, 180)
+	}
+
+	// Title (large) — the river run's own name
+	dc.SetColor(fgColor)
+	dc.SetFontFace(face(boldFont, 60))
+	wrapAndDraw(dc, d.Title, 80, 260, float64(Width-160), 72)
+
+	// Footer block — date + handle + paddled
+	dc.SetColor(mutedColor)
+	dc.SetFontFace(face(regularFont, 28))
+	footerParts := []string{}
+	if d.RunDate != "" {
+		footerParts = append(footerParts, formatReportDate(d.RunDate))
+	}
+	if d.Handle != "" {
+		footerParts = append(footerParts, "@"+d.Handle)
+	}
+	if d.Paddled {
+		footerParts = append(footerParts, "paddled")
+	}
+	dc.DrawString(joinDot(footerParts), 80, 510)
+
+	if d.HasCfs {
+		bc := bandColor(d.FlowBand)
+		dc.SetColor(bc)
+		dc.DrawRoundedRectangle(80, 540, 380, 60, 12)
+		dc.Fill()
+		dc.SetColor(fgColor)
+		dc.SetFontFace(face(boldFont, 32))
+		dc.DrawString(fmt.Sprintf("%s cfs", formatThousands(d.FlowCfs)), 100, 582)
+		if d.FlowBand != "" {
+			dc.SetFontFace(face(boldFont, 20))
+			dc.DrawStringAnchored(strUpper(d.FlowBand), 440, 570, 1.0, 0.5)
+		}
+	}
+
+	// URL footer right
+	dc.SetColor(mutedColor)
+	dc.SetFontFace(face(regularFont, 20))
+	dc.DrawStringAnchored("h2oflows.app/plan-runs/"+d.ID, float64(Width-80), 575, 1.0, 0.5)
+
+	var buf bytes.Buffer
+	if err := dc.EncodePNG(&buf); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 // GaugeData is the input to RenderGauge.
 type GaugeData struct {
 	Name       string

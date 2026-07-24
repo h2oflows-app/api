@@ -102,9 +102,42 @@ func (h *PlanHandler) Calendar(w http.ResponseWriter, r *http.Request) {
 		}
 		runsByDate[runDate] = append(runsByDate[runDate], cr)
 	}
+	// needs_confirm (#246 A5): true on days with a Tier-A nudge candidate —
+	// reuses the same scanCandidates/resolveInBand machinery as
+	// GET /me/nudge/candidate (nudges.go), bounded to the 14-day nudge
+	// lookback intersected with [from,to] so this never balloons into a
+	// per-calendar-day scan even when the caller requests a full year.
+	//
+	// loc (the owner's calendar tz) is resolved ONCE here and threaded
+	// through both this loop and the nudge_dot_dates loop below — resolveInBand
+	// used to re-query user_calendar_prefs.tz for the SAME owner on every
+	// single candidate, which on a year view (~90 candidates x this endpoint
+	// being polled) turned into a real N+1 (#246 review).
+	needsConfirmDates := map[string]bool{}
+	var loc *time.Location
+	{
+		today, terr := userToday(ctx, h.db, ownerID)
+		if terr == nil {
+			if l, lerr := resolveOwnerLocation(ctx, h.db, ownerID); lerr == nil {
+				loc = l
+			}
+			tierFrom := maxDateStr(from, today.AddDate(0, 0, -14).Format("2006-01-02"))
+			tierTo := minDateStr(to, today.AddDate(0, 0, -1).Format("2006-01-02"))
+			if loc != nil && tierFrom <= tierTo {
+				if cands, cerr := scanCandidates(ctx, h.db, ownerID, tierFrom, tierTo, false); cerr == nil {
+					for _, c := range cands {
+						if _, inBand := resolveInBand(ctx, h.db, loc, c); inBand {
+							needsConfirmDates[c.RunDate] = true
+						}
+					}
+				}
+			}
+		}
+	}
+
 	days := make([]calDay, 0, len(dateOrder))
 	for _, d := range dateOrder {
-		days = append(days, calDay{Date: d, Runs: runsByDate[d], NeedsConfirm: false})
+		days = append(days, calDay{Date: d, Runs: runsByDate[d], NeedsConfirm: needsConfirmDates[d]})
 	}
 
 	// plans[] = own plans in range PLUS plans where caller is a plan_members
@@ -163,10 +196,44 @@ func (h *PlanHandler) Calendar(w http.ResponseWriter, r *http.Request) {
 		plans = append(plans, p)
 	}
 
+	// nudge_dot_dates (#246 A5): Tier-B "quiet dot" — in-band + previously
+	// paddled, no popup — over the FULL requested [from,to] (not just the
+	// 14-day Tier-A window; a quiet dot is a passive calendar hint, not a
+	// prompt, so it isn't bounded by the nudge lookback). scanCandidates'
+	// LIMIT 90 and the requirePriorPaddle EXISTS filter keep this a bounded
+	// set-based read even for a wide range.
+	//
+	// Dates already in needsConfirmDates are skipped here rather than
+	// re-resolved: a date that already earned a Tier-A "needs confirm" flag
+	// must never ALSO carry a Tier-B quiet dot (one calendar cell can't
+	// render both a '?' and a quiet dot), and skipping avoids paying
+	// resolveInBand's flow.StampFull cost twice for the same candidate when
+	// the two windows overlap (last 14 days is in both).
+	nudgeDotDates := []string{}
+	if loc == nil {
+		if l, lerr := resolveOwnerLocation(ctx, h.db, ownerID); lerr == nil {
+			loc = l
+		}
+	}
+	if loc != nil {
+		if cands, cerr := scanCandidates(ctx, h.db, ownerID, from, to, true); cerr == nil {
+			seen := map[string]bool{}
+			for _, c := range cands {
+				if seen[c.RunDate] || needsConfirmDates[c.RunDate] {
+					continue
+				}
+				if _, inBand := resolveInBand(ctx, h.db, loc, c); inBand {
+					seen[c.RunDate] = true
+					nudgeDotDates = append(nudgeDotDates, c.RunDate)
+				}
+			}
+		}
+	}
+
 	jsonResponse(w, http.StatusOK, map[string]any{
 		"days":            days,
 		"plans":           plans,
-		"nudge_dot_dates": []string{},
+		"nudge_dot_dates": nudgeDotDates,
 	})
 }
 
