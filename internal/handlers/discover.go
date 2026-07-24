@@ -22,6 +22,8 @@ type discoverRun struct {
 	ID                   string     `json:"id"`
 	Slug                 string     `json:"slug"`
 	Name                 string     `json:"name"`
+	RiverName            *string    `json:"river_name"`
+	StateAbbr            *string    `json:"state_abbr"`
 	Handle               string     `json:"handle"`
 	IsSpecial            bool       `json:"is_special"`
 	ClassMin             *float64   `json:"class_min"`
@@ -69,7 +71,7 @@ func (h *DiscoverHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 
 	query := `
 		SELECT
-			id, slug, name, handle, is_special,
+			id, slug, name, river_name, state_abbr, handle, is_special,
 			class_min, class_max, length_mi,
 			upvote_count, last_forked_at, gauge_name,
 			put_in_lng, put_in_lat,
@@ -83,6 +85,8 @@ func (h *DiscoverHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 				ur.id::text                         AS id,
 				ur.slug                             AS slug,
 				ur.name                             AS name,
+				ur.river_name                       AS river_name,
+				rv.state_abbr                       AS state_abbr,
 				COALESCE(up.handle, 'h2oflows')     AS handle,
 				COALESCE(up.is_special, false)      AS is_special,
 				ur.class_min                        AS class_min,
@@ -109,6 +113,7 @@ func (h *DiscoverHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 					ELSE 0
 				END                                 AS text_rank
 			FROM user_reaches ur
+			LEFT JOIN rivers rv ON rv.id = ur.river_id
 			LEFT JOIN gauges g ON g.id = ur.primary_gauge_id
 			LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
 			LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
@@ -137,7 +142,7 @@ func (h *DiscoverHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 		var run discoverRun
 		var textRank int
 		if err := rows.Scan(
-			&run.ID, &run.Slug, &run.Name, &run.Handle, &run.IsSpecial,
+			&run.ID, &run.Slug, &run.Name, &run.RiverName, &run.StateAbbr, &run.Handle, &run.IsSpecial,
 			&run.ClassMin, &run.ClassMax, &run.LengthMi,
 			&run.UpvoteCount, &run.LastForkedAt, &run.GaugeName,
 			&run.PutInLng, &run.PutInLat,
