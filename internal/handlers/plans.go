@@ -475,6 +475,12 @@ func (h *PlanHandler) GetByHandleSlug(w http.ResponseWriter, r *http.Request) {
 		WHERE LOWER(up.handle) = LOWER($1) AND p.slug = $2 AND p.deleted_at IS NULL
 	`, handle, slug).Scan(&planID)
 	if err != nil {
+		// Anon gets a uniform 401 whether or not the plan exists — a 404-vs-401
+		// split would let anon probe which handle/slug pairs exist.
+		if _, ok := h.ownerID(r); !ok {
+			errorResponse(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
 		errorResponse(w, http.StatusNotFound, "plan not found")
 		return
 	}
@@ -487,6 +493,11 @@ func (h *PlanHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 	if err := h.db.QueryRow(r.Context(),
 		`SELECT id FROM plans WHERE id = $1::uuid AND deleted_at IS NULL`, id,
 	).Scan(&planID); err != nil {
+		// Uniform 401 for anon — see GetByHandleSlug.
+		if _, ok := h.ownerID(r); !ok {
+			errorResponse(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
 		errorResponse(w, http.StatusNotFound, "plan not found")
 		return
 	}
