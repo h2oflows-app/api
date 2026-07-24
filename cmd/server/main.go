@@ -138,12 +138,12 @@ func main() {
 	plans := handlers.NewPlanHandler(pool, devFallbackID).WithMailer(mailer)
 	invites := handlers.NewInviteHandler(pool, devFallbackID, mailer)
 	nudges := handlers.NewNudgeHandler(pool, devFallbackID)
-	discover := handlers.NewDiscoverHandler(pool)
+	discover := handlers.NewDiscoverHandler(pool, devFallbackID)
 	preferences := handlers.NewPreferencesHandler(pool, devFallbackID)
 	profile := handlers.NewProfileHandler(pool, devFallbackID)
 	dashboards := handlers.NewDashboardHandler(pool, devFallbackID)
 	basinOverrides := handlers.NewBasinOverrideHandler(pool, devFallbackID)
-	ogh := handlers.NewOGHandler(pool)
+	ogh := handlers.NewOGHandler(pool, devFallbackID)
 	// LoadAppRoles queries user_roles for the authenticated user on each request.
 	// Runs after Optional/Required so the user ID is already in context.
 	loadAppRoles := auth.LoadAppRoles(func(r *http.Request, userID string) ([]string, error) {
@@ -189,8 +189,8 @@ func main() {
 		r.Post("/ask", reaches.GlobalAsk)
 		r.Get("/stats", reaches.Stats)
 		r.Get("/discover/runs", discover.ListRuns)
-		// #246 A4: public crew-call browse — anon OK, gated by the plan's
-		// own visibility+looking_for_crew (contract decision #7).
+		// #246 A6: auth-only (anon scoping REVISED block) — gated by the
+		// plan's own visibility+looking_for_crew (contract decision #7).
 		r.Get("/discover/plans", discover.ListPlans)
 		r.Get("/admin/slug-check", admin.SlugCheck)
 		// NLDI upstream-tributaries is public — run detail page needs it without auth.
@@ -448,7 +448,11 @@ func main() {
 	r.Get("/og/reaches/{slug}", ogh.Reach)
 	r.Get("/og/reports/{id}", ogh.Report)
 	r.Get("/og/gauges/{id}", ogh.Gauge)
-	r.Get("/og/plan-runs/{id}", ogh.PlanRun)
+	// #246 A6: unlike the routes above, plan-runs is auth-gated (anon
+	// scoping REVISED block) — wrap with auth.Optional so a signed-in
+	// caller's Bearer token (if sent) populates ownerID; anon still 404s
+	// inside the handler.
+	r.With(auth.Optional(verifier)).Get("/og/plan-runs/{id}", ogh.PlanRun)
 
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%s", cfg.Port),

@@ -214,6 +214,29 @@ func generateInviteToken() (raw, hash string, err error) {
 	return raw, hash, nil
 }
 
+// anonInviteTokenValid checks whether token (the raw ?invite= query param)
+// hashes to a plan_members.invite_token_hash row scoped to planID — the one
+// anon read carve-out for the calendar domain (#246 A6, PlanHandler.renderPlan).
+// Package-level (not a method) since it's needed from PlanHandler, mirroring
+// this file's dbQueryer-free helpers. An empty/absent token or a token for a
+// DIFFERENT plan_id both fail closed (false), same as AcceptInvite's token
+// check below — the token only ever grants access to the plan it was minted
+// for, never a general bearer credential.
+func anonInviteTokenValid(ctx context.Context, db *pgxpool.Pool, planID, token string) bool {
+	if token == "" {
+		return false
+	}
+	sum := sha256.Sum256([]byte(token))
+	hash := hex.EncodeToString(sum[:])
+	var exists bool
+	if err := db.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM plan_members WHERE plan_id = $1::uuid AND invite_token_hash = $2)
+	`, planID, hash).Scan(&exists); err != nil {
+		return false
+	}
+	return exists
+}
+
 // sendInviteMail builds the invite email (+ .ics attachment when requested)
 // and sends it. Package-level (not a method) so both InviteHandler and
 // PlanHandler.Create can fire it after their respective transaction commits,

@@ -496,6 +496,27 @@ func (h *PlanHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, planID string) {
 	ctx := r.Context()
 
+	// #246 A6 anon scoping (IMPLEMENTATION_PLAN.md §6 REVISED — binding): the
+	// calendar domain is auth-only. Anon (no ownerID) gets 401 UNLESS a
+	// matching invite token is presented for THIS plan_id — the one
+	// carve-out (?invite=<raw token>, the exact param name the invite email
+	// link already embeds, invites.go sendInviteMail's acceptURL). A valid
+	// token grants read access to this plan regardless of its visibility:
+	// the whole point is letting an invited, logged-out recipient see what
+	// they were invited to before creating an account (accept itself still
+	// requires one — contract decision #8). Authed behavior is unchanged
+	// below (public readable to any authed user; private → host/invited/
+	// accepted member only, 404 no-leak).
+	callerID, callerOK := h.ownerID(r)
+	anonTokenGrant := false
+	if !callerOK {
+		anonTokenGrant = anonInviteTokenValid(ctx, h.db, planID, r.URL.Query().Get("invite"))
+		if !anonTokenGrant {
+			errorResponse(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
+	}
+
 	var pd planDetail
 	var createdAt, updatedAt time.Time
 	err := h.db.QueryRow(ctx, `
@@ -522,8 +543,7 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, planID 
 	pd.UpdatedAt = updatedAt.Format(time.RFC3339)
 
 	if pd.Visibility != "public" {
-		callerID, callerOK := h.ownerID(r)
-		allowed := callerOK && callerID == pd.HostOwnerID
+		allowed := anonTokenGrant || (callerOK && callerID == pd.HostOwnerID)
 		if !allowed && callerOK {
 			h.db.QueryRow(ctx, `
 				SELECT EXISTS(SELECT 1 FROM plan_members

@@ -87,12 +87,14 @@ func (h *ClusterHandler) nearbyRuns(r *http.Request, putInLat, putInLng, takeOut
 				-- hardcoded to the h2oflows sentinel) so they retain cluster prominence.
 				CASE WHEN COALESCE(up.is_special, false) THEN 50 ELSE 0 END
 				+ COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0)
-				+ COALESCE((SELECT COUNT(*) FROM reports rp WHERE rp.user_reach_id = ur.id AND rp.deleted_at IS NULL), 0) * 2
+				-- #246 A6 repoint: plan_runs WHERE paddled (live), superset of the old
+				-- reports count post-000143 backfill (PART 2 item 3, binding).
+				+ COALESCE((SELECT COUNT(*) FROM plan_runs pr JOIN plans pl ON pl.id = pr.plan_id AND pl.deleted_at IS NULL WHERE pr.user_reach_id = ur.id AND pr.paddled AND pr.deleted_at IS NULL), 0) * 2
 				+ (CASE WHEN ur.centerline IS NOT NULL THEN 1 ELSE 0 END
 				   + CASE WHEN EXISTS(SELECT 1 FROM user_reach_flow_ranges WHERE user_reach_id = ur.id) THEN 1 ELSE 0 END
 				   + CASE WHEN ur.note IS NOT NULL AND char_length(ur.note) >= 20 THEN 1 ELSE 0 END) * 5
 			)::int AS rank_score,
-			COALESCE((SELECT COUNT(*) FROM reports rp WHERE rp.user_reach_id = ur.id AND rp.deleted_at IS NULL), 0)::int AS report_count
+			COALESCE((SELECT COUNT(*) FROM plan_runs pr JOIN plans pl ON pl.id = pr.plan_id AND pl.deleted_at IS NULL WHERE pr.user_reach_id = ur.id AND pr.paddled AND pr.deleted_at IS NULL), 0)::int AS report_count
 		FROM user_reaches ur
 		LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
 		WHERE ur.visibility = 'public' AND ur.deleted_at IS NULL

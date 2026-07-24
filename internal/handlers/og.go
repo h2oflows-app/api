@@ -7,16 +7,30 @@ import (
 	"strings"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
 	"github.com/h2oflow/h2oflow/apps/api/internal/og"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // OGHandler renders OpenGraph share-card PNGs for reach, report, and gauge pages.
 type OGHandler struct {
-	db *pgxpool.Pool
+	db            *pgxpool.Pool
+	devFallbackID string // #246 A6: PlanRun requires a valid ownerID (see below)
 }
 
-func NewOGHandler(db *pgxpool.Pool) *OGHandler { return &OGHandler{db: db} }
+func NewOGHandler(db *pgxpool.Pool, devFallbackID string) *OGHandler {
+	return &OGHandler{db: db, devFallbackID: devFallbackID}
+}
+
+func (h *OGHandler) ownerID(r *http.Request) (string, bool) {
+	if id, ok := auth.UserIDFromContext(r.Context()); ok {
+		return id, true
+	}
+	if h.devFallbackID != "" {
+		return h.devFallbackID, true
+	}
+	return "", false
+}
 
 // writePNG sets caching headers and writes the PNG body.
 func writePNG(w http.ResponseWriter, b []byte) {
@@ -191,15 +205,25 @@ func (h *OGHandler) Report(w http.ResponseWriter, r *http.Request) {
 }
 
 // PlanRun renders the OG image for a plan_run (calendar run). Path:
-// /og/plan-runs/{id}.png (#246 A5). Public only: the parent plan must be
-// public and live — /og is an unauthenticated scraper endpoint with no
-// session to check plan_members membership against, so a private plan's
-// plan_run simply 404s rather than leaking via OG. Fixes the handle bug the
-// contract calls out in Report above: that query selects `rep.handle`
-// straight off `reports` (a denormalized, easily-stale column); this one
-// resolves the host's handle live via a proper user_profiles JOIN on
-// plans.owner_id.
+// /og/plan-runs/{id}.png (#246 A5). Fixes the handle bug the contract calls
+// out in Report above: that query selects `rep.handle` straight off
+// `reports` (a denormalized, easily-stale column); this one resolves the
+// host's handle live via a proper user_profiles JOIN on plans.owner_id.
+//
+// #246 A6 anon scoping (IMPLEMENTATION_PLAN.md §6 REVISED, PART 3 item 4 —
+// binding): the calendar domain is auth-only and the page no longer
+// advertises this URL, so an anonymous request (crawlers have no JWT to
+// send — bearerToken() finds nothing without an Authorization header) 404s
+// rather than 401 — a 401/WWW-Authenticate would just be noise scrapers
+// can't act on. Route is registered with auth.Optional (main.go) so a
+// signed-in caller's own token IS honored here, unlike the other top-level
+// /og/* routes which run with no auth middleware at all.
 func (h *OGHandler) PlanRun(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.ownerID(r); !ok {
+		http.Error(w, "plan run not found", http.StatusNotFound)
+		return
+	}
+
 	id := paramTrimExt(r, "id")
 	if id == "" {
 		http.Error(w, "missing id", http.StatusBadRequest)

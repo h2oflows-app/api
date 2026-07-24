@@ -458,6 +458,16 @@ func (h *ReportHandler) ListByRunID(w http.ResponseWriter, r *http.Request) {
 	runID := chi.URLParam(r, "runId")
 	ctx := r.Context()
 
+	// #246 A6 anon scoping (IMPLEMENTATION_PLAN.md §6 REVISED, PART 3 item
+	// 5): the run-detail "logged runs" list is trip-log data (plan_runs
+	// post-repoint below), not river-run metadata — the calendar domain is
+	// auth-only. Web gates its own fetch of this endpoint; enforce it here
+	// too so the data can't be read anonymously over a bare request.
+	if _, ok := h.ownerID(r); !ok {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
 	var userReachID string
 	if err := h.db.QueryRow(ctx,
 		`SELECT id FROM user_reaches WHERE id = $1 AND visibility = 'public' AND deleted_at IS NULL`, runID,
@@ -469,31 +479,44 @@ func (h *ReportHandler) ListByRunID(w http.ResponseWriter, r *http.Request) {
 	const limit = 25
 	cursor := r.URL.Query().Get("cursor")
 
+	// #246 A6 repoint (PART 2): plan_runs is a strict superset of `reports`
+	// post-000143 backfill — reads switch over, `reports` write path + table
+	// stay live-but-dormant (table retirement is a separate later PR).
+	// Matches the FINAL contract's retained-endpoint note verbatim:
+	// "plan_runs JOIN plans WHERE user_reach_id=$1 AND paddled AND
+	// plans.visibility='public'" (both deleted_at IS NULL). `name` has no
+	// plan_runs equivalent (reports' free-text author-name snapshot was
+	// dropped in the new schema) — resolved to the live handle instead, same
+	// as `handle`, so the JSON shape/field names the web run-detail pages
+	// already consume (recon_api-reports.md §2) do not change.
 	var (
 		query string
 		args  []any
 	)
 	if cursor != "" {
 		query = `
-			SELECT rp.id, rp.slug, rp.name, rp.report_date::TEXT, rp.report_time::TEXT,
-			       rp.content, rp.paddled,
-			       rp.flow_cfs, rp.flow_band, rp.created_at, up.handle
-			FROM reports rp
-			LEFT JOIN user_profiles up ON up.owner_id = rp.owner_id
-			WHERE rp.user_reach_id = $1 AND rp.report_date < $2::DATE
-			  AND rp.deleted_at IS NULL
-			ORDER BY rp.report_date DESC, rp.created_at DESC
+			SELECT pr.id, pr.slug, COALESCE(up.handle, ''), pr.run_date::TEXT, pr.run_time::TEXT,
+			       COALESCE(pr.notes, ''), pr.paddled,
+			       pr.gauge_cfs, pr.flow_band, pr.created_at, up.handle
+			FROM plan_runs pr
+			JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL AND p.visibility = 'public'
+			LEFT JOIN user_profiles up ON up.owner_id = pr.owner_id
+			WHERE pr.user_reach_id = $1 AND pr.run_date < $2::DATE
+			  AND pr.paddled AND pr.deleted_at IS NULL
+			ORDER BY pr.run_date DESC, pr.created_at DESC
 			LIMIT $3`
 		args = []any{userReachID, cursor, limit + 1}
 	} else {
 		query = `
-			SELECT rp.id, rp.slug, rp.name, rp.report_date::TEXT, rp.report_time::TEXT,
-			       rp.content, rp.paddled,
-			       rp.flow_cfs, rp.flow_band, rp.created_at, up.handle
-			FROM reports rp
-			LEFT JOIN user_profiles up ON up.owner_id = rp.owner_id
-			WHERE rp.user_reach_id = $1 AND rp.deleted_at IS NULL
-			ORDER BY rp.report_date DESC, rp.created_at DESC
+			SELECT pr.id, pr.slug, COALESCE(up.handle, ''), pr.run_date::TEXT, pr.run_time::TEXT,
+			       COALESCE(pr.notes, ''), pr.paddled,
+			       pr.gauge_cfs, pr.flow_band, pr.created_at, up.handle
+			FROM plan_runs pr
+			JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL AND p.visibility = 'public'
+			LEFT JOIN user_profiles up ON up.owner_id = pr.owner_id
+			WHERE pr.user_reach_id = $1
+			  AND pr.paddled AND pr.deleted_at IS NULL
+			ORDER BY pr.run_date DESC, pr.created_at DESC
 			LIMIT $2`
 		args = []any{userReachID, limit + 1}
 	}
@@ -535,7 +558,11 @@ func (h *ReportHandler) ListByRunID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		rep.CreatedAt = createdAt.Format(time.RFC3339)
-		rep.URL = fmt.Sprintf("/reports/%s", rep.ID)
+		// #246 A6 repoint: rep.ID is now a plan_runs.id, not a reports.id —
+		// point "Read more" at the new permalink (web's /plan-runs/[id].vue,
+		// already live) rather than the legacy /reports/{id} route, which
+		// would 404 for any row whose id isn't itself an old report id.
+		rep.URL = fmt.Sprintf("/plan-runs/%s", rep.ID)
 		reports = append(reports, rep)
 	}
 	if reports == nil {
