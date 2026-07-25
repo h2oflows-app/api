@@ -320,6 +320,13 @@ type planRunSummary struct {
 	Companions  *string      `json:"companions,omitempty"`
 	CreatedAt   string       `json:"created_at,omitempty"`
 	Crew        runCrewMeter `json:"crew"`
+	// Per-viewer RSVP on THIS run (the caller's own plan_members row, if
+	// any): status invited|requested|accepted|declined + the row id the
+	// accept/dismiss endpoints take. Drives the itinerary's per-run accept
+	// buttons + "You're in" state (#246 A7; W5 review blocker — the web
+	// cannot derive these client-side).
+	MyRSVP     *string `json:"my_rsvp,omitempty"`
+	MyMemberID *string `json:"my_member_id,omitempty"`
 }
 
 type planMember struct {
@@ -582,7 +589,7 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, planID 
 	// member_owner_id check below and would 404 despite holding a valid
 	// token — resolve the token once, up front, for both branches.
 	callerID, callerOK := h.ownerID(r)
-	tokenMemberIDs, tokenGrant := inviteTokenMemberIDs(ctx, h.db, planID, r.URL.Query().Get("invite"))
+	tokenRuns, tokenGrant := inviteTokenMemberIDs(ctx, h.db, planID, r.URL.Query().Get("invite"))
 	if !callerOK && !tokenGrant {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
 		return
@@ -632,16 +639,23 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, planID 
 		SELECT pr.id, pr.slug, pr.user_reach_id::text, ur.name, pr.run_date::text, pr.run_time::text,
 		       pr.sort_order, pr.gauge_cfs, pr.flow_band, pr.flow_color, pr.paddled, pr.paddled_at,
 		       pr.notes, pr.companions, pr.created_at,
-		       pr.looking_for_crew, pr.max_crew, COALESCE(cm.filled, 0)
+		       pr.looking_for_crew, pr.max_crew, COALESCE(cm.filled, 0),
+		       me.status, me.id
 		FROM plan_runs pr
 		LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
 		LEFT JOIN LATERAL (
 			SELECT COUNT(*) AS filled FROM plan_members pm
 			WHERE pm.plan_run_id = pr.id AND pm.status = 'accepted'
 		) cm ON true
+		LEFT JOIN LATERAL (
+			-- the caller's own RSVP row on this run ($2 = '' for anon/token
+			-- viewers -> never matches); unique per (plan_run_id, member)
+			SELECT pm.id::text, pm.status::text FROM plan_members pm
+			WHERE pm.plan_run_id = pr.id AND pm.member_owner_id = $2
+		) me ON true
 		WHERE pr.plan_id = $1 AND pr.deleted_at IS NULL
 		ORDER BY pr.run_date, pr.sort_order
-	`, planID)
+	`, planID, callerID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
 		return
@@ -659,6 +673,7 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, planID 
 			&run.SortOrder, &run.GaugeCFS, &run.FlowBand, &run.FlowColor, &run.Paddled, &paddledAtRaw,
 			&run.Notes, &run.Companions, &createdAtRaw,
 			&run.Crew.LookingForCrew, &run.Crew.Max, &run.Crew.Filled,
+			&run.MyRSVP, &run.MyMemberID,
 		); err != nil {
 			errorResponse(w, http.StatusInternalServerError, "scan failed")
 			return
@@ -716,9 +731,16 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, planID 
 		// for a caller who holds a valid invite token but isn't bound to the
 		// invite yet (member_owner_id still NULL — e.g. signed up with a
 		// different email than the invite, so it's absent from /me/invites
-		// too; review finding, #246 W4). #246 A7: plural — an email invite's
-		// token now spans one row per invited run (inviteOne's fan-out).
-		resp["invite_member_ids"] = tokenMemberIDs
+		// too; review finding, #246 W4). #246 A7: the token spans one row per
+		// invited run (inviteOne's fan-out) — invite_token_runs carries run
+		// context so the token-landing page renders a per-run accept list;
+		// invite_member_ids kept as the bare-id view for the W4-era client.
+		resp["invite_token_runs"] = tokenRuns
+		ids := make([]string, 0, len(tokenRuns))
+		for _, t := range tokenRuns {
+			ids = append(ids, t.MemberID)
+		}
+		resp["invite_member_ids"] = ids
 	}
 	jsonResponse(w, http.StatusOK, resp)
 }

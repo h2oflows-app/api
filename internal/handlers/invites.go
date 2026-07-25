@@ -324,29 +324,47 @@ func generateInviteToken() (raw, hash string, err error) {
 // token or a token for a DIFFERENT plan_id both fail closed (nil/false),
 // same as AcceptInvite's token check below — the token only ever grants
 // access to the plan it was minted for, never a general bearer credential.
-func inviteTokenMemberIDs(ctx context.Context, db *pgxpool.Pool, planID, token string) ([]string, bool) {
+// tokenInviteRun is one row of an email invite's run fan-out, with enough
+// run context for the web's token-landing page (?invite=) to render a
+// per-run accept list without any other authed fetch.
+type tokenInviteRun struct {
+	MemberID  string  `json:"member_id"`
+	PlanRunID *string `json:"plan_run_id,omitempty"` // NULL on a runless-plan (plan-level) invite row
+	RunName   *string `json:"run_name,omitempty"`
+	RunDate   *string `json:"run_date,omitempty"`
+	RunTime   *string `json:"run_time,omitempty"`
+	Status    string  `json:"status"`
+}
+
+func inviteTokenMemberIDs(ctx context.Context, db *pgxpool.Pool, planID, token string) ([]tokenInviteRun, bool) {
 	if token == "" {
 		return nil, false
 	}
 	sum := sha256.Sum256([]byte(token))
 	hash := hex.EncodeToString(sum[:])
-	rows, err := db.Query(ctx,
-		`SELECT id::text FROM plan_members WHERE plan_id = $1::uuid AND invite_token_hash = $2`, planID, hash)
+	rows, err := db.Query(ctx, `
+		SELECT pm.id::text, pm.plan_run_id::text, ur.name, pr.run_date::text, pr.run_time::text, pm.status::text
+		FROM plan_members pm
+		LEFT JOIN plan_runs pr ON pr.id = pm.plan_run_id AND pr.deleted_at IS NULL
+		LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
+		WHERE pm.plan_id = $1::uuid AND pm.invite_token_hash = $2
+		ORDER BY pr.run_date, pr.sort_order
+	`, planID, hash)
 	if err != nil {
 		return nil, false
 	}
 	defer rows.Close()
-	var ids []string
+	var out []tokenInviteRun
 	for rows.Next() {
-		var id string
-		if rows.Scan(&id) == nil {
-			ids = append(ids, id)
+		var t tokenInviteRun
+		if rows.Scan(&t.MemberID, &t.PlanRunID, &t.RunName, &t.RunDate, &t.RunTime, &t.Status) == nil {
+			out = append(out, t)
 		}
 	}
-	if len(ids) == 0 {
+	if len(out) == 0 {
 		return nil, false
 	}
-	return ids, true
+	return out, true
 }
 
 // webBaseURL is the web origin embedded in invite emails + .ics links.
