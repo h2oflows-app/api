@@ -335,6 +335,17 @@ type planRunSummary struct {
 	// cannot derive these client-side).
 	MyRSVP     *string `json:"my_rsvp,omitempty"`
 	MyMemberID *string `json:"my_member_id,omitempty"`
+	// UserReachSlug/UserReachOwnerHandle: the underlying river run's OWN
+	// slug/owner handle (distinct from this plan_run's Slug above) — lets
+	// PlanRunLogSheet's edit-mode meet-up-spot combobox fetch that run's
+	// rapids/access features (#312). Only populated by GetRun/renderPlanRun
+	// (review finding #246 W5 "should" — the calendar list/day-run/discover
+	// call sites that also build a planRunSummary don't need this and leave
+	// it nil/omitted). OwnerHandle nil means the run is the CALLER's own
+	// (web fetches via /me/runs/{slug} instead of the public
+	// /users/{handle}/runs/{slug}).
+	UserReachSlug        *string `json:"user_reach_slug,omitempty"`
+	UserReachOwnerHandle *string `json:"user_reach_owner_handle,omitempty"`
 }
 
 type planMember struct {

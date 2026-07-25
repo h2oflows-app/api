@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -373,6 +374,7 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 	var planID, planSlug, planName, hostOwnerID, hostHandle, visibility string
 	var planStart, planEnd string
 	var meetupRapidID, meetupAccessID *string
+	var userReachOwnerID, userReachOwnerHandle *string
 
 	err := h.db.QueryRow(ctx, `
 		SELECT pr.id, pr.slug, pr.user_reach_id::text, ur.name, pr.run_date::text, pr.run_time::text,
@@ -381,11 +383,13 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 		       pr.looking_for_crew, pr.max_crew, COALESCE(cm.filled, 0),
 		       pr.meetup_spot, pr.meetup_rapid_id::text, pr.meetup_access_id::text,
 		       p.id, p.slug, p.name, p.owner_id, COALESCE(up.handle, ''), p.visibility::text,
-		       p.start_date::text, p.end_date::text
+		       p.start_date::text, p.end_date::text,
+		       ur.slug, ur.owner_id::text, urp.handle
 		FROM plan_runs pr
 		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
 		LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
 		LEFT JOIN user_profiles up ON up.owner_id = p.owner_id
+		LEFT JOIN user_profiles urp ON urp.owner_id = ur.owner_id
 		LEFT JOIN LATERAL (
 			SELECT COUNT(*) AS filled FROM plan_members pm
 			WHERE pm.plan_run_id = pr.id AND pm.status = 'accepted'
@@ -399,6 +403,7 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 		&run.MeetupSpot, &meetupRapidID, &meetupAccessID,
 		&planID, &planSlug, &planName, &hostOwnerID, &hostHandle, &visibility,
 		&planStart, &planEnd,
+		&run.UserReachSlug, &userReachOwnerID, &userReachOwnerHandle,
 	)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "plan run not found")
@@ -411,6 +416,13 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 	}
 	run.CreatedAt = createdAtRaw.Format(time.RFC3339)
 	run.MeetupFeatureType, run.MeetupFeatureID = meetupFeatureTypeID(meetupRapidID, meetupAccessID)
+	// UserReachOwnerHandle stays nil when the run belongs to the CALLER
+	// (their own river run) — the web's contract (planRun.ts) is "nil means
+	// fetch via /me/runs/{slug}", so don't send the handle back in that case
+	// even though we resolved it above.
+	if userReachOwnerID != nil && *userReachOwnerID != callerID {
+		run.UserReachOwnerHandle = userReachOwnerHandle
+	}
 
 	if visibility != "public" {
 		allowed := callerID == hostOwnerID
@@ -443,13 +455,20 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 // ── PATCH /plan-runs/{id} ────────────────────────────────────────────────
 
 // updatePlanRunBody's MeetupSpot/MeetupFeature follow the same COALESCE-patch
-// convention as the rest of this body (nil = don't touch) with ONE
-// documented, binding exception: an explicit empty-string meetup_spot ("")
-// clears BOTH meetup_spot and any feature ref together — the sheet always
-// pairs it with meetup_feature omitted/null. Sending a non-nil meetup_feature
-// alongside an explicit empty meetup_spot is rejected (422): the sheet's
-// contract is "clear = empty text + no feature", not a valid state to build
-// a feature ref on top of.
+// convention as the rest of this body (key omitted = don't touch) with TWO
+// documented, binding exceptions:
+//  1. An explicit empty-string meetup_spot ("") clears BOTH meetup_spot and
+//     any feature ref together. Sending a non-nil meetup_feature alongside an
+//     explicit empty meetup_spot is rejected (422): "clear = empty text + no
+//     feature", not a valid state to build a feature ref on top of.
+//  2. An explicitly-present `"meetup_feature": null` (distinguished from an
+//     OMITTED key via the raw-JSON presence check in UpdateRun below) clears
+//     just the feature ref while leaving meetup_spot's text alone — this is
+//     the "typed over a picked spot" case: the ref is now stale (doesn't
+//     match the edited text) but the user's typing shouldn't be discarded.
+//     An omitted meetup_feature key (the ordinary "didn't touch this field"
+//     case) leaves any existing ref untouched, same as every other field
+//     here.
 type updatePlanRunBody struct {
 	RunDate        *string            `json:"run_date"`
 	RunTime        *string            `json:"run_time"`
@@ -474,11 +493,22 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var body updatePlanRunBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	bodyBytes, rerr := io.ReadAll(r.Body)
+	if rerr != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
+	var body updatePlanRunBody
+	if err := json.Unmarshal(bodyBytes, &body); err != nil {
+		errorResponse(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	// Raw key-presence check (distinguishes an explicit `"meetup_feature":
+	// null` from an omitted key — json.Unmarshal alone maps both to a nil
+	// *meetupFeatureBody, see updatePlanRunBody doc comment above).
+	var rawFields map[string]json.RawMessage
+	_ = json.Unmarshal(bodyBytes, &rawFields) // body already validated above; best-effort
+	_, meetupFeatureKeyPresent := rawFields["meetup_feature"]
 	if body.GaugeCFS != nil || body.FlowBand != nil || body.UserReachID != nil {
 		errorResponse(w, http.StatusBadRequest, "gauge_cfs, flow_band, and user_reach_id are system-managed and cannot be edited")
 		return
@@ -510,7 +540,7 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 		if body.RunDate != nil || body.RunTime != nil || body.Companions != nil ||
 			body.SortOrder != nil || body.Paddled != nil ||
 			body.LookingForCrew != nil || body.MaxCrew != nil ||
-			body.MeetupSpot != nil || body.MeetupFeature != nil {
+			body.MeetupSpot != nil || body.MeetupFeature != nil || meetupFeatureKeyPresent {
 			errorResponse(w, http.StatusBadRequest, "plan run is locked after paddling — only notes can be edited")
 			return
 		}
@@ -568,7 +598,12 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusUnprocessableEntity, "meetup_spot cannot be cleared while meetup_feature is set — clear both or send neither")
 		return
 	}
-	featureTouched := clearingMeetup || body.MeetupFeature != nil
+	// explicitClearFeature: `"meetup_feature": null` sent explicitly (key
+	// present, value null) — clears just the ref, keeps meetup_spot's text.
+	// clearingMeetup already covers the "clear both together" case, so this
+	// only fires for the "typed over a pick" path (doc comment above).
+	explicitClearFeature := meetupFeatureKeyPresent && body.MeetupFeature == nil && !clearingMeetup
+	featureTouched := clearingMeetup || body.MeetupFeature != nil || explicitClearFeature
 	var meetupRapidID, meetupAccessID *string
 	if body.MeetupFeature != nil {
 		rid, aid, snap, ferr := resolveMeetupFeature(ctx, h.db, curUserReachID, body.MeetupFeature)
