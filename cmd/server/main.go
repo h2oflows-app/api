@@ -191,7 +191,8 @@ func main() {
 		r.Get("/stats", reaches.Stats)
 		r.Get("/discover/runs", discover.ListRuns)
 		// #246 A6: auth-only (anon scoping REVISED block) — gated by the
-		// plan's own visibility+looking_for_crew (contract decision #7).
+		// plan's own visibility (contract decision #7). #246 A7: the
+		// looking_for_crew gate moved to plan_runs (per-run crew).
 		r.Get("/discover/plans", discover.ListPlans)
 		r.Get("/admin/slug-check", admin.SlugCheck)
 		// NLDI upstream-tributaries is public — run detail page needs it without auth.
@@ -317,14 +318,18 @@ func main() {
 		r.Get("/me/calendar/day", plans.CalendarDay)
 
 		// #246 A4: invites + crew (plan_members) + mail/.ics.
+		// #246 A7: crew/RSVP is now PER-RUN — POST /plans/{id}/join and
+		// /plans/{id}/crew* are REMOVED (replaced by the /plan-runs/{id}/*
+		// routes below, grouped with the rest of the plan-run routes).
 		r.Post("/plans/{id}/invite", invites.InviteToPlan)
+		r.Post("/plans/{id}/invite/resend", invites.ResendInvite)
 		r.Get("/me/invites", invites.MyInvites)
 		r.Post("/invites/{memberId}/accept", invites.AcceptInvite)
 		r.Post("/invites/{memberId}/dismiss", invites.DismissInvite)
-		r.Post("/plans/{id}/join", invites.JoinPlan)
-		r.Get("/plans/{id}/crew", invites.CrewList)
-		r.Post("/plans/{id}/crew/{memberId}/accept", invites.CrewAccept)
-		r.Post("/plans/{id}/crew/{memberId}/decline", invites.CrewDecline)
+		r.Post("/plan-runs/{id}/join", invites.JoinRun)
+		r.Get("/plan-runs/{id}/crew", invites.RunCrewList)
+		r.Post("/plan-runs/{id}/crew/{memberId}/accept", invites.RunCrewAccept)
+		r.Post("/plan-runs/{id}/crew/{memberId}/decline", invites.RunCrewDecline)
 
 		// #246 A5: nudge + season + calendar prefs.
 		r.Get("/me/nudge/candidate", nudges.Candidate)

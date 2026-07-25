@@ -17,14 +17,28 @@ import (
 
 // createPlanRunBody is the shared request shape for a calendar run, used
 // both by POST /plans (embedded `runs`) and POST /plans/{id}/runs.
+// LookingForCrew/MaxCrew are per-run (#246 A7 — crew moved off plans onto
+// plan_runs, product decision IMPLEMENTATION_PLAN.md §6 REVISED 2026-07-25).
 type createPlanRunBody struct {
-	UserReachID *string `json:"user_reach_id"`
-	ReachSlug   *string `json:"reach_slug"`
-	RunDate     string  `json:"run_date"`
-	RunTime     *string `json:"run_time"`
-	Notes       *string `json:"notes"`
-	Companions  *string `json:"companions"`
-	Paddled     *bool   `json:"paddled"`
+	UserReachID    *string `json:"user_reach_id"`
+	ReachSlug      *string `json:"reach_slug"`
+	RunDate        string  `json:"run_date"`
+	RunTime        *string `json:"run_time"`
+	Notes          *string `json:"notes"`
+	Companions     *string `json:"companions"`
+	Paddled        *bool   `json:"paddled"`
+	LookingForCrew *bool   `json:"looking_for_crew"`
+	MaxCrew        *int    `json:"max_crew"`
+}
+
+// validateCrewFields enforces the same "looking_for_crew requires a positive
+// max_crew" rule that used to live on plans.Create/Update (#246 A4), now
+// applied per plan_run.
+func validateCrewFields(lookingForCrew *bool, maxCrew *int) error {
+	if lookingForCrew != nil && *lookingForCrew && (maxCrew == nil || *maxCrew <= 0) {
+		return fmt.Errorf("max_crew is required (and must be > 0) when looking_for_crew is true")
+	}
+	return nil
 }
 
 // insertPlanRun resolves the river run (user_reach_id or reach_slug),
@@ -41,6 +55,9 @@ func (h *PlanHandler) insertPlanRun(
 		return "", "", &apiError{http.StatusBadRequest, "run_date is required"}
 	}
 	if verr := validateRunDateInRange(body.RunDate, planStart, planEnd); verr != nil {
+		return "", "", &apiError{http.StatusBadRequest, verr.Error()}
+	}
+	if verr := validateCrewFields(body.LookingForCrew, body.MaxCrew); verr != nil {
 		return "", "", &apiError{http.StatusBadRequest, verr.Error()}
 	}
 
@@ -113,17 +130,19 @@ func (h *PlanHandler) insertPlanRun(
 	}
 	slug = uniqueRunSlug(ctx, q, hostOwnerID, slugBase+"-"+body.RunDate)
 
+	lookingForCrew := body.LookingForCrew != nil && *body.LookingForCrew
+
 	err = q.QueryRow(ctx, `
 		INSERT INTO plan_runs
 			(plan_id, owner_id, user_reach_id, slug, run_date, run_time,
 			 gauge_cfs, flow_band, flow_color, gauge_id, stamped_at,
-			 paddled, paddled_at, notes, companions)
-		VALUES ($1,$2,$3::uuid,$4,$5::date,$6,$7,$8,$9,$10::uuid,$11,$12,$13,$14,$15)
+			 paddled, paddled_at, notes, companions, looking_for_crew, max_crew)
+		VALUES ($1,$2,$3::uuid,$4,$5::date,$6,$7,$8,$9,$10::uuid,$11,$12,$13,$14,$15,$16,$17)
 		RETURNING id
 	`,
 		planID, hostOwnerID, userReachID, slug, body.RunDate, runTimeVal,
 		stamp.CFS, stamp.Band, stamp.Color, stamp.GaugeID, stampedAt,
-		paddled, paddledAt, body.Notes, body.Companions,
+		paddled, paddledAt, body.Notes, body.Companions, lookingForCrew, body.MaxCrew,
 	).Scan(&id)
 	if err != nil {
 		return "", "", &apiError{http.StatusInternalServerError, fmt.Sprintf("create run failed: %v", err)}
@@ -220,17 +239,23 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 		SELECT pr.id, pr.slug, pr.user_reach_id::text, ur.name, pr.run_date::text, pr.run_time::text,
 		       pr.sort_order, pr.gauge_cfs, pr.flow_band, pr.flow_color, pr.paddled, pr.paddled_at,
 		       pr.notes, pr.companions, pr.created_at,
+		       pr.looking_for_crew, pr.max_crew, COALESCE(cm.filled, 0),
 		       p.id, p.slug, p.name, p.owner_id, COALESCE(up.handle, ''), p.visibility::text,
 		       p.start_date::text, p.end_date::text
 		FROM plan_runs pr
 		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
 		LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
 		LEFT JOIN user_profiles up ON up.owner_id = p.owner_id
+		LEFT JOIN LATERAL (
+			SELECT COUNT(*) AS filled FROM plan_members pm
+			WHERE pm.plan_run_id = pr.id AND pm.status = 'accepted'
+		) cm ON true
 		WHERE pr.id = $1 AND pr.deleted_at IS NULL
 	`, runID).Scan(
 		&run.ID, &run.Slug, &run.UserReachID, &run.Name, &run.RunDate, &runTime,
 		&run.SortOrder, &run.GaugeCFS, &run.FlowBand, &run.FlowColor, &run.Paddled, &paddledAtRaw,
 		&run.Notes, &run.Companions, &createdAtRaw,
+		&run.Crew.LookingForCrew, &run.Crew.Max, &run.Crew.Filled,
 		&planID, &planSlug, &planName, &hostOwnerID, &hostHandle, &visibility,
 		&planStart, &planEnd,
 	)
@@ -276,15 +301,17 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 // ── PATCH /plan-runs/{id} ────────────────────────────────────────────────
 
 type updatePlanRunBody struct {
-	RunDate     *string  `json:"run_date"`
-	RunTime     *string  `json:"run_time"`
-	Notes       *string  `json:"notes"`
-	Companions  *string  `json:"companions"`
-	SortOrder   *int16   `json:"sort_order"`
-	Paddled     *bool    `json:"paddled"`
-	GaugeCFS    *float64 `json:"gauge_cfs"`     // never client-settable — 400 on attempts
-	FlowBand    *string  `json:"flow_band"`     // never client-settable — 400 on attempts
-	UserReachID *string  `json:"user_reach_id"` // never client-settable — 400 on attempts
+	RunDate        *string  `json:"run_date"`
+	RunTime        *string  `json:"run_time"`
+	Notes          *string  `json:"notes"`
+	Companions     *string  `json:"companions"`
+	SortOrder      *int16   `json:"sort_order"`
+	Paddled        *bool    `json:"paddled"`
+	LookingForCrew *bool    `json:"looking_for_crew"`
+	MaxCrew        *int     `json:"max_crew"`
+	GaugeCFS       *float64 `json:"gauge_cfs"`     // never client-settable — 400 on attempts
+	FlowBand       *string  `json:"flow_band"`     // never client-settable — 400 on attempts
+	UserReachID    *string  `json:"user_reach_id"` // never client-settable — 400 on attempts
 }
 
 func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
@@ -308,15 +335,18 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	var planID, curUserReachID, curRunDate, planStart, planEnd string
-	var curPaddled bool
+	var curPaddled, curLookingForCrew bool
 	var curPaddledAt *time.Time
+	var curMaxCrew *int
 	err := h.db.QueryRow(ctx, `
 		SELECT pr.plan_id, COALESCE(pr.user_reach_id::text, ''), pr.run_date::text,
-		       pr.paddled, pr.paddled_at, p.start_date::text, p.end_date::text
+		       pr.paddled, pr.paddled_at, p.start_date::text, p.end_date::text,
+		       pr.looking_for_crew, pr.max_crew
 		FROM plan_runs pr
 		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
 		WHERE pr.id = $1 AND pr.owner_id = $2 AND pr.deleted_at IS NULL
-	`, runID, ownerID).Scan(&planID, &curUserReachID, &curRunDate, &curPaddled, &curPaddledAt, &planStart, &planEnd)
+	`, runID, ownerID).Scan(&planID, &curUserReachID, &curRunDate, &curPaddled, &curPaddledAt, &planStart, &planEnd,
+		&curLookingForCrew, &curMaxCrew)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "plan run not found")
 		return
@@ -326,7 +356,8 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 		// Locked state (contract): ONLY notes editable, and only within 24h
 		// of paddled_at — mirrors reports.go's 24h edit-lock message.
 		if body.RunDate != nil || body.RunTime != nil || body.Companions != nil ||
-			body.SortOrder != nil || body.Paddled != nil {
+			body.SortOrder != nil || body.Paddled != nil ||
+			body.LookingForCrew != nil || body.MaxCrew != nil {
 			errorResponse(w, http.StatusBadRequest, "plan run is locked after paddling — only notes can be edited")
 			return
 		}
@@ -358,6 +389,19 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 			errorResponse(w, http.StatusBadRequest, verr.Error())
 			return
 		}
+	}
+
+	newLookingForCrew := curLookingForCrew
+	if body.LookingForCrew != nil {
+		newLookingForCrew = *body.LookingForCrew
+	}
+	newMaxCrew := curMaxCrew
+	if body.MaxCrew != nil {
+		newMaxCrew = body.MaxCrew
+	}
+	if verr := validateCrewFields(&newLookingForCrew, newMaxCrew); verr != nil {
+		errorResponse(w, http.StatusBadRequest, verr.Error())
+		return
 	}
 
 	markPaddled := body.Paddled != nil && *body.Paddled
@@ -416,25 +460,28 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 
 	_, err = h.db.Exec(ctx, `
 		UPDATE plan_runs SET
-			run_date    = COALESCE($1::date, run_date),
-			run_time    = COALESCE($2, run_time),
-			notes       = COALESCE($3, notes),
-			companions  = COALESCE($4, companions),
-			sort_order  = COALESCE($5, sort_order),
-			gauge_cfs   = CASE WHEN $6 THEN $7 ELSE gauge_cfs END,
-			flow_band   = CASE WHEN $6 THEN $8 ELSE flow_band END,
-			flow_color  = CASE WHEN $6 THEN $9 ELSE flow_color END,
-			gauge_id    = CASE WHEN $6 THEN $10::uuid ELSE gauge_id END,
-			stamped_at  = COALESCE($11, stamped_at),
-			paddled     = CASE WHEN $12 THEN TRUE ELSE paddled END,
-			paddled_at  = COALESCE($13, paddled_at),
-			updated_at  = NOW()
+			run_date         = COALESCE($1::date, run_date),
+			run_time         = COALESCE($2, run_time),
+			notes            = COALESCE($3, notes),
+			companions       = COALESCE($4, companions),
+			sort_order       = COALESCE($5, sort_order),
+			gauge_cfs        = CASE WHEN $6 THEN $7 ELSE gauge_cfs END,
+			flow_band        = CASE WHEN $6 THEN $8 ELSE flow_band END,
+			flow_color       = CASE WHEN $6 THEN $9 ELSE flow_color END,
+			gauge_id         = CASE WHEN $6 THEN $10::uuid ELSE gauge_id END,
+			stamped_at       = COALESCE($11, stamped_at),
+			paddled          = CASE WHEN $12 THEN TRUE ELSE paddled END,
+			paddled_at       = COALESCE($13, paddled_at),
+			looking_for_crew = $16,
+			max_crew         = $17,
+			updated_at       = NOW()
 		WHERE id = $14 AND owner_id = $15
 	`,
 		body.RunDate, body.RunTime, body.Notes, body.Companions, body.SortOrder,
 		restampFlow, stamp.CFS, stamp.Band, stamp.Color, stamp.GaugeID, stampedAt,
 		markPaddled, paddledAt,
 		runID, ownerID,
+		newLookingForCrew, newMaxCrew,
 	)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "update failed")

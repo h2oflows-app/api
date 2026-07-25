@@ -1,8 +1,12 @@
-// Package ics builds RFC 5545 iCalendar payloads for plan invites (#246 A4).
-// Pure string templating, no third-party library — a single all-day VEVENT
-// is simple enough that a dependency isn't worth it, and hand-rolling keeps
-// the escaping/folding exactly matched to what Apple/Google Calendar import
-// needs (verified against both, see ics_test.go).
+// Package ics builds RFC 5545 iCalendar payloads for plan invites (#246 A4,
+// reworked #246 A7 for per-run crew: BuildPlanInvite emits one VCALENDAR
+// with MULTIPLE VEVENTs — the plan-spanning all-day event (as before) plus
+// one VEVENT per plan_run, so a recipient can live entirely off the
+// calendar attachment without ever loading the web page (§6 REVISED
+// 2026-07-25: "ICS carries the whole plan"). Pure string templating, no
+// third-party library — hand-rolling keeps the escaping/folding exactly
+// matched to what Apple/Google Calendar import needs (verified against
+// both, see ics_test.go).
 package ics
 
 import (
@@ -10,10 +14,35 @@ import (
 	"time"
 )
 
-// PlanInviteInput is the data BuildPlanInvite needs to render one plan as an
-// all-day (possibly multi-day) VEVENT.
+// PlanInviteRun is one plan_run rendered as its own VEVENT inside the plan's
+// VCALENDAR — RunTime set renders a timed event (DTSTART date+time, no
+// TZID/Z — RFC 5545 "floating time" form, interpreted in the viewer's local
+// zone, the simplest correct choice absent a stored per-run TZID) with a
+// placeholder PT2H DURATION (river-run length isn't tracked); RunTime empty
+// renders an all-day event on RunDate, same DTEND-exclusive convention as
+// the plan VEVENT.
+type PlanInviteRun struct {
+	// ID becomes part of UID={PlanID}-{ID}@h2oflows.app — unique per run
+	// within the plan.
+	ID string
+	// Name is user/reach-derived -> SUMMARY, TEXT-escaped.
+	Name string
+	// RunDate is YYYY-MM-DD.
+	RunDate string
+	// RunTime is HH:MM or HH:MM:SS (24h), or "" for an all-day run.
+	RunTime string
+	// Invited marks this as one of the recipient's invited runs — prefixes
+	// SUMMARY with "You're invited: " (contract §6: "invited runs marked in
+	// their SUMMARY/DESCRIPTION").
+	Invited bool
+}
+
+// PlanInviteInput is the data BuildPlanInvite needs to render one plan as a
+// multi-VEVENT VCALENDAR: one all-day VEVENT spanning the whole plan, plus
+// one VEVENT per entry in Runs.
 type PlanInviteInput struct {
-	// PlanID becomes UID={PlanID}@h2oflows.app.
+	// PlanID becomes UID={PlanID}@h2oflows.app for the plan-spanning VEVENT,
+	// and the UID prefix ({PlanID}-{run.ID}@h2oflows.app) for each run VEVENT.
 	PlanID string
 	// Name is user input -> SUMMARY, TEXT-escaped.
 	Name string
@@ -28,15 +57,22 @@ type PlanInviteInput struct {
 	// URL -> URL (not escaped; this is always a URI we construct, never raw
 	// user input).
 	URL string
-	// Now stamps DTSTAMP. Zero value defaults to time.Now().UTC() — tests
-	// pin this explicitly for deterministic golden output.
+	// Runs renders one additional VEVENT per entry, in the given order
+	// (callers pass them run_date/sort_order-ordered — the itinerary order).
+	Runs []PlanInviteRun
+	// Now stamps DTSTAMP (same instant reused for every VEVENT in the
+	// output). Zero value defaults to time.Now().UTC() — tests pin this
+	// explicitly for deterministic golden output.
 	Now time.Time
 }
 
 const (
-	inputDateLayout   = "2006-01-02"
-	icsDateLayout     = "20060102"
-	icsDateTimeLayout = "20060102T150405Z"
+	inputDateLayout    = "2006-01-02"
+	inputTimeLayoutSec = "15:04:05"
+	inputTimeLayoutMin = "15:04"
+	icsDateLayout      = "20060102"
+	icsDateTimeLayout  = "20060102T150405Z"
+	icsFloatingLayout  = "20060102T150405"
 	// maxFoldOctets is RFC 5545 §3.1's content-line limit: 75 octets,
 	// excluding the terminating CRLF. Continuation lines are prefixed by a
 	// single SPACE, which itself counts toward that continuation line's
@@ -45,13 +81,12 @@ const (
 	maxFoldOctets = 75
 )
 
-// BuildPlanInvite renders a single-VEVENT VCALENDAR for a plan invite email
-// attachment. Strictly RFC 5545: VERSION:2.0, PRODID, METHOD:PUBLISH,
-// UID={planID}@h2oflows.app, DTSTAMP (UTC, required), all-day
-// DTSTART/DTEND;VALUE=DATE (DTEND exclusive = EndDate+1 day), TEXT-escaped
-// SUMMARY/LOCATION (plan names and locations are user input), CRLF line
-// endings, 75-octet line folding. Shaped for, and manually verified against,
-// Apple Calendar and Google Calendar .ics import.
+// BuildPlanInvite renders a multi-VEVENT VCALENDAR for a plan invite email
+// attachment. Strictly RFC 5545: VERSION:2.0, PRODID, METHOD:PUBLISH, one
+// DTSTAMP (UTC, required) per VEVENT, TEXT-escaped SUMMARY/LOCATION (plan
+// names/run names are user/reach-derived input), CRLF line endings,
+// 75-octet line folding. Shaped for, and manually verified against, Apple
+// Calendar and Google Calendar .ics import.
 func BuildPlanInvite(in PlanInviteInput) string {
 	now := in.Now
 	if now.IsZero() {
@@ -74,6 +109,24 @@ func BuildPlanInvite(in PlanInviteInput) string {
 		"VERSION:2.0",
 		"PRODID:-//h2oflows//Trip Calendar//EN",
 		"METHOD:PUBLISH",
+	}
+	lines = append(lines, planVEvent(in, now, start, dtend)...)
+	for _, run := range in.Runs {
+		lines = append(lines, runVEvent(in.PlanID, run, now)...)
+	}
+	lines = append(lines, "END:VCALENDAR")
+
+	folded := make([]string, len(lines))
+	for i, l := range lines {
+		folded[i] = foldLine(l)
+	}
+	return strings.Join(folded, "\r\n") + "\r\n"
+}
+
+// planVEvent is the plan-spanning all-day VEVENT — unchanged in shape from
+// the original single-VEVENT BuildPlanInvite (#246 A4).
+func planVEvent(in PlanInviteInput, now, start, dtend time.Time) []string {
+	lines := []string{
 		"BEGIN:VEVENT",
 		"UID:" + in.PlanID + "@h2oflows.app",
 		"DTSTAMP:" + now.Format(icsDateTimeLayout),
@@ -87,13 +140,60 @@ func BuildPlanInvite(in PlanInviteInput) string {
 	if in.URL != "" {
 		lines = append(lines, "URL:"+in.URL)
 	}
-	lines = append(lines, "END:VEVENT", "END:VCALENDAR")
+	lines = append(lines, "END:VEVENT")
+	return lines
+}
 
-	folded := make([]string, len(lines))
-	for i, l := range lines {
-		folded[i] = foldLine(l)
+// runVEvent renders one plan_run as its own VEVENT — timed (DTSTART
+// floating date-time + DURATION:PT2H) when RunTime is set, else all-day
+// (DTSTART/DTEND;VALUE=DATE) on RunDate, matching planVEvent's exclusive-
+// DTEND convention.
+func runVEvent(planID string, run PlanInviteRun, now time.Time) []string {
+	rd, err := time.Parse(inputDateLayout, run.RunDate)
+	if err != nil {
+		rd = now
 	}
-	return strings.Join(folded, "\r\n") + "\r\n"
+
+	summary := run.Name
+	if run.Invited {
+		summary = "You're invited: " + summary
+	}
+
+	lines := []string{
+		"BEGIN:VEVENT",
+		"UID:" + planID + "-" + run.ID + "@h2oflows.app",
+		"DTSTAMP:" + now.Format(icsDateTimeLayout),
+	}
+	if rt, ok := parseRunTime(run.RunTime); ok {
+		dtstart := time.Date(rd.Year(), rd.Month(), rd.Day(), rt.Hour(), rt.Minute(), rt.Second(), 0, time.UTC)
+		lines = append(lines,
+			"DTSTART:"+dtstart.Format(icsFloatingLayout),
+			"DURATION:PT2H",
+		)
+	} else {
+		lines = append(lines,
+			"DTSTART;VALUE=DATE:"+rd.Format(icsDateLayout),
+			"DTEND;VALUE=DATE:"+rd.AddDate(0, 0, 1).Format(icsDateLayout),
+		)
+	}
+	lines = append(lines, "SUMMARY:"+escapeText(summary), "END:VEVENT")
+	return lines
+}
+
+// parseRunTime accepts "HH:MM:SS" or "HH:MM" (both shapes plan_runs.run_time
+// can come back as text ::text-cast from Postgres TIME); ok=false for ""
+// (all-day run) or an unparseable value.
+func parseRunTime(s string) (time.Time, bool) {
+	if s == "" {
+		return time.Time{}, false
+	}
+	if t, err := time.Parse(inputTimeLayoutSec, s); err == nil {
+		return t, true
+	}
+	if t, err := time.Parse(inputTimeLayoutMin, s); err == nil {
+		return t, true
+	}
+	return time.Time{}, false
 }
 
 // escapeText applies RFC 5545 §3.3.11 TEXT escaping: backslash, comma, and

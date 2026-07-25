@@ -21,6 +21,34 @@ import (
 // PlanHandler handles /plans, /plan-runs, and /me/calendar* routes (#246 A3
 // — Trip Calendar). Split across plans.go (plan CRUD + shared helpers),
 // plan_runs.go (calendar-run CRUD), calendar.go (/me/calendar*).
+//
+// # Membership rule (#246 A7, binding)
+//
+// Crew/RSVP rows (plan_members) are RUN-scoped (plan_run_id NOT NULL)
+// whenever the parent plan has at least one live run — invites and join
+// requests fan out to one row per targeted run at write time (InviteToPlan/
+// JoinRun), never lazily. A plan with ZERO live runs has nowhere to fan out
+// to, so its invites/requests stay PLAN-scoped (plan_run_id NULL) — the
+// plan page simply lists them as plan members with no per-run RSVP button.
+// This is a static split decided once at invite/join time, not a live
+// state: a runless plan that later gains its first run does NOT retroactively
+// fan out its existing plan-level rows (deliberately simple — see
+// migrations/000144_crew_per_run.up.sql's one-time fan-out, which only ever
+// runs against pre-existing data).
+//
+// "Plan member" for ACCESS checks (private-plan read in renderPlan/
+// renderPlanRun, the calendar plans[] role in calendar.go, the log-mine gate
+// in LogMine, moderation's FlagPlanRun) means: EXISTS any plan_members row
+// for that plan_id with the right status, regardless of plan_run_id (run-
+// scoped or plan-level, doesn't matter) — every access-check query in this
+// package already matches on plan_id alone with no plan_run_id filter, so
+// they needed no code change for this rule; this comment documents that
+// invariant so it isn't accidentally narrowed to a single run later.
+//
+// "Crew" (the accept/decline meter with a cap), by contrast, is ALWAYS
+// per-run: runFilled/plan_runs.max_crew/looking_for_crew below, never a
+// plan-level aggregate — a plan itself has no crew concept anymore (the
+// columns moved to plan_runs; see plans_test/plan_runs.go).
 type PlanHandler struct {
 	db            *pgxpool.Pool
 	devFallbackID string
@@ -228,20 +256,22 @@ func uniqueRunSlug(ctx context.Context, q dbQueryer, ownerID, base string) strin
 	return fmt.Sprintf("%s-%d", base, time.Now().UnixMilli())
 }
 
-// crewFilled counts plan_members rows with status='accepted' for planID —
-// the shared crew-meter read used by renderPlan (plans.go) and
-// CrewList/CrewAccept/JoinPlan/AcceptInvite (invites.go). #246 A4 carry-over
-// fix (task 6a): every call site used to `.Scan(&filled)` and discard the
-// error, silently fail-open to filled=0 on a DB error — at every gating call
-// site (JoinPlan/CrewAccept/AcceptInvite's `filled>=max_crew` check) that
-// would let an over-cap join through on a transient DB error instead of
-// rejecting it. Scan errors now propagate to the caller as a real 500.
-func crewFilled(ctx context.Context, q dbQueryer, planID string) (int, error) {
+// runFilled counts plan_members rows with status='accepted' for planRunID —
+// the shared crew-meter read used by renderPlan/renderPlanRun (per itinerary
+// run) and RunCrewList/RunCrewAccept/JoinRun/AcceptInvite (invites.go). #246
+// A7: crew moved from plans to plan_runs (product decision, see the package
+// comment above) — this replaces the old plan-scoped crewFilled. Host is
+// never counted (no membership row for the host). #246 A4 carry-over fix
+// (task 6a, preserved): scan errors propagate as a real error rather than
+// silently failing open to filled=0, which would let an over-cap
+// join/accept through on a transient DB error at any of this function's
+// gating call sites.
+func runFilled(ctx context.Context, q dbQueryer, planRunID string) (int, error) {
 	var filled int
 	if err := q.QueryRow(ctx,
-		`SELECT COUNT(*) FROM plan_members WHERE plan_id = $1::uuid AND status = 'accepted'`, planID,
+		`SELECT COUNT(*) FROM plan_members WHERE plan_run_id = $1::uuid AND status = 'accepted'`, planRunID,
 	).Scan(&filled); err != nil {
-		return 0, fmt.Errorf("crewFilled: %w", err)
+		return 0, fmt.Errorf("runFilled: %w", err)
 	}
 	return filled, nil
 }
@@ -249,43 +279,56 @@ func crewFilled(ctx context.Context, q dbQueryer, planID string) (int, error) {
 // ── Response shapes ──────────────────────────────────────────────────────
 
 type planDetail struct {
-	ID             string  `json:"id"`
-	Slug           string  `json:"slug"`
-	Name           string  `json:"name"`
-	Type           string  `json:"type"`
-	Visibility     string  `json:"visibility"`
-	StartDate      string  `json:"start_date"`
-	EndDate        string  `json:"end_date"`
-	Location       *string `json:"location,omitempty"`
-	LookingForCrew bool    `json:"looking_for_crew"`
-	MaxCrew        *int    `json:"max_crew,omitempty"`
-	HostOwnerID    string  `json:"host_owner_id"`
-	HostHandle     string  `json:"host_handle"`
-	CreatedAt      string  `json:"created_at"`
-	UpdatedAt      string  `json:"updated_at"`
+	ID          string  `json:"id"`
+	Slug        string  `json:"slug"`
+	Name        string  `json:"name"`
+	Type        string  `json:"type"`
+	Visibility  string  `json:"visibility"`
+	StartDate   string  `json:"start_date"`
+	EndDate     string  `json:"end_date"`
+	Location    *string `json:"location,omitempty"`
+	HostOwnerID string  `json:"host_owner_id"`
+	HostHandle  string  `json:"host_handle"`
+	CreatedAt   string  `json:"created_at"`
+	UpdatedAt   string  `json:"updated_at"`
+}
+
+// runCrewMeter is the per-run crew embed (#246 A7 — crew moved off plans
+// onto plan_runs): {filled,max,looking_for_crew}, always present on a
+// planRunSummary (not conditional on LookingForCrew) so the web can render
+// "not looking for crew" vs "0 of N" without a second field to check.
+type runCrewMeter struct {
+	Filled         int  `json:"filled"`
+	Max            *int `json:"max,omitempty"`
+	LookingForCrew bool `json:"looking_for_crew"`
 }
 
 type planRunSummary struct {
-	ID          string   `json:"id"`
-	Slug        string   `json:"slug"`
-	UserReachID *string  `json:"user_reach_id,omitempty"`
-	Name        *string  `json:"name,omitempty"`
-	RunDate     string   `json:"run_date"`
-	RunTime     *string  `json:"run_time,omitempty"`
-	SortOrder   int16    `json:"sort_order"`
-	GaugeCFS    *float64 `json:"gauge_cfs,omitempty"`
-	FlowBand    *string  `json:"flow_band,omitempty"`
-	FlowColor   *string  `json:"flow_color,omitempty"`
-	Paddled     bool     `json:"paddled"`
-	PaddledAt   *string  `json:"paddled_at,omitempty"`
-	Notes       *string  `json:"notes,omitempty"`
-	Companions  *string  `json:"companions,omitempty"`
-	CreatedAt   string   `json:"created_at,omitempty"`
+	ID          string       `json:"id"`
+	Slug        string       `json:"slug"`
+	UserReachID *string      `json:"user_reach_id,omitempty"`
+	Name        *string      `json:"name,omitempty"`
+	RunDate     string       `json:"run_date"`
+	RunTime     *string      `json:"run_time,omitempty"`
+	SortOrder   int16        `json:"sort_order"`
+	GaugeCFS    *float64     `json:"gauge_cfs,omitempty"`
+	FlowBand    *string      `json:"flow_band,omitempty"`
+	FlowColor   *string      `json:"flow_color,omitempty"`
+	Paddled     bool         `json:"paddled"`
+	PaddledAt   *string      `json:"paddled_at,omitempty"`
+	Notes       *string      `json:"notes,omitempty"`
+	Companions  *string      `json:"companions,omitempty"`
+	CreatedAt   string       `json:"created_at,omitempty"`
+	Crew        runCrewMeter `json:"crew"`
 }
 
 type planMember struct {
 	Handle string `json:"handle"`
 	Status string `json:"status"`
+	// PlanRunID is nil for a plan-level row (runless-plan invite/request —
+	// see the membership-rule package comment above), set to the specific
+	// run this membership row RSVPs to otherwise (#246 A7).
+	PlanRunID *string `json:"plan_run_id,omitempty"`
 	// InviteEmail is populated ONLY when the viewer is the host — email-only
 	// invitees have no handle (member_owner_id NULL until accept), and without
 	// this the host's members row rendered them invisible. Never exposed to
@@ -312,16 +355,21 @@ func (h *PlanHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		Name           string              `json:"name"`
-		Type           *string             `json:"type"`
-		StartDate      string              `json:"start_date"`
-		EndDate        string              `json:"end_date"`
-		Location       *string             `json:"location"`
-		Visibility     *string             `json:"visibility"`
-		LookingForCrew *bool               `json:"looking_for_crew"`
-		MaxCrew        *int                `json:"max_crew"`
-		Runs           []createPlanRunBody `json:"runs"`
-		Invites        []inviteBody        `json:"invites"`
+		Name       string              `json:"name"`
+		Type       *string             `json:"type"`
+		StartDate  string              `json:"start_date"`
+		EndDate    string              `json:"end_date"`
+		Location   *string             `json:"location"`
+		Visibility *string             `json:"visibility"`
+		Runs       []createPlanRunBody `json:"runs"`
+		Invites    []inviteBody        `json:"invites"`
+		// LookingForCrew/MaxCrew: #246 A7 moved crew from plans to plan_runs
+		// (see createPlanRunBody's own fields of the same name). Decoded and
+		// SILENTLY IGNORED here rather than rejected — an un-migrated web
+		// client (pre-W5) still POSTs these at the plan level, and this
+		// endpoint must not 400 it (sweep note, IMPLEMENTATION_PLAN.md §6/§9).
+		LookingForCrew *bool `json:"looking_for_crew"`
+		MaxCrew        *int  `json:"max_crew"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid JSON")
@@ -368,11 +416,6 @@ func (h *PlanHandler) Create(w http.ResponseWriter, r *http.Request) {
 		}
 		visibility = *body.Visibility
 	}
-	lookingForCrew := body.LookingForCrew != nil && *body.LookingForCrew
-	if lookingForCrew && (body.MaxCrew == nil || *body.MaxCrew <= 0) {
-		errorResponse(w, http.StatusBadRequest, "max_crew is required (and must be > 0) when looking_for_crew is true")
-		return
-	}
 
 	ctx := r.Context()
 
@@ -404,12 +447,11 @@ func (h *PlanHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var planID string
 	err = tx.QueryRow(ctx, `
 		INSERT INTO plans
-			(owner_id, slug, name, type, visibility, start_date, end_date,
-			 location, looking_for_crew, max_crew)
-		VALUES ($1,$2,$3,$4::plan_type,$5::plan_visibility,$6::date,$7::date,$8,$9,$10)
+			(owner_id, slug, name, type, visibility, start_date, end_date, location)
+		VALUES ($1,$2,$3,$4::plan_type,$5::plan_visibility,$6::date,$7::date,$8)
 		RETURNING id
 	`, ownerID, slug, name, planType, visibility, body.StartDate, body.EndDate,
-		body.Location, lookingForCrew, body.MaxCrew,
+		body.Location,
 	).Scan(&planID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("create plan failed: %v", err))
@@ -434,12 +476,23 @@ func (h *PlanHandler) Create(w http.ResponseWriter, r *http.Request) {
 		if body.Location != nil {
 			loc = *body.Location
 		}
+		allRuns, rerr := loadPlanRuns(ctx, tx, planID)
+		if rerr != nil {
+			errorResponse(w, http.StatusInternalServerError, "load runs failed")
+			return
+		}
 		planInfo := invitedPlanInfo{
 			ID: planID, Slug: slug, Name: name, Location: loc,
 			StartDate: body.StartDate, EndDate: body.EndDate, HostHandle: handle,
+			AllRuns: allRuns,
 		}
 		for _, ib := range body.Invites {
-			_, pending, ierr := inviteOne(ctx, tx, planInfo, ownerID, ib)
+			targets, terr := resolveInviteTargets(planInfo.AllRuns, ib.PlanRunIDs)
+			if terr != nil {
+				h.respondAPIError(w, terr)
+				return
+			}
+			_, pending, ierr := inviteOne(ctx, tx, planInfo, ownerID, ib, targets)
 			if ierr != nil {
 				h.respondAPIError(w, ierr)
 				return
@@ -529,7 +582,7 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, planID 
 	// member_owner_id check below and would 404 despite holding a valid
 	// token — resolve the token once, up front, for both branches.
 	callerID, callerOK := h.ownerID(r)
-	tokenMemberID, tokenGrant := inviteTokenMemberID(ctx, h.db, planID, r.URL.Query().Get("invite"))
+	tokenMemberIDs, tokenGrant := inviteTokenMemberIDs(ctx, h.db, planID, r.URL.Query().Get("invite"))
 	if !callerOK && !tokenGrant {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
 		return
@@ -540,7 +593,6 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, planID 
 	err := h.db.QueryRow(ctx, `
 		SELECT p.id, p.slug, p.name, p.type::text, p.visibility::text,
 		       p.start_date::text, p.end_date::text, p.location,
-		       p.looking_for_crew, p.max_crew,
 		       p.owner_id, COALESCE(up.handle, ''),
 		       p.created_at, p.updated_at
 		FROM plans p
@@ -549,7 +601,6 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, planID 
 	`, planID).Scan(
 		&pd.ID, &pd.Slug, &pd.Name, &pd.Type, &pd.Visibility,
 		&pd.StartDate, &pd.EndDate, &pd.Location,
-		&pd.LookingForCrew, &pd.MaxCrew,
 		&pd.HostOwnerID, &pd.HostHandle,
 		&createdAt, &updatedAt,
 	)
@@ -574,12 +625,20 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, planID 
 		}
 	}
 
+	// #246 A7: per-run crew {filled,max,looking_for_crew} embedded via the
+	// cm LATERAL — crew is no longer a plan-level aggregate (see the
+	// membership-rule package comment above runFilled).
 	rows, err := h.db.Query(ctx, `
 		SELECT pr.id, pr.slug, pr.user_reach_id::text, ur.name, pr.run_date::text, pr.run_time::text,
 		       pr.sort_order, pr.gauge_cfs, pr.flow_band, pr.flow_color, pr.paddled, pr.paddled_at,
-		       pr.notes, pr.companions, pr.created_at
+		       pr.notes, pr.companions, pr.created_at,
+		       pr.looking_for_crew, pr.max_crew, COALESCE(cm.filled, 0)
 		FROM plan_runs pr
 		LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
+		LEFT JOIN LATERAL (
+			SELECT COUNT(*) AS filled FROM plan_members pm
+			WHERE pm.plan_run_id = pr.id AND pm.status = 'accepted'
+		) cm ON true
 		WHERE pr.plan_id = $1 AND pr.deleted_at IS NULL
 		ORDER BY pr.run_date, pr.sort_order
 	`, planID)
@@ -599,6 +658,7 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, planID 
 			&run.ID, &run.Slug, &run.UserReachID, &run.Name, &run.RunDate, &run.RunTime,
 			&run.SortOrder, &run.GaugeCFS, &run.FlowBand, &run.FlowColor, &run.Paddled, &paddledAtRaw,
 			&run.Notes, &run.Companions, &createdAtRaw,
+			&run.Crew.LookingForCrew, &run.Crew.Max, &run.Crew.Filled,
 		); err != nil {
 			errorResponse(w, http.StatusInternalServerError, "scan failed")
 			return
@@ -622,9 +682,12 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, planID 
 
 	viewerIsHost := callerOK && callerID == pd.HostOwnerID
 	members := []planMember{}
+	// #246 A7: members[] gains plan_run_id so the web can map each RSVP to
+	// its run — nil for a plan-level row (runless plan, see the membership
+	// rule package comment above).
 	memberRows, err := h.db.Query(ctx, `
 		SELECT COALESCE(up.handle, pm.invite_handle, '') AS handle, pm.status::text,
-		       pm.invite_email
+		       pm.plan_run_id::text, pm.invite_email
 		FROM plan_members pm
 		LEFT JOIN user_profiles up ON up.owner_id = pm.member_owner_id
 		WHERE pm.plan_id = $1
@@ -634,7 +697,7 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, planID 
 		defer memberRows.Close()
 		for memberRows.Next() {
 			var m planMember
-			if memberRows.Scan(&m.Handle, &m.Status, &m.InviteEmail) == nil {
+			if memberRows.Scan(&m.Handle, &m.Status, &m.PlanRunID, &m.InviteEmail) == nil {
 				if !viewerIsHost {
 					m.InviteEmail = nil // invitee privacy — emails are host-only
 				}
@@ -643,25 +706,19 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, planID 
 		}
 	}
 
-	filled, ferr := crewFilled(ctx, h.db, planID)
-	if ferr != nil {
-		errorResponse(w, http.StatusInternalServerError, "crew count failed")
-		return
-	}
-
 	resp := map[string]any{
 		"plan":      pd,
 		"itinerary": itinerary,
 		"members":   members,
-		"crew":      map[string]any{"filled": filled, "max": pd.MaxCrew},
 	}
 	if tokenGrant {
 		// Lets the frontend drive InviteAcceptCard/POST /invites/{id}/accept
 		// for a caller who holds a valid invite token but isn't bound to the
 		// invite yet (member_owner_id still NULL — e.g. signed up with a
 		// different email than the invite, so it's absent from /me/invites
-		// too; review finding, #246 W4).
-		resp["invite_member_id"] = tokenMemberID
+		// too; review finding, #246 W4). #246 A7: plural — an email invite's
+		// token now spans one row per invited run (inviteOne's fan-out).
+		resp["invite_member_ids"] = tokenMemberIDs
 	}
 	jsonResponse(w, http.StatusOK, resp)
 }
@@ -710,7 +767,6 @@ func (h *PlanHandler) ListMine(w http.ResponseWriter, r *http.Request) {
 	query := fmt.Sprintf(`
 		SELECT p.id, p.slug, p.name, p.type::text, p.visibility::text,
 		       p.start_date::text, p.end_date::text, p.location,
-		       p.looking_for_crew, p.max_crew,
 		       (SELECT COUNT(*) FROM plan_runs pr WHERE pr.plan_id = p.id AND pr.deleted_at IS NULL) AS run_count
 		FROM plans p
 		WHERE %s
@@ -725,24 +781,22 @@ func (h *PlanHandler) ListMine(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type myPlan struct {
-		ID             string  `json:"id"`
-		Slug           string  `json:"slug"`
-		Name           string  `json:"name"`
-		Type           string  `json:"type"`
-		Visibility     string  `json:"visibility"`
-		StartDate      string  `json:"start_date"`
-		EndDate        string  `json:"end_date"`
-		Location       *string `json:"location,omitempty"`
-		LookingForCrew bool    `json:"looking_for_crew"`
-		MaxCrew        *int    `json:"max_crew,omitempty"`
-		RunCount       int     `json:"run_count"`
+		ID         string  `json:"id"`
+		Slug       string  `json:"slug"`
+		Name       string  `json:"name"`
+		Type       string  `json:"type"`
+		Visibility string  `json:"visibility"`
+		StartDate  string  `json:"start_date"`
+		EndDate    string  `json:"end_date"`
+		Location   *string `json:"location,omitempty"`
+		RunCount   int     `json:"run_count"`
 	}
 
 	plans := []myPlan{}
 	for rows.Next() {
 		var p myPlan
 		if err := rows.Scan(&p.ID, &p.Slug, &p.Name, &p.Type, &p.Visibility,
-			&p.StartDate, &p.EndDate, &p.Location, &p.LookingForCrew, &p.MaxCrew, &p.RunCount); err != nil {
+			&p.StartDate, &p.EndDate, &p.Location, &p.RunCount); err != nil {
 			errorResponse(w, http.StatusInternalServerError, "scan failed")
 			return
 		}
@@ -763,14 +817,16 @@ func (h *PlanHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		Name           *string `json:"name"`
-		Type           *string `json:"type"`
-		Visibility     *string `json:"visibility"`
-		LookingForCrew *bool   `json:"looking_for_crew"`
-		MaxCrew        *int    `json:"max_crew"`
-		StartDate      *string `json:"start_date"`
-		EndDate        *string `json:"end_date"`
-		Location       *string `json:"location"`
+		Name       *string `json:"name"`
+		Type       *string `json:"type"`
+		Visibility *string `json:"visibility"`
+		StartDate  *string `json:"start_date"`
+		EndDate    *string `json:"end_date"`
+		Location   *string `json:"location"`
+		// LookingForCrew/MaxCrew: #246 A7 moved crew to plan_runs — see the
+		// same comment on Create's body struct above. Decoded, never applied.
+		LookingForCrew *bool `json:"looking_for_crew"`
+		MaxCrew        *int  `json:"max_crew"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid JSON")
@@ -780,12 +836,10 @@ func (h *PlanHandler) Update(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	var curType, curVisibility, curStart, curEnd string
-	var curLookingForCrew bool
-	var curMaxCrew *int
 	err := h.db.QueryRow(ctx, `
-		SELECT type::text, visibility::text, start_date::text, end_date::text, looking_for_crew, max_crew
+		SELECT type::text, visibility::text, start_date::text, end_date::text
 		FROM plans WHERE id = $1::uuid AND owner_id = $2 AND deleted_at IS NULL
-	`, id, ownerID).Scan(&curType, &curVisibility, &curStart, &curEnd, &curLookingForCrew, &curMaxCrew)
+	`, id, ownerID).Scan(&curType, &curVisibility, &curStart, &curEnd)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "plan not found")
 		return
@@ -825,19 +879,6 @@ func (h *PlanHandler) Update(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusBadRequest, "end_date must be on or after start_date")
 		return
 	}
-	newLookingForCrew := curLookingForCrew
-	if body.LookingForCrew != nil {
-		newLookingForCrew = *body.LookingForCrew
-	}
-	newMaxCrew := curMaxCrew
-	if body.MaxCrew != nil {
-		newMaxCrew = body.MaxCrew
-	}
-	if newLookingForCrew && (newMaxCrew == nil || *newMaxCrew <= 0) {
-		errorResponse(w, http.StatusBadRequest, "max_crew is required (and must be > 0) when looking_for_crew is true")
-		return
-	}
-
 	// #246 A4 carry-over fix: shrinking [start_date,end_date] must not stray
 	// from a live child plan_run's run_date — orphaning a scheduled run
 	// outside its own plan's dates silently breaks validateRunDateInRange's
@@ -862,18 +903,15 @@ func (h *PlanHandler) Update(w http.ResponseWriter, r *http.Request) {
 
 	_, err = h.db.Exec(ctx, `
 		UPDATE plans SET
-			name             = COALESCE($1, name),
-			type             = $2::plan_type,
-			visibility       = $3::plan_visibility,
-			start_date       = $4::date,
-			end_date         = $5::date,
-			location         = COALESCE($6, location),
-			looking_for_crew = $7,
-			max_crew         = $8,
-			updated_at       = NOW()
-		WHERE id = $9::uuid AND owner_id = $10
-	`, body.Name, newType, newVisibility, newStart, newEnd, body.Location,
-		newLookingForCrew, newMaxCrew, id, ownerID)
+			name       = COALESCE($1, name),
+			type       = $2::plan_type,
+			visibility = $3::plan_visibility,
+			start_date = $4::date,
+			end_date   = $5::date,
+			location   = COALESCE($6, location),
+			updated_at = NOW()
+		WHERE id = $7::uuid AND owner_id = $8
+	`, body.Name, newType, newVisibility, newStart, newEnd, body.Location, id, ownerID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("update failed: %v", err))
 		return
