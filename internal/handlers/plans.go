@@ -286,6 +286,11 @@ type planRunSummary struct {
 type planMember struct {
 	Handle string `json:"handle"`
 	Status string `json:"status"`
+	// InviteEmail is populated ONLY when the viewer is the host — email-only
+	// invitees have no handle (member_owner_id NULL until accept), and without
+	// this the host's members row rendered them invisible. Never exposed to
+	// non-host viewers (invitee privacy).
+	InviteEmail *string `json:"invite_email,omitempty"`
 }
 
 type itineraryDay struct {
@@ -615,9 +620,11 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, planID 
 		itinerary = append(itinerary, itineraryDay{Date: d, Runs: runsByDate[d]})
 	}
 
+	viewerIsHost := callerOK && callerID == pd.HostOwnerID
 	members := []planMember{}
 	memberRows, err := h.db.Query(ctx, `
-		SELECT COALESCE(up.handle, pm.invite_handle, '') AS handle, pm.status::text
+		SELECT COALESCE(up.handle, pm.invite_handle, '') AS handle, pm.status::text,
+		       pm.invite_email
 		FROM plan_members pm
 		LEFT JOIN user_profiles up ON up.owner_id = pm.member_owner_id
 		WHERE pm.plan_id = $1
@@ -627,7 +634,10 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, planID 
 		defer memberRows.Close()
 		for memberRows.Next() {
 			var m planMember
-			if memberRows.Scan(&m.Handle, &m.Status) == nil {
+			if memberRows.Scan(&m.Handle, &m.Status, &m.InviteEmail) == nil {
+				if !viewerIsHost {
+					m.InviteEmail = nil // invitee privacy — emails are host-only
+				}
 				members = append(members, m)
 			}
 		}

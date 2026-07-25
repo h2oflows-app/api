@@ -250,6 +250,19 @@ func inviteTokenMemberID(ctx context.Context, db *pgxpool.Pool, planID, token st
 // context dies at response, so a fresh context.Background()+timeout is used
 // per the contract ("Sends are async... go func with its own
 // context.Background+timeout").
+// webBaseURL is the web origin embedded in invite emails + .ics links.
+// Overridden from config (WEB_BASE_URL) in main.go so staging emails link to
+// the staging web deploy instead of prod (which bit the first staging test:
+// the emailed link went to prod, where the plan page wasn't deployed yet).
+var webBaseURL = "https://h2oflows.app"
+
+// SetWebBaseURL wires config.WebBaseURL at startup (trailing slash stripped).
+func SetWebBaseURL(u string) {
+	if u != "" {
+		webBaseURL = strings.TrimRight(u, "/")
+	}
+}
+
 func sendInviteMail(mailer mail.Mailer, p pendingInviteMail) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -258,7 +271,7 @@ func sendInviteMail(mailer mail.Mailer, p pendingInviteMail) {
 	if host == "" {
 		host = "a paddler"
 	}
-	planURL := fmt.Sprintf("https://h2oflows.app/plans/%s/%s", p.plan.HostHandle, p.plan.Slug)
+	planURL := fmt.Sprintf("%s/plans/%s/%s", webBaseURL, p.plan.HostHandle, p.plan.Slug)
 	acceptURL := fmt.Sprintf("%s?invite=%s", planURL, p.rawToken)
 
 	dateRange := p.plan.StartDate

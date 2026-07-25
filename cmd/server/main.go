@@ -135,6 +135,7 @@ func main() {
 	meGauges := handlers.NewUserGaugesHandler(pool, devFallbackID).WithPoller(p)
 	userProfiles := handlers.NewUserProfileHandler(pool)
 	moderation := handlers.NewModerationHandler(pool, devFallbackID)
+	handlers.SetWebBaseURL(cfg.WebBaseURL)
 	plans := handlers.NewPlanHandler(pool, devFallbackID).WithMailer(mailer)
 	invites := handlers.NewInviteHandler(pool, devFallbackID, mailer)
 	nudges := handlers.NewNudgeHandler(pool, devFallbackID)
