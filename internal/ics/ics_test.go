@@ -107,7 +107,10 @@ func TestBuildPlanInvite_LongMultibyteName(t *testing.T) {
 // prefix) — verifying UID composition, per-VEVENT DTSTAMP, and the "You're
 // invited" marker. Short fake IDs (not full UUIDs) keep every line under the
 // 75-octet fold threshold so this test isolates multi-VEVENT structure from
-// the folding behavior already covered above.
+// the folding behavior already covered above. Also covers "meet up at"
+// (product request 2026-07-25): run-a has its own MeetupSpot (LOCATION
+// overrides the plan's), run-b has none (LOCATION falls back to the plan's
+// "Idaho").
 func TestBuildPlanInvite_MultiVEventWithRuns(t *testing.T) {
 	got := BuildPlanInvite(PlanInviteInput{
 		PlanID:    "plan1",
@@ -118,7 +121,7 @@ func TestBuildPlanInvite_MultiVEventWithRuns(t *testing.T) {
 		URL:       "https://h2oflows.app/plans/ianskluhsman/salmon-trip",
 		Now:       time.Date(2026, 7, 23, 18, 4, 5, 0, time.UTC),
 		Runs: []PlanInviteRun{
-			{ID: "run-a", Name: "Foxton", RunDate: "2026-08-01", RunTime: "10:00:00", Invited: true},
+			{ID: "run-a", Name: "Foxton", RunDate: "2026-08-01", RunTime: "10:00:00", Invited: true, MeetupSpot: "The 'T' parking lot"},
 			{ID: "run-b", Name: "South Platte", RunDate: "2026-08-02", RunTime: "", Invited: false},
 		},
 	})
@@ -142,6 +145,7 @@ func TestBuildPlanInvite_MultiVEventWithRuns(t *testing.T) {
 		"DTSTART:20260801T100000\r\n" +
 		"DURATION:PT2H\r\n" +
 		"SUMMARY:You're invited: Foxton\r\n" +
+		"LOCATION:The 'T' parking lot\r\n" +
 		"END:VEVENT\r\n" +
 		"BEGIN:VEVENT\r\n" +
 		"UID:plan1-run-b@h2oflows.app\r\n" +
@@ -149,6 +153,7 @@ func TestBuildPlanInvite_MultiVEventWithRuns(t *testing.T) {
 		"DTSTART;VALUE=DATE:20260802\r\n" +
 		"DTEND;VALUE=DATE:20260803\r\n" +
 		"SUMMARY:South Platte\r\n" +
+		"LOCATION:Idaho\r\n" +
 		"END:VEVENT\r\n" +
 		"END:VCALENDAR\r\n"
 

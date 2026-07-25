@@ -186,16 +186,17 @@ func (h *DiscoverHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 // future/today runs w/ looking_for_crew, parent public); a plan appears iff
 // it has >=1 such run."
 type discoverPlanRun struct {
-	PlanRunID string            `json:"plan_run_id"`
-	Name      string            `json:"name"`
-	RunDate   string            `json:"run_date"`
-	RunTime   *string           `json:"run_time,omitempty"`
-	ClassMin  *float64          `json:"class_min,omitempty"`
-	ClassMax  *float64          `json:"class_max,omitempty"`
-	FlowBand  *string           `json:"flow_band,omitempty"`
-	FlowColor *string           `json:"flow_color,omitempty"`
-	GaugeCFS  *float64          `json:"gauge_cfs,omitempty"`
-	Crew      discoverCrewMeter `json:"crew"`
+	PlanRunID  string            `json:"plan_run_id"`
+	Name       string            `json:"name"`
+	RunDate    string            `json:"run_date"`
+	RunTime    *string           `json:"run_time,omitempty"`
+	ClassMin   *float64          `json:"class_min,omitempty"`
+	ClassMax   *float64          `json:"class_max,omitempty"`
+	FlowBand   *string           `json:"flow_band,omitempty"`
+	FlowColor  *string           `json:"flow_color,omitempty"`
+	GaugeCFS   *float64          `json:"gauge_cfs,omitempty"`
+	Crew       discoverCrewMeter `json:"crew"`
+	MeetupSpot *string           `json:"meetup_spot,omitempty"`
 }
 
 type discoverPlan struct {
@@ -338,7 +339,7 @@ func (h *DiscoverHandler) ListPlans(w http.ResponseWriter, r *http.Request) {
 		runRows, rerr := h.db.Query(ctx, `
 			SELECT pr.plan_id::text, pr.id::text, COALESCE(ur.name, 'Paddle'), pr.run_date::text, pr.run_time::text,
 			       ur.class_min, ur.class_max, pr.flow_band, pr.flow_color, pr.gauge_cfs,
-			       pr.max_crew, COALESCE(cm.filled, 0)
+			       pr.max_crew, COALESCE(cm.filled, 0), pr.meetup_spot
 			FROM plan_runs pr
 			LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
 			LEFT JOIN LATERAL (
@@ -359,7 +360,7 @@ func (h *DiscoverHandler) ListPlans(w http.ResponseWriter, r *http.Request) {
 				if serr := runRows.Scan(
 					&planID, &dr.PlanRunID, &dr.Name, &dr.RunDate, &dr.RunTime,
 					&dr.ClassMin, &dr.ClassMax, &dr.FlowBand, &dr.FlowColor, &dr.GaugeCFS,
-					&dr.Crew.Max, &dr.Crew.Filled,
+					&dr.Crew.Max, &dr.Crew.Filled, &dr.MeetupSpot,
 				); serr != nil {
 					continue
 				}

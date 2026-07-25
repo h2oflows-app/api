@@ -285,7 +285,8 @@ func (h *PlanHandler) CalendarDay(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := h.db.Query(ctx, `
 		SELECT pr.id, pr.plan_id::text, pr.slug, pr.user_reach_id::text, ur.name,
-		       pr.flow_band, pr.flow_color, pr.gauge_cfs, pr.paddled, pr.run_time::text, pr.notes
+		       pr.flow_band, pr.flow_color, pr.gauge_cfs, pr.paddled, pr.run_time::text, pr.notes,
+		       pr.meetup_spot, pr.meetup_rapid_id::text, pr.meetup_access_id::text
 		FROM plan_runs pr
 		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
 		LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
@@ -299,29 +300,35 @@ func (h *PlanHandler) CalendarDay(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type dayRun struct {
-		ID             string   `json:"id"`
-		PlanID         string   `json:"plan_id"`
-		Slug           string   `json:"slug"`
-		UserReachID    *string  `json:"user_reach_id,omitempty"`
-		Name           *string  `json:"name,omitempty"`
-		FlowBand       *string  `json:"flow_band,omitempty"`
-		FlowColor      *string  `json:"flow_color,omitempty"`
-		GaugeCFS       *float64 `json:"gauge_cfs,omitempty"`
-		Paddled        bool     `json:"paddled"`
-		RunTime        *string  `json:"run_time,omitempty"`
-		Notes          *string  `json:"notes,omitempty"`
-		CanMarkPaddled bool     `json:"can_mark_paddled"`
+		ID                string   `json:"id"`
+		PlanID            string   `json:"plan_id"`
+		Slug              string   `json:"slug"`
+		UserReachID       *string  `json:"user_reach_id,omitempty"`
+		Name              *string  `json:"name,omitempty"`
+		FlowBand          *string  `json:"flow_band,omitempty"`
+		FlowColor         *string  `json:"flow_color,omitempty"`
+		GaugeCFS          *float64 `json:"gauge_cfs,omitempty"`
+		Paddled           bool     `json:"paddled"`
+		RunTime           *string  `json:"run_time,omitempty"`
+		Notes             *string  `json:"notes,omitempty"`
+		CanMarkPaddled    bool     `json:"can_mark_paddled"`
+		MeetupSpot        *string  `json:"meetup_spot,omitempty"`
+		MeetupFeatureType *string  `json:"meetup_feature_type,omitempty"`
+		MeetupFeatureID   *string  `json:"meetup_feature_id,omitempty"`
 	}
 
 	runs := []dayRun{}
 	for rows.Next() {
 		var dr dayRun
+		var meetupRapidID, meetupAccessID *string
 		if err := rows.Scan(&dr.ID, &dr.PlanID, &dr.Slug, &dr.UserReachID, &dr.Name,
-			&dr.FlowBand, &dr.FlowColor, &dr.GaugeCFS, &dr.Paddled, &dr.RunTime, &dr.Notes); err != nil {
+			&dr.FlowBand, &dr.FlowColor, &dr.GaugeCFS, &dr.Paddled, &dr.RunTime, &dr.Notes,
+			&dr.MeetupSpot, &meetupRapidID, &meetupAccessID); err != nil {
 			errorResponse(w, http.StatusInternalServerError, "scan failed")
 			return
 		}
 		dr.CanMarkPaddled = !dr.Paddled && canMark
+		dr.MeetupFeatureType, dr.MeetupFeatureID = meetupFeatureTypeID(meetupRapidID, meetupAccessID)
 		runs = append(runs, dr)
 	}
 

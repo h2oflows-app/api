@@ -3,6 +3,16 @@
 -- restore) — task 10's local-DB up/down/up smoke test is what this is
 -- shaped for.
 
+-- (d) Drop the "meet up at" columns FIRST — added on top of the crew
+-- remodel above (product request 2026-07-25), so it's the last thing the up
+-- migration adds and the first thing rolled back here, mirroring (a)-(c)'s
+-- own reverse order below. Column drops auto-drop the indexes and the XOR
+-- check constraint that depend solely on these columns.
+ALTER TABLE plan_runs
+  DROP COLUMN meetup_spot,
+  DROP COLUMN meetup_rapid_id,
+  DROP COLUMN meetup_access_id;
+
 -- (c) Collapse plan_members rows back toward one plan-level row per
 -- (plan_id, member_owner_id-or-email): the up migration's fan-out is only
 -- cleanly invertible when every fanned-out group agrees on status/message/

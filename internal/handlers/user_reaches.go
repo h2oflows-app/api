@@ -1235,6 +1235,97 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 	jsonResponse(w, http.StatusOK, d)
 }
 
+// ── Meetup feature picker (#246 "meet up at", product request 2026-07-25) ──
+// No existing read returns a LIGHTWEIGHT rapids+access listing for a run:
+// Get/GetPublic/getPublicByID return the full userReachDetail (gauge/flow
+// bands/upvotes/description/hazard fields and all) as part of the whole run
+// detail payload — too heavy for a "pick a feature" dropdown source, so this
+// is a new, minimal, dedicated read.
+
+// userReachFeatureOption/userReachAccessFeatureOption are deliberately thin
+// {id,name[,access_type]} projections — no description/hazard/location
+// fields the full run-detail rapids[]/access_points[] carry.
+type userReachFeatureOption struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+type userReachAccessFeatureOption struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	AccessType string `json:"access_type"`
+}
+
+// GET /api/v1/user-runs/{runId}/features
+// Public for a public run (mirrors GetPublic/getPublicByID's visibility
+// gate); an authed caller who may edit the run (owns it, or holds a
+// special-user role for it — editableOwnerIDs, #314) can also read it while
+// private — the calendar run sheet needs this for a still-unpublished run
+// being planned. access[] is pre-filtered to the meetup-eligible access
+// types (meetupEligibleAccessTypes, plan_runs.go) — put_in/take_out aren't
+// offered as a "meet up at" pick, they're already the implicit endpoints.
+func (h *UserReachHandler) ListFeatures(w http.ResponseWriter, r *http.Request) {
+	runID := chi.URLParam(r, "runId")
+	callerID, _ := h.ownerID(r)
+	ctx := r.Context()
+
+	var ownerID, visibility string
+	if err := h.db.QueryRow(ctx,
+		`SELECT owner_id, visibility::text FROM user_reaches WHERE id = $1::uuid AND deleted_at IS NULL`,
+		runID,
+	).Scan(&ownerID, &visibility); err != nil {
+		errorResponse(w, http.StatusNotFound, "run not found")
+		return
+	}
+	if visibility != "public" {
+		allowed := false
+		if callerID != "" {
+			for _, id := range editableOwnerIDs(ctx, h.db, callerID) {
+				if id == ownerID {
+					allowed = true
+					break
+				}
+			}
+		}
+		if !allowed {
+			errorResponse(w, http.StatusNotFound, "run not found")
+			return
+		}
+	}
+
+	rapids := make([]userReachFeatureOption, 0)
+	rapRows, _ := h.db.Query(ctx,
+		`SELECT id, name FROM rapids WHERE user_reach_id = $1::uuid ORDER BY name`, runID)
+	if rapRows != nil {
+		defer rapRows.Close()
+		for rapRows.Next() {
+			var f userReachFeatureOption
+			if rapRows.Scan(&f.ID, &f.Name) == nil {
+				rapids = append(rapids, f)
+			}
+		}
+	}
+
+	access := make([]userReachAccessFeatureOption, 0)
+	apRows, _ := h.db.Query(ctx, `
+		SELECT id, COALESCE(name, ''), access_type FROM reach_access
+		WHERE user_reach_id = $1::uuid
+		  AND access_type IN ('camp','parking','boat_ramp','intermediate','shuttle_drop')
+		ORDER BY access_type, name
+	`, runID)
+	if apRows != nil {
+		defer apRows.Close()
+		for apRows.Next() {
+			var f userReachAccessFeatureOption
+			if apRows.Scan(&f.ID, &f.Name, &f.AccessType) == nil {
+				access = append(access, f)
+			}
+		}
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]any{"rapids": rapids, "access": access})
+}
+
 // ── Create ───────────────────────────────────────────────────────────────────
 
 // POST /api/v1/me/reaches

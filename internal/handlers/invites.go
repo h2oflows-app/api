@@ -80,12 +80,15 @@ func (h *InviteHandler) respondAPIError(w http.ResponseWriter, err error) {
 // inviteRunInfo is a minimal plan_runs projection used both to fan out
 // plan_members rows (one per targeted run) and to render the whole-plan
 // itinerary recap in the invite email/.ics attachment (#246 A7). RunTime is
-// "" for an untimed run.
+// "" for an untimed run. MeetupSpot is "" when unset — the invite email's
+// "Meet at: ..." line and the .ics VEVENT LOCATION (ics.PlanInviteRun) both
+// key off non-empty (product request 2026-07-25).
 type inviteRunInfo struct {
-	ID      string
-	Name    string
-	RunDate string
-	RunTime string
+	ID         string
+	Name       string
+	RunDate    string
+	RunTime    string
+	MeetupSpot string
 }
 
 // loadPlanRuns fetches every LIVE plan_runs row for planID, ordered by
@@ -95,7 +98,8 @@ type inviteRunInfo struct {
 // gets full trip context without ever signing in").
 func loadPlanRuns(ctx context.Context, q dbQueryer, planID string) ([]inviteRunInfo, error) {
 	rows, err := q.Query(ctx, `
-		SELECT pr.id, COALESCE(ur.name, 'Paddle'), pr.run_date::text, COALESCE(pr.run_time::text, '')
+		SELECT pr.id, COALESCE(ur.name, 'Paddle'), pr.run_date::text, COALESCE(pr.run_time::text, ''),
+		       COALESCE(pr.meetup_spot, '')
 		FROM plan_runs pr
 		LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
 		WHERE pr.plan_id = $1::uuid AND pr.deleted_at IS NULL
@@ -109,7 +113,7 @@ func loadPlanRuns(ctx context.Context, q dbQueryer, planID string) ([]inviteRunI
 	var out []inviteRunInfo
 	for rows.Next() {
 		var ri inviteRunInfo
-		if err := rows.Scan(&ri.ID, &ri.Name, &ri.RunDate, &ri.RunTime); err != nil {
+		if err := rows.Scan(&ri.ID, &ri.Name, &ri.RunDate, &ri.RunTime, &ri.MeetupSpot); err != nil {
 			return nil, fmt.Errorf("loadPlanRuns scan: %w", err)
 		}
 		out = append(out, ri)
@@ -451,6 +455,9 @@ func buildInviteEmailBody(plan invitedPlanInfo, invitedRuns []inviteRunInfo, pla
 		if t := formatUSTime(run.RunTime); t != "" {
 			line += " at " + t
 		}
+		if run.MeetupSpot != "" {
+			line += " · Meet at: " + run.MeetupSpot
+		}
 		if invited[run.ID] {
 			htmlItems.WriteString(fmt.Sprintf(`<li><strong>%s</strong> — You're invited! <a href="%s">Accept</a></li>`, html.EscapeString(line), acceptURL))
 			textItems.WriteString(fmt.Sprintf("* %s — You're invited! Accept: %s\n", line, acceptURL))
@@ -511,11 +518,12 @@ func sendInviteMail(mailer mail.Mailer, p pendingInviteMail) {
 		icsRuns := make([]ics.PlanInviteRun, 0, len(p.plan.AllRuns))
 		for _, run := range p.plan.AllRuns {
 			icsRuns = append(icsRuns, ics.PlanInviteRun{
-				ID:      run.ID,
-				Name:    run.Name,
-				RunDate: run.RunDate,
-				RunTime: run.RunTime,
-				Invited: invited[run.ID],
+				ID:         run.ID,
+				Name:       run.Name,
+				RunDate:    run.RunDate,
+				RunTime:    run.RunTime,
+				Invited:    invited[run.ID],
+				MeetupSpot: run.MeetupSpot,
 			})
 		}
 		icsBody := ics.BuildPlanInvite(ics.PlanInviteInput{

@@ -320,6 +320,14 @@ type planRunSummary struct {
 	Companions  *string      `json:"companions,omitempty"`
 	CreatedAt   string       `json:"created_at,omitempty"`
 	Crew        runCrewMeter `json:"crew"`
+	// MeetupSpot/MeetupFeatureType/MeetupFeatureID: "meet up at" (product
+	// request 2026-07-25) — MeetupSpot is the always-present display text
+	// (typed or feature-name snapshot); the FeatureType/ID pair (present
+	// only when a #312 rapid/access feature was picked, one or neither, per
+	// the DB's XOR) lets the edit sheet re-resolve and re-highlight the pick.
+	MeetupSpot        *string `json:"meetup_spot,omitempty"`
+	MeetupFeatureType *string `json:"meetup_feature_type,omitempty"`
+	MeetupFeatureID   *string `json:"meetup_feature_id,omitempty"`
 	// Per-viewer RSVP on THIS run (the caller's own plan_members row, if
 	// any): status invited|requested|accepted|declined + the row id the
 	// accept/dismiss endpoints take. Drives the itinerary's per-run accept
@@ -640,6 +648,7 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, planID 
 		       pr.sort_order, pr.gauge_cfs, pr.flow_band, pr.flow_color, pr.paddled, pr.paddled_at,
 		       pr.notes, pr.companions, pr.created_at,
 		       pr.looking_for_crew, pr.max_crew, COALESCE(cm.filled, 0),
+		       pr.meetup_spot, pr.meetup_rapid_id::text, pr.meetup_access_id::text,
 		       me.status, me.id
 		FROM plan_runs pr
 		LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
@@ -668,11 +677,13 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, planID 
 		var run planRunSummary
 		var paddledAtRaw *time.Time
 		var createdAtRaw time.Time
+		var meetupRapidID, meetupAccessID *string
 		if err := rows.Scan(
 			&run.ID, &run.Slug, &run.UserReachID, &run.Name, &run.RunDate, &run.RunTime,
 			&run.SortOrder, &run.GaugeCFS, &run.FlowBand, &run.FlowColor, &run.Paddled, &paddledAtRaw,
 			&run.Notes, &run.Companions, &createdAtRaw,
 			&run.Crew.LookingForCrew, &run.Crew.Max, &run.Crew.Filled,
+			&run.MeetupSpot, &meetupRapidID, &meetupAccessID,
 			&run.MyRSVP, &run.MyMemberID,
 		); err != nil {
 			errorResponse(w, http.StatusInternalServerError, "scan failed")
@@ -683,6 +694,7 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, planID 
 			run.PaddledAt = &s
 		}
 		run.CreatedAt = createdAtRaw.Format(time.RFC3339)
+		run.MeetupFeatureType, run.MeetupFeatureID = meetupFeatureTypeID(meetupRapidID, meetupAccessID)
 
 		if _, seen := runsByDate[run.RunDate]; !seen {
 			dateOrder = append(dateOrder, run.RunDate)

@@ -35,6 +35,11 @@ type PlanInviteRun struct {
 	// SUMMARY with "You're invited: " (contract §6: "invited runs marked in
 	// their SUMMARY/DESCRIPTION").
 	Invited bool
+	// MeetupSpot ("meet up at", product request 2026-07-25) -> this VEVENT's
+	// LOCATION, TEXT-escaped, when non-empty. Empty falls back to the
+	// enclosing PlanInviteInput.Location (the plan-level location) — see
+	// BuildPlanInvite/runVEvent.
+	MeetupSpot string
 }
 
 // PlanInviteInput is the data BuildPlanInvite needs to render one plan as a
@@ -112,7 +117,7 @@ func BuildPlanInvite(in PlanInviteInput) string {
 	}
 	lines = append(lines, planVEvent(in, now, start, dtend)...)
 	for _, run := range in.Runs {
-		lines = append(lines, runVEvent(in.PlanID, run, now)...)
+		lines = append(lines, runVEvent(in.PlanID, run, in.Location, now)...)
 	}
 	lines = append(lines, "END:VCALENDAR")
 
@@ -147,8 +152,10 @@ func planVEvent(in PlanInviteInput, now, start, dtend time.Time) []string {
 // runVEvent renders one plan_run as its own VEVENT — timed (DTSTART
 // floating date-time + DURATION:PT2H) when RunTime is set, else all-day
 // (DTSTART/DTEND;VALUE=DATE) on RunDate, matching planVEvent's exclusive-
-// DTEND convention.
-func runVEvent(planID string, run PlanInviteRun, now time.Time) []string {
+// DTEND convention. LOCATION ("meet up at", product request 2026-07-25) is
+// run.MeetupSpot when set, else planLocation (the plan-level LOCATION) —
+// omitted entirely when both are empty, same as planVEvent's LOCATION.
+func runVEvent(planID string, run PlanInviteRun, planLocation string, now time.Time) []string {
 	rd, err := time.Parse(inputDateLayout, run.RunDate)
 	if err != nil {
 		rd = now
@@ -176,7 +183,13 @@ func runVEvent(planID string, run PlanInviteRun, now time.Time) []string {
 			"DTEND;VALUE=DATE:"+rd.AddDate(0, 0, 1).Format(icsDateLayout),
 		)
 	}
-	lines = append(lines, "SUMMARY:"+escapeText(summary), "END:VEVENT")
+	lines = append(lines, "SUMMARY:"+escapeText(summary))
+	if loc := run.MeetupSpot; loc != "" {
+		lines = append(lines, "LOCATION:"+escapeText(loc))
+	} else if planLocation != "" {
+		lines = append(lines, "LOCATION:"+escapeText(planLocation))
+	}
+	lines = append(lines, "END:VEVENT")
 	return lines
 }
 

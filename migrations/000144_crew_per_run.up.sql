@@ -106,3 +106,22 @@ DO NOTHING;
 DELETE FROM plan_members pm
 WHERE pm.plan_run_id IS NULL
   AND EXISTS (SELECT 1 FROM plan_runs pr WHERE pr.plan_id = pm.plan_id AND pr.deleted_at IS NULL);
+
+-- (d) "Meet up at" (product request 2026-07-25, added on top of the crew
+-- remodel above — same migration since 000144 hasn't shipped to prod yet).
+-- meetup_spot is the DISPLAY TEXT — either freely typed, or snapshotted from
+-- a picked #312 run feature — so it survives the feature being deleted or
+-- the run being re-imported (KML re-import wipes community rapids/access
+-- rows, feedback_feature_rows_data_source_community.md). The two nullable
+-- soft refs (mutually exclusive, XOR check) let the web re-resolve back to
+-- the live feature for editing; ON DELETE SET NULL keeps meetup_spot intact
+-- if the referenced feature itself is later deleted.
+ALTER TABLE plan_runs
+  ADD COLUMN meetup_spot      TEXT,
+  ADD COLUMN meetup_rapid_id  UUID REFERENCES rapids(id) ON DELETE SET NULL,
+  ADD COLUMN meetup_access_id UUID REFERENCES reach_access(id) ON DELETE SET NULL,
+  ADD CONSTRAINT plan_runs_meetup_feature_xor_check
+    CHECK (meetup_rapid_id IS NULL OR meetup_access_id IS NULL);
+
+CREATE INDEX plan_runs_meetup_rapid_idx  ON plan_runs (meetup_rapid_id)  WHERE meetup_rapid_id IS NOT NULL;
+CREATE INDEX plan_runs_meetup_access_idx ON plan_runs (meetup_access_id) WHERE meetup_access_id IS NOT NULL;
