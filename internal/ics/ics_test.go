@@ -110,7 +110,11 @@ func TestBuildPlanInvite_LongMultibyteName(t *testing.T) {
 // the folding behavior already covered above. Also covers "meet up at"
 // (product request 2026-07-25): run-a has its own MeetupSpot (LOCATION
 // overrides the plan's), run-b has none (LOCATION falls back to the plan's
-// "Idaho").
+// "Idaho"). run-a's MeetupSpot carries a comma, semicolon, and trailing
+// backslash — all three RFC 5545 TEXT special chars escapeText handles —
+// so a regression that drops escapeText(loc) in runVEvent fails this test
+// (plain apostrophes, as used here for "'T'", are NOT escaped and so don't
+// exercise this on their own).
 func TestBuildPlanInvite_MultiVEventWithRuns(t *testing.T) {
 	got := BuildPlanInvite(PlanInviteInput{
 		PlanID:    "plan1",
@@ -121,7 +125,7 @@ func TestBuildPlanInvite_MultiVEventWithRuns(t *testing.T) {
 		URL:       "https://h2oflows.app/plans/ianskluhsman/salmon-trip",
 		Now:       time.Date(2026, 7, 23, 18, 4, 5, 0, time.UTC),
 		Runs: []PlanInviteRun{
-			{ID: "run-a", Name: "Foxton", RunDate: "2026-08-01", RunTime: "10:00:00", Invited: true, MeetupSpot: "The 'T' parking lot"},
+			{ID: "run-a", Name: "Foxton", RunDate: "2026-08-01", RunTime: "10:00:00", Invited: true, MeetupSpot: "The 'T' lot, past the gate; muddy\\"},
 			{ID: "run-b", Name: "South Platte", RunDate: "2026-08-02", RunTime: "", Invited: false},
 		},
 	})
@@ -145,7 +149,7 @@ func TestBuildPlanInvite_MultiVEventWithRuns(t *testing.T) {
 		"DTSTART:20260801T100000\r\n" +
 		"DURATION:PT2H\r\n" +
 		"SUMMARY:You're invited: Foxton\r\n" +
-		"LOCATION:The 'T' parking lot\r\n" +
+		"LOCATION:The 'T' lot\\, past the gate\\; muddy\\\\\r\n" +
 		"END:VEVENT\r\n" +
 		"BEGIN:VEVENT\r\n" +
 		"UID:plan1-run-b@h2oflows.app\r\n" +
