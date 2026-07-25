@@ -159,6 +159,12 @@ func (h *PlanHandler) Calendar(w http.ResponseWriter, r *http.Request) {
 		HostHandle   string  `json:"host_handle"`
 	}
 
+	// Member branch collapses to one row per plan (DISTINCT ON p.id,
+	// preferring accepted over invited): A7's per-run fan-out (mig 000144)
+	// means plan_members now carries one row PER RUN for a multi-run plan,
+	// so a plain JOIN here would emit the same plan once per accepted/invited
+	// run — violating the plans[] "each plan once, with role" contract and
+	// producing overlapping/dashed calendar ribbons (#246 review).
 	planRows, err := h.db.Query(ctx, `
 		SELECT p.id, p.slug, p.name, p.type::text, p.start_date::text, p.end_date::text,
 		       p.visibility::text, 'own' AS role, NULL::text AS member_status,
@@ -168,20 +174,27 @@ func (h *PlanHandler) Calendar(w http.ResponseWriter, r *http.Request) {
 		WHERE p.owner_id = $1 AND p.deleted_at IS NULL
 		  AND p.start_date <= $3::date AND p.end_date >= $2::date
 		UNION ALL
-		SELECT p.id, p.slug, p.name, p.type::text, p.start_date::text, p.end_date::text,
-		       p.visibility::text,
-		       CASE WHEN pm.status = 'accepted' THEN 'member' ELSE 'invited' END AS role,
-		       pm.status::text AS member_status,
-		       COALESCE(up.handle, '') AS host_handle
-		FROM plan_members pm
-		JOIN plans p ON p.id = pm.plan_id AND p.deleted_at IS NULL
-		LEFT JOIN user_profiles up ON up.owner_id = p.owner_id
-		WHERE pm.member_owner_id = $1
-		  AND (
-		    (pm.origin = 'invite' AND pm.status IN ('invited','accepted'))
-		    OR (pm.origin = 'request' AND pm.status = 'accepted')
-		  )
-		  AND p.start_date <= $3::date AND p.end_date >= $2::date
+		SELECT mp.id, mp.slug, mp.name, mp.type, mp.start_date, mp.end_date,
+		       mp.visibility, mp.role, mp.member_status, mp.host_handle
+		FROM (
+			SELECT DISTINCT ON (p.id)
+			       p.id, p.slug, p.name, p.type::text AS type,
+			       p.start_date::text AS start_date, p.end_date::text AS end_date,
+			       p.visibility::text AS visibility,
+			       CASE WHEN pm.status = 'accepted' THEN 'member' ELSE 'invited' END AS role,
+			       pm.status::text AS member_status,
+			       COALESCE(up.handle, '') AS host_handle
+			FROM plan_members pm
+			JOIN plans p ON p.id = pm.plan_id AND p.deleted_at IS NULL
+			LEFT JOIN user_profiles up ON up.owner_id = p.owner_id
+			WHERE pm.member_owner_id = $1
+			  AND (
+			    (pm.origin = 'invite' AND pm.status IN ('invited','accepted'))
+			    OR (pm.origin = 'request' AND pm.status = 'accepted')
+			  )
+			  AND p.start_date <= $3::date AND p.end_date >= $2::date
+			ORDER BY p.id, (pm.status = 'accepted') DESC
+		) mp
 		ORDER BY 5
 	`, ownerID, from, to)
 	if err != nil {
@@ -272,7 +285,8 @@ func (h *PlanHandler) CalendarDay(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := h.db.Query(ctx, `
 		SELECT pr.id, pr.plan_id::text, pr.slug, pr.user_reach_id::text, ur.name,
-		       pr.flow_band, pr.flow_color, pr.gauge_cfs, pr.paddled, pr.run_time::text, pr.notes
+		       pr.flow_band, pr.flow_color, pr.gauge_cfs, pr.paddled, pr.run_time::text, pr.notes,
+		       pr.meetup_spot, pr.meetup_rapid_id::text, pr.meetup_access_id::text
 		FROM plan_runs pr
 		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
 		LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
@@ -286,29 +300,35 @@ func (h *PlanHandler) CalendarDay(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type dayRun struct {
-		ID             string   `json:"id"`
-		PlanID         string   `json:"plan_id"`
-		Slug           string   `json:"slug"`
-		UserReachID    *string  `json:"user_reach_id,omitempty"`
-		Name           *string  `json:"name,omitempty"`
-		FlowBand       *string  `json:"flow_band,omitempty"`
-		FlowColor      *string  `json:"flow_color,omitempty"`
-		GaugeCFS       *float64 `json:"gauge_cfs,omitempty"`
-		Paddled        bool     `json:"paddled"`
-		RunTime        *string  `json:"run_time,omitempty"`
-		Notes          *string  `json:"notes,omitempty"`
-		CanMarkPaddled bool     `json:"can_mark_paddled"`
+		ID                string   `json:"id"`
+		PlanID            string   `json:"plan_id"`
+		Slug              string   `json:"slug"`
+		UserReachID       *string  `json:"user_reach_id,omitempty"`
+		Name              *string  `json:"name,omitempty"`
+		FlowBand          *string  `json:"flow_band,omitempty"`
+		FlowColor         *string  `json:"flow_color,omitempty"`
+		GaugeCFS          *float64 `json:"gauge_cfs,omitempty"`
+		Paddled           bool     `json:"paddled"`
+		RunTime           *string  `json:"run_time,omitempty"`
+		Notes             *string  `json:"notes,omitempty"`
+		CanMarkPaddled    bool     `json:"can_mark_paddled"`
+		MeetupSpot        *string  `json:"meetup_spot,omitempty"`
+		MeetupFeatureType *string  `json:"meetup_feature_type,omitempty"`
+		MeetupFeatureID   *string  `json:"meetup_feature_id,omitempty"`
 	}
 
 	runs := []dayRun{}
 	for rows.Next() {
 		var dr dayRun
+		var meetupRapidID, meetupAccessID *string
 		if err := rows.Scan(&dr.ID, &dr.PlanID, &dr.Slug, &dr.UserReachID, &dr.Name,
-			&dr.FlowBand, &dr.FlowColor, &dr.GaugeCFS, &dr.Paddled, &dr.RunTime, &dr.Notes); err != nil {
+			&dr.FlowBand, &dr.FlowColor, &dr.GaugeCFS, &dr.Paddled, &dr.RunTime, &dr.Notes,
+			&dr.MeetupSpot, &meetupRapidID, &meetupAccessID); err != nil {
 			errorResponse(w, http.StatusInternalServerError, "scan failed")
 			return
 		}
 		dr.CanMarkPaddled = !dr.Paddled && canMark
+		dr.MeetupFeatureType, dr.MeetupFeatureID = meetupFeatureTypeID(meetupRapidID, meetupAccessID)
 		runs = append(runs, dr)
 	}
 

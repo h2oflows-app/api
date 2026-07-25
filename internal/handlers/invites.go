@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"log"
 	"net/http"
 	"strings"
@@ -22,21 +23,23 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// InviteHandler handles /plans/{id}/invite, /me/invites, /invites/*,
-// /plans/{id}/join, and /plans/{id}/crew/* (#246 A4). Split into its own
-// file/handler type from PlanHandler (plans.go/plan_runs.go/calendar.go)
-// since it owns a distinct table relationship (plan_members) and a new
-// external dependency (mail.Mailer) — but the two share package-level
-// helpers (dbQueryer, apiError, parseDate, userToday, localNoonUTC,
-// validPlanTypes) defined in plans.go, matching this codebase's convention
-// of duplicating only the handler-struct-bound helpers (ownerID,
-// ensureHandle) per type.
+// InviteHandler handles /plans/{id}/invite(+/resend), /me/invites,
+// /invites/*, /plan-runs/{id}/join, and /plan-runs/{id}/crew/* (#246 A4,
+// reworked #246 A7 for per-run crew/RSVP — see the membership-rule package
+// comment on PlanHandler in plans.go). Split into its own file/handler type
+// from PlanHandler (plans.go/plan_runs.go/calendar.go) since it owns a
+// distinct table relationship (plan_members) and a new external dependency
+// (mail.Mailer) — but the two share package-level helpers (dbQueryer,
+// apiError, parseDate, userToday, localNoonUTC, validPlanTypes, runFilled)
+// defined in plans.go, matching this codebase's convention of duplicating
+// only the handler-struct-bound helpers (ownerID, ensureHandle) per type.
 type InviteHandler struct {
 	db            *pgxpool.Pool
 	devFallbackID string
 	mailer        mail.Mailer
 	rlInvite      *reportRateLimiter // 20/hr/owner — POST /plans/{id}/invite
-	rlJoin        *reportRateLimiter // 10/hr/owner — POST /plans/{id}/join
+	rlJoin        *reportRateLimiter // 10/hr/owner — POST /plan-runs/{id}/join
+	rlResend      *reportRateLimiter // 10/hr/owner — POST /plans/{id}/invite/resend
 }
 
 func NewInviteHandler(db *pgxpool.Pool, devFallbackID string, mailer mail.Mailer) *InviteHandler {
@@ -49,6 +52,7 @@ func NewInviteHandler(db *pgxpool.Pool, devFallbackID string, mailer mail.Mailer
 		mailer:        mailer,
 		rlInvite:      newReportRateLimiter(),
 		rlJoin:        newReportRateLimiter(),
+		rlResend:      newReportRateLimiter(),
 	}
 }
 
@@ -73,10 +77,83 @@ func (h *InviteHandler) respondAPIError(w http.ResponseWriter, err error) {
 
 // ── Shared invite machinery (reused by POST /plans' invites[] — plans.go) ──
 
+// inviteRunInfo is a minimal plan_runs projection used both to fan out
+// plan_members rows (one per targeted run) and to render the whole-plan
+// itinerary recap in the invite email/.ics attachment (#246 A7). RunTime is
+// "" for an untimed run. MeetupSpot is "" when unset — the invite email's
+// "Meet at: ..." line and the .ics VEVENT LOCATION (ics.PlanInviteRun) both
+// key off non-empty (product request 2026-07-25).
+type inviteRunInfo struct {
+	ID         string
+	Name       string
+	RunDate    string
+	RunTime    string
+	MeetupSpot string
+}
+
+// loadPlanRuns fetches every LIVE plan_runs row for planID, ordered by
+// run_date/sort_order — the plan's full itinerary. Used as both the
+// "default = all runs" invite target set (resolveInviteTargets) and the
+// whole-plan recap baked into every invite email (contract §6: "a non-user
+// gets full trip context without ever signing in").
+func loadPlanRuns(ctx context.Context, q dbQueryer, planID string) ([]inviteRunInfo, error) {
+	rows, err := q.Query(ctx, `
+		SELECT pr.id, COALESCE(ur.name, 'Paddle'), pr.run_date::text, COALESCE(pr.run_time::text, ''),
+		       COALESCE(pr.meetup_spot, '')
+		FROM plan_runs pr
+		LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
+		WHERE pr.plan_id = $1::uuid AND pr.deleted_at IS NULL
+		ORDER BY pr.run_date, pr.sort_order
+	`, planID)
+	if err != nil {
+		return nil, fmt.Errorf("loadPlanRuns: %w", err)
+	}
+	defer rows.Close()
+
+	var out []inviteRunInfo
+	for rows.Next() {
+		var ri inviteRunInfo
+		if err := rows.Scan(&ri.ID, &ri.Name, &ri.RunDate, &ri.RunTime, &ri.MeetupSpot); err != nil {
+			return nil, fmt.Errorf("loadPlanRuns scan: %w", err)
+		}
+		out = append(out, ri)
+	}
+	return out, nil
+}
+
+// resolveInviteTargets resolves the plan_run_ids an invite/request targets:
+// empty `requested` -> ALL of allRuns (contract default, POST
+// /plans/{id}/invite: "plan_run_ids []string (optional; default = ALL live
+// runs of the plan)"); non-empty -> exactly those runs, each validated
+// against allRuns (400, not 404 — the mismatch is the caller's own request
+// body, not a missing resource).
+func resolveInviteTargets(allRuns []inviteRunInfo, requested []string) ([]inviteRunInfo, error) {
+	if len(requested) == 0 {
+		return allRuns, nil
+	}
+	want := make(map[string]bool, len(requested))
+	for _, id := range requested {
+		want[id] = true
+	}
+	out := make([]inviteRunInfo, 0, len(requested))
+	for _, run := range allRuns {
+		if want[run.ID] {
+			out = append(out, run)
+			delete(want, run.ID)
+		}
+	}
+	if len(want) > 0 {
+		return nil, &apiError{http.StatusBadRequest, "one or more plan_run_ids do not belong to this plan"}
+	}
+	return out, nil
+}
+
 // invitedPlanInfo is the subset of a plan's fields inviteOne and the invite
 // email need, gathered once by the caller (either from the in-memory values
 // of a just-created plan in PlanHandler.Create, or via loadInvitedPlanInfo
-// for the standalone POST /plans/{id}/invite endpoint).
+// for the standalone POST /plans/{id}/invite endpoint). AllRuns is the full
+// itinerary (#246 A7 — needed for the "whole plan laid out" email recap and
+// as the invite's default target-run set).
 type invitedPlanInfo struct {
 	ID         string
 	Slug       string
@@ -85,39 +162,53 @@ type invitedPlanInfo struct {
 	StartDate  string
 	EndDate    string
 	HostHandle string
+	AllRuns    []inviteRunInfo
 }
 
 // inviteBody is the request shape for a single invite — used both by
 // POST /plans/{id}/invite and the `invites` array in POST /plans.
+// PlanRunIDs is #246 A7: the runs this invite RSVPs to (nil/empty = all live
+// runs of the plan).
 type inviteBody struct {
-	Handle    *string `json:"handle"`
-	Email     *string `json:"email"`
-	AttachICS *bool   `json:"attach_ics"`
+	Handle     *string  `json:"handle"`
+	Email      *string  `json:"email"`
+	AttachICS  *bool    `json:"attach_ics"`
+	PlanRunIDs []string `json:"plan_run_ids"`
 }
 
-type inviteResult struct {
-	MemberID string
-	Status   string
-	Created  bool // true -> 201 (new row); false -> 200 (existing/self, no dup)
+// inviteRowResult is one fanned-out plan_members row's outcome — #246 A7
+// replaces the old single-row inviteResult since one inviteOne call now
+// produces one row PER targeted run.
+type inviteRowResult struct {
+	PlanRunID string `json:"plan_run_id"`
+	MemberID  string `json:"member_id"`
+	Status    string `json:"status"`
+	Created   bool   `json:"-"` // true -> new row; false -> pre-existing row for that run, skipped
 }
 
 // pendingInviteMail carries everything needed to send + attach an invite
 // email after the enclosing transaction commits — an outbound HTTPS call to
 // Resend must never run while a DB tx is open. Only produced by the email
-// path of inviteOne (handle invites never send mail).
+// path of inviteOne (handle invites never send mail). InvitedRuns is the
+// subset of plan.AllRuns this particular recipient was newly invited to —
+// used to build the subject line and the "You're invited" emphasis in the
+// whole-plan email body (#246 A7).
 type pendingInviteMail struct {
-	to        string
-	rawToken  string
-	attachICS bool
-	plan      invitedPlanInfo
+	to          string
+	rawToken    string
+	attachICS   bool
+	plan        invitedPlanInfo
+	invitedRuns []inviteRunInfo
 }
 
-// inviteOne inserts (or finds an existing) plan_members row for a single
-// handle/email invite. Runs via q, a plain pool or a tx, so it is shared
-// verbatim by POST /plans' single-tx invites[] array (plans.go Create) and
-// the standalone POST /plans/{id}/invite — mirrors insertPlanRun's
-// dbQueryer-parameterized shape (plan_runs.go).
-func inviteOne(ctx context.Context, q dbQueryer, plan invitedPlanInfo, hostOwnerID string, body inviteBody) (inviteResult, *pendingInviteMail, error) {
+// inviteOne inserts (or finds an existing) plan_members row for EACH run in
+// targetRuns, for a single handle/email invite. Runs via q, a plain pool or
+// a tx, so it is shared verbatim by POST /plans' single-tx invites[] array
+// (plans.go Create) and the standalone POST /plans/{id}/invite. An email
+// invite shares ONE rawToken/token_hash across the whole fan-out (contract
+// §6: "same rawToken/token_hash shared across the fan-out for an email
+// invite"); a handle invite needs no token (accept is by owner_id match).
+func inviteOne(ctx context.Context, q dbQueryer, plan invitedPlanInfo, hostOwnerID string, body inviteBody, targetRuns []inviteRunInfo) ([]inviteRowResult, *pendingInviteMail, error) {
 	switch {
 	case body.Handle != nil && strings.TrimSpace(*body.Handle) != "":
 		handle := strings.TrimPrefix(strings.TrimSpace(*body.Handle), "@")
@@ -126,35 +217,40 @@ func inviteOne(ctx context.Context, q dbQueryer, plan invitedPlanInfo, hostOwner
 		if err := q.QueryRow(ctx,
 			`SELECT owner_id FROM user_profiles WHERE LOWER(handle) = LOWER($1)`, handle,
 		).Scan(&targetOwnerID); err != nil {
-			return inviteResult{}, nil, &apiError{http.StatusNotFound, "user not found"}
+			return nil, nil, &apiError{http.StatusNotFound, "user not found"}
 		}
 		if targetOwnerID == hostOwnerID {
 			// Host invites themselves — already implicitly "in" the plan
 			// (no organizer row exists); no-op, 200 existing.
-			return inviteResult{Status: "existing"}, nil, nil
+			return []inviteRowResult{{Status: "existing"}}, nil, nil
 		}
 
-		var memberID, status string
-		err := q.QueryRow(ctx, `
-			INSERT INTO plan_members (plan_id, member_owner_id, invite_handle, invited_by, origin, status)
-			VALUES ($1::uuid, $2, $3, $4, 'invite', 'invited')
-			ON CONFLICT (plan_id, member_owner_id) WHERE member_owner_id IS NOT NULL DO NOTHING
-			RETURNING id, status::text
-		`, plan.ID, targetOwnerID, handle, hostOwnerID).Scan(&memberID, &status)
-		if err != nil {
-			if !errors.Is(err, pgx.ErrNoRows) {
-				return inviteResult{}, nil, fmt.Errorf("invite insert: %w", err)
+		results := make([]inviteRowResult, 0, len(targetRuns))
+		for _, run := range targetRuns {
+			var memberID, status string
+			err := q.QueryRow(ctx, `
+				INSERT INTO plan_members (plan_id, member_owner_id, invite_handle, invited_by, origin, status, plan_run_id)
+				VALUES ($1::uuid, $2, $3, $4, 'invite', 'invited', $5::uuid)
+				ON CONFLICT (plan_run_id, member_owner_id) WHERE member_owner_id IS NOT NULL AND plan_run_id IS NOT NULL DO NOTHING
+				RETURNING id, status::text
+			`, plan.ID, targetOwnerID, handle, hostOwnerID, run.ID).Scan(&memberID, &status)
+			if err != nil {
+				if !errors.Is(err, pgx.ErrNoRows) {
+					return nil, nil, fmt.Errorf("invite insert: %w", err)
+				}
+				// ON CONFLICT DO NOTHING with no RETURNING row: already invited to this run.
+				if serr := q.QueryRow(ctx,
+					`SELECT id, status::text FROM plan_members WHERE plan_run_id = $1::uuid AND member_owner_id = $2`,
+					run.ID, targetOwnerID,
+				).Scan(&memberID, &status); serr != nil {
+					return nil, nil, fmt.Errorf("invite lookup: %w", serr)
+				}
+				results = append(results, inviteRowResult{PlanRunID: run.ID, MemberID: memberID, Status: status, Created: false})
+				continue
 			}
-			// ON CONFLICT DO NOTHING with no RETURNING row: already a member.
-			if serr := q.QueryRow(ctx,
-				`SELECT id, status::text FROM plan_members WHERE plan_id = $1::uuid AND member_owner_id = $2`,
-				plan.ID, targetOwnerID,
-			).Scan(&memberID, &status); serr != nil {
-				return inviteResult{}, nil, fmt.Errorf("invite lookup: %w", serr)
-			}
-			return inviteResult{MemberID: memberID, Status: status, Created: false}, nil, nil
+			results = append(results, inviteRowResult{PlanRunID: run.ID, MemberID: memberID, Status: status, Created: true})
 		}
-		return inviteResult{MemberID: memberID, Status: status, Created: true}, nil, nil
+		return results, nil, nil
 
 	case body.Email != nil && strings.TrimSpace(*body.Email) != "":
 		email := strings.ToLower(strings.TrimSpace(*body.Email))
@@ -162,39 +258,44 @@ func inviteOne(ctx context.Context, q dbQueryer, plan invitedPlanInfo, hostOwner
 
 		rawToken, tokenHash, terr := generateInviteToken()
 		if terr != nil {
-			return inviteResult{}, nil, fmt.Errorf("token generation: %w", terr)
+			return nil, nil, fmt.Errorf("token generation: %w", terr)
 		}
 
-		var memberID, status string
-		var inserted bool
-		err := q.QueryRow(ctx, `
-			INSERT INTO plan_members (plan_id, invite_email, invited_by, origin, status, invite_token_hash)
-			VALUES ($1::uuid, $2, $3, 'invite', 'invited', $4)
-			ON CONFLICT (plan_id, lower(invite_email)) WHERE invite_email IS NOT NULL AND member_owner_id IS NULL DO NOTHING
-			RETURNING id, status::text
-		`, plan.ID, email, hostOwnerID, tokenHash).Scan(&memberID, &status)
-		if err != nil {
-			if !errors.Is(err, pgx.ErrNoRows) {
-				return inviteResult{}, nil, fmt.Errorf("invite insert: %w", err)
+		results := make([]inviteRowResult, 0, len(targetRuns))
+		var invitedRuns []inviteRunInfo
+		for _, run := range targetRuns {
+			var memberID, status string
+			err := q.QueryRow(ctx, `
+				INSERT INTO plan_members (plan_id, invite_email, invited_by, origin, status, invite_token_hash, plan_run_id)
+				VALUES ($1::uuid, $2, $3, 'invite', 'invited', $4, $5::uuid)
+				ON CONFLICT (plan_run_id, lower(invite_email)) WHERE invite_email IS NOT NULL AND member_owner_id IS NULL AND plan_run_id IS NOT NULL DO NOTHING
+				RETURNING id, status::text
+			`, plan.ID, email, hostOwnerID, tokenHash, run.ID).Scan(&memberID, &status)
+			if err != nil {
+				if !errors.Is(err, pgx.ErrNoRows) {
+					return nil, nil, fmt.Errorf("invite insert: %w", err)
+				}
+				if serr := q.QueryRow(ctx,
+					`SELECT id, status::text FROM plan_members WHERE plan_run_id = $1::uuid AND lower(invite_email) = $2 AND member_owner_id IS NULL`,
+					run.ID, email,
+				).Scan(&memberID, &status); serr != nil {
+					return nil, nil, fmt.Errorf("invite lookup: %w", serr)
+				}
+				results = append(results, inviteRowResult{PlanRunID: run.ID, MemberID: memberID, Status: status, Created: false})
+				continue
 			}
-			if serr := q.QueryRow(ctx,
-				`SELECT id, status::text FROM plan_members WHERE plan_id = $1::uuid AND lower(invite_email) = $2 AND member_owner_id IS NULL`,
-				plan.ID, email,
-			).Scan(&memberID, &status); serr != nil {
-				return inviteResult{}, nil, fmt.Errorf("invite lookup: %w", serr)
-			}
-		} else {
-			inserted = true
+			results = append(results, inviteRowResult{PlanRunID: run.ID, MemberID: memberID, Status: status, Created: true})
+			invitedRuns = append(invitedRuns, run)
 		}
 
 		var pending *pendingInviteMail
-		if inserted {
-			pending = &pendingInviteMail{to: email, rawToken: rawToken, attachICS: attachICS, plan: plan}
+		if len(invitedRuns) > 0 {
+			pending = &pendingInviteMail{to: email, rawToken: rawToken, attachICS: attachICS, plan: plan, invitedRuns: invitedRuns}
 		}
-		return inviteResult{MemberID: memberID, Status: status, Created: inserted}, pending, nil
+		return results, pending, nil
 
 	default:
-		return inviteResult{}, nil, &apiError{http.StatusBadRequest, "handle or email is required"}
+		return nil, nil, &apiError{http.StatusBadRequest, "handle or email is required"}
 	}
 }
 
@@ -214,42 +315,62 @@ func generateInviteToken() (raw, hash string, err error) {
 	return raw, hash, nil
 }
 
-// inviteTokenMemberID resolves token (the raw ?invite= query param) to the
-// plan_members.id it hashes to, scoped to planID — the one read carve-out
-// for the calendar domain (#246 A6, PlanHandler.renderPlan), used both to
-// grant read access (ok==true is the old anonInviteTokenValid signal) and,
-// for an AUTHED caller, to tell the frontend which member row an
-// unbound (member_owner_id IS NULL) email invite corresponds to so it can
+// inviteTokenMemberIDs resolves token (the raw ?invite= query param) to
+// every plan_members.id it hashes to, scoped to planID — the one read
+// carve-out for the calendar domain (#246 A6, PlanHandler.renderPlan), used
+// both to grant read access (ok==true is the old anonInviteTokenValid
+// signal) and, for an AUTHED caller, to tell the frontend which member rows
+// an unbound (member_owner_id IS NULL) email invite corresponds to so it can
 // drive InviteAcceptCard/AcceptInvite before the invite is ever bound to
-// their account (review finding, W4 #246: signed-up-with-different-email
-// conversion was otherwise unreachable — no member_id, no accept). Package-
-// level (not a method) since it's needed from PlanHandler, mirroring this
-// file's dbQueryer-free helpers. An empty/absent token or a token for a
-// DIFFERENT plan_id both fail closed (""/false), same as AcceptInvite's
-// token check below — the token only ever grants access to the plan it was
-// minted for, never a general bearer credential.
-func inviteTokenMemberID(ctx context.Context, db *pgxpool.Pool, planID, token string) (string, bool) {
+// their account. #246 A7: an email invite's token is now shared across ITS
+// WHOLE RUN FAN-OUT (inviteOne above), so this returns every matching row,
+// not just one (was inviteTokenMemberID, singular, pre-A7). An empty/absent
+// token or a token for a DIFFERENT plan_id both fail closed (nil/false),
+// same as AcceptInvite's token check below — the token only ever grants
+// access to the plan it was minted for, never a general bearer credential.
+// tokenInviteRun is one row of an email invite's run fan-out, with enough
+// run context for the web's token-landing page (?invite=) to render a
+// per-run accept list without any other authed fetch.
+type tokenInviteRun struct {
+	MemberID  string  `json:"member_id"`
+	PlanRunID *string `json:"plan_run_id,omitempty"` // NULL on a runless-plan (plan-level) invite row
+	RunName   *string `json:"run_name,omitempty"`
+	RunDate   *string `json:"run_date,omitempty"`
+	RunTime   *string `json:"run_time,omitempty"`
+	Status    string  `json:"status"`
+}
+
+func inviteTokenMemberIDs(ctx context.Context, db *pgxpool.Pool, planID, token string) ([]tokenInviteRun, bool) {
 	if token == "" {
-		return "", false
+		return nil, false
 	}
 	sum := sha256.Sum256([]byte(token))
 	hash := hex.EncodeToString(sum[:])
-	var memberID string
-	if err := db.QueryRow(ctx, `
-		SELECT id::text FROM plan_members WHERE plan_id = $1::uuid AND invite_token_hash = $2
-	`, planID, hash).Scan(&memberID); err != nil {
-		return "", false
+	rows, err := db.Query(ctx, `
+		SELECT pm.id::text, pm.plan_run_id::text, ur.name, pr.run_date::text, pr.run_time::text, pm.status::text
+		FROM plan_members pm
+		LEFT JOIN plan_runs pr ON pr.id = pm.plan_run_id AND pr.deleted_at IS NULL
+		LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
+		WHERE pm.plan_id = $1::uuid AND pm.invite_token_hash = $2
+		ORDER BY pr.run_date, pr.sort_order
+	`, planID, hash)
+	if err != nil {
+		return nil, false
 	}
-	return memberID, true
+	defer rows.Close()
+	var out []tokenInviteRun
+	for rows.Next() {
+		var t tokenInviteRun
+		if rows.Scan(&t.MemberID, &t.PlanRunID, &t.RunName, &t.RunDate, &t.RunTime, &t.Status) == nil {
+			out = append(out, t)
+		}
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, true
 }
 
-// sendInviteMail builds the invite email (+ .ics attachment when requested)
-// and sends it. Package-level (not a method) so both InviteHandler and
-// PlanHandler.Create can fire it after their respective transaction commits,
-// each with its own detached context — the triggering HTTP request's
-// context dies at response, so a fresh context.Background()+timeout is used
-// per the contract ("Sends are async... go func with its own
-// context.Background+timeout").
 // webBaseURL is the web origin embedded in invite emails + .ics links.
 // Overridden from config (WEB_BASE_URL) in main.go so staging emails link to
 // the staging web deploy instead of prod (which bit the first staging test:
@@ -263,6 +384,118 @@ func SetWebBaseURL(u string) {
 	}
 }
 
+// formatUSDate renders a YYYY-MM-DD string as M/D/YYYY (contract §6 email
+// copy: "on 7/26/2026"). Falls back to the raw string on a parse failure
+// (defensive — every caller's date already came from Postgres via ::text).
+func formatUSDate(ymd string) string {
+	t, err := time.Parse("2006-01-02", ymd)
+	if err != nil {
+		return ymd
+	}
+	return fmt.Sprintf("%d/%d/%d", int(t.Month()), t.Day(), t.Year())
+}
+
+// formatUSTime renders a "15:04:05" or "15:04" string as "3:04 PM" (contract
+// §6: "at 10:00 AM"). "" (untimed run) returns "".
+func formatUSTime(hms string) string {
+	if hms == "" {
+		return ""
+	}
+	if t, err := time.Parse("15:04:05", hms); err == nil {
+		return t.Format("3:04 PM")
+	}
+	if t, err := time.Parse("15:04", hms); err == nil {
+		return t.Format("3:04 PM")
+	}
+	return ""
+}
+
+// inviteSubject builds the email subject naming the FIRST invited run with
+// date+time (contract §6): "@host invited you to run {RunName} on
+// {M/D/YYYY}[ at {h:MM AM}]" — "...and N more" when the recipient was
+// invited to more than one run.
+func inviteSubject(host string, invitedRuns []inviteRunInfo) string {
+	if len(invitedRuns) == 0 {
+		// Runless-plan invite (membership rule, plans.go package comment) —
+		// no run to name.
+		return fmt.Sprintf("@%s invited you to a trip", host)
+	}
+	first := invitedRuns[0]
+	line := fmt.Sprintf("@%s invited you to run %s on %s", host, first.Name, formatUSDate(first.RunDate))
+	if t := formatUSTime(first.RunTime); t != "" {
+		line += " at " + t
+	}
+	if len(invitedRuns) > 1 {
+		line += fmt.Sprintf(" and %d more", len(invitedRuns)-1)
+	}
+	return line
+}
+
+// buildInviteEmailBody renders the WHOLE plan (contract §6: "a non-user
+// gets full trip context without ever signing in") — plan name/type/date
+// range/location, then every day's runs, with the recipient's invited runs
+// emphasized (bold + "You're invited") and carrying their own accept link
+// ({WEB_BASE_URL}/plans/{handle}/{slug}?invite={token}&run={plan_run_id}).
+// Returns HTML + a plain-text mirror.
+func buildInviteEmailBody(plan invitedPlanInfo, invitedRuns []inviteRunInfo, planURL, rawToken string) (htmlBody, textBody string) {
+	invited := make(map[string]bool, len(invitedRuns))
+	for _, r := range invitedRuns {
+		invited[r.ID] = true
+	}
+
+	dateRange := formatUSDate(plan.StartDate)
+	if plan.EndDate != plan.StartDate {
+		dateRange = fmt.Sprintf("%s – %s", formatUSDate(plan.StartDate), formatUSDate(plan.EndDate))
+	}
+
+	var htmlItems, textItems strings.Builder
+	for _, run := range plan.AllRuns {
+		acceptURL := fmt.Sprintf("%s?invite=%s&run=%s", planURL, rawToken, run.ID)
+		line := run.Name + " — " + formatUSDate(run.RunDate)
+		if t := formatUSTime(run.RunTime); t != "" {
+			line += " at " + t
+		}
+		if run.MeetupSpot != "" {
+			line += " · Meet at: " + run.MeetupSpot
+		}
+		if invited[run.ID] {
+			htmlItems.WriteString(fmt.Sprintf(`<li><strong>%s</strong> — You're invited! <a href="%s">Accept</a></li>`, html.EscapeString(line), acceptURL))
+			textItems.WriteString(fmt.Sprintf("* %s — You're invited! Accept: %s\n", line, acceptURL))
+		} else {
+			htmlItems.WriteString(fmt.Sprintf("<li>%s</li>", html.EscapeString(line)))
+			textItems.WriteString(fmt.Sprintf("- %s\n", line))
+		}
+	}
+	if len(plan.AllRuns) == 0 {
+		htmlItems.WriteString("<li>(no runs scheduled yet)</li>")
+		textItems.WriteString("(no runs scheduled yet)\n")
+	}
+
+	htmlLoc, textLoc := "", ""
+	if plan.Location != "" {
+		htmlLoc = " · " + html.EscapeString(plan.Location)
+		textLoc = " · " + plan.Location
+	}
+
+	htmlBody = fmt.Sprintf(
+		`<p>@%s invited you on H2OFlows.</p><h2>%s</h2><p>%s%s</p><ul>%s</ul><p><a href="%s">View the full plan</a></p>`,
+		html.EscapeString(plan.HostHandle), html.EscapeString(plan.Name), dateRange, htmlLoc, htmlItems.String(), planURL,
+	)
+	textBody = fmt.Sprintf(
+		"@%s invited you on H2OFlows.\n%s\n%s%s\n\n%s\nView the full plan: %s\n",
+		plan.HostHandle, plan.Name, dateRange, textLoc, textItems.String(), planURL,
+	)
+	return htmlBody, textBody
+}
+
+// sendInviteMail builds the invite email (+ .ics attachment when requested)
+// and sends it. Package-level (not a method) so both InviteHandler and
+// PlanHandler.Create can fire it after their respective transaction commits,
+// each with its own detached context — the triggering HTTP request's
+// context dies at response, so a fresh context.Background()+timeout is used
+// per the contract ("Sends are async... go func with its own
+// context.Background+timeout"). #246 A7 rework: whole-plan layout + one
+// .ics VEVENT per run (see internal/ics).
 func sendInviteMail(mailer mail.Mailer, p pendingInviteMail) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -272,22 +505,27 @@ func sendInviteMail(mailer mail.Mailer, p pendingInviteMail) {
 		host = "a paddler"
 	}
 	planURL := fmt.Sprintf("%s/plans/%s/%s", webBaseURL, p.plan.HostHandle, p.plan.Slug)
-	acceptURL := fmt.Sprintf("%s?invite=%s", planURL, p.rawToken)
 
-	dateRange := p.plan.StartDate
-	if p.plan.EndDate != p.plan.StartDate {
-		dateRange = fmt.Sprintf("%s – %s", p.plan.StartDate, p.plan.EndDate)
-	}
+	subject := inviteSubject(host, p.invitedRuns)
+	htmlBody, textBody := buildInviteEmailBody(p.plan, p.invitedRuns, planURL, p.rawToken)
 
-	subject := fmt.Sprintf("@%s invited you to %s", host, p.plan.Name)
-	html := fmt.Sprintf(
-		`<p>@%s invited you to <strong>%s</strong> (%s).</p><p><a href="%s">View the plan on H2OFlows</a></p>`,
-		host, p.plan.Name, dateRange, acceptURL,
-	)
-	text := fmt.Sprintf("@%s invited you to %s (%s).\n%s", host, p.plan.Name, dateRange, acceptURL)
-
-	msg := mail.Message{To: p.to, Subject: subject, HTML: html, Text: text}
+	msg := mail.Message{To: p.to, Subject: subject, HTML: htmlBody, Text: textBody}
 	if p.attachICS {
+		invited := make(map[string]bool, len(p.invitedRuns))
+		for _, r := range p.invitedRuns {
+			invited[r.ID] = true
+		}
+		icsRuns := make([]ics.PlanInviteRun, 0, len(p.plan.AllRuns))
+		for _, run := range p.plan.AllRuns {
+			icsRuns = append(icsRuns, ics.PlanInviteRun{
+				ID:         run.ID,
+				Name:       run.Name,
+				RunDate:    run.RunDate,
+				RunTime:    run.RunTime,
+				Invited:    invited[run.ID],
+				MeetupSpot: run.MeetupSpot,
+			})
+		}
 		icsBody := ics.BuildPlanInvite(ics.PlanInviteInput{
 			PlanID:    p.plan.ID,
 			Name:      p.plan.Name,
@@ -295,6 +533,7 @@ func sendInviteMail(mailer mail.Mailer, p pendingInviteMail) {
 			StartDate: p.plan.StartDate,
 			EndDate:   p.plan.EndDate,
 			URL:       planURL,
+			Runs:      icsRuns,
 		})
 		msg.Attachments = append(msg.Attachments, mail.Attachment{
 			Filename:    "invite.ics",
@@ -308,11 +547,11 @@ func sendInviteMail(mailer mail.Mailer, p pendingInviteMail) {
 	}
 }
 
-// loadInvitedPlanInfo fetches the host-only plan fields needed to send an
-// invite, in one call — 404s (rather than 403) when the plan doesn't exist
-// or the caller isn't its host, matching this package's existing
-// not-found-over-forbidden convention for owner-scoped lookups (e.g.
-// PlanHandler.Update).
+// loadInvitedPlanInfo fetches the host-only plan fields (+ full itinerary)
+// needed to send an invite, in one call — 404s (rather than 403) when the
+// plan doesn't exist or the caller isn't its host, matching this package's
+// existing not-found-over-forbidden convention for owner-scoped lookups
+// (e.g. PlanHandler.Update).
 func (h *InviteHandler) loadInvitedPlanInfo(ctx context.Context, planID, hostOwnerID string) (invitedPlanInfo, error) {
 	var p invitedPlanInfo
 	var location *string
@@ -328,6 +567,11 @@ func (h *InviteHandler) loadInvitedPlanInfo(ctx context.Context, planID, hostOwn
 	if location != nil {
 		p.Location = *location
 	}
+	allRuns, rerr := loadPlanRuns(ctx, h.db, planID)
+	if rerr != nil {
+		return invitedPlanInfo{}, rerr
+	}
+	p.AllRuns = allRuns
 	return p, nil
 }
 
@@ -358,7 +602,13 @@ func (h *InviteHandler) InviteToPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, pending, err := inviteOne(ctx, h.db, plan, ownerID, body)
+	targets, terr := resolveInviteTargets(plan.AllRuns, body.PlanRunIDs)
+	if terr != nil {
+		h.respondAPIError(w, terr)
+		return
+	}
+
+	results, pending, err := inviteOne(ctx, h.db, plan, ownerID, body, targets)
 	if err != nil {
 		h.respondAPIError(w, err)
 		return
@@ -370,18 +620,140 @@ func (h *InviteHandler) InviteToPlan(w http.ResponseWriter, r *http.Request) {
 		go sendInviteMail(h.mailer, *pending)
 	}
 
-	status := http.StatusOK
-	if result.Created {
-		status = http.StatusCreated
+	memberIDs := make([]string, 0, len(results))
+	anyCreated := false
+	for _, res := range results {
+		if res.MemberID != "" {
+			memberIDs = append(memberIDs, res.MemberID)
+		}
+		if res.Created {
+			anyCreated = true
+		}
 	}
-	jsonResponse(w, status, map[string]any{
-		"member_id": result.MemberID,
-		"status":    result.Status,
-		"sent":      sent,
+	status := "existing"
+	httpStatus := http.StatusOK
+	if anyCreated {
+		status = "invited"
+		httpStatus = http.StatusCreated
+	}
+
+	jsonResponse(w, httpStatus, map[string]any{
+		"member_ids": memberIDs,
+		"status":     status,
+		"sent":       sent,
+		// results: per-row detail (contract "Dup handling per row (existing
+		// row -> skipped, reported)") — member_ids/status/sent above stay the
+		// bulk-level summary the contract's Response shape names literally.
+		"results": results,
+	})
+}
+
+// ── POST /plans/{id}/invite/resend ───────────────────────────────────────
+// Host-only, rate-limited 10/hr/owner (reuses reportRateLimiter). Regenerates
+// a fresh shared token, rotates invite_token_hash on every still-invited row
+// for that email across the whole plan, and re-sends (same email/.ics
+// rework as InviteToPlan). 404 if the email has no invited rows on this
+// plan at all; 409 if every row for that email has already been
+// accepted/declined (nothing left to resend).
+
+func (h *InviteHandler) ResendInvite(w http.ResponseWriter, r *http.Request) {
+	planID := chi.URLParam(r, "id")
+	ownerID, ok := h.ownerID(r)
+	if !ok {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.rlResend.allow(ownerID, 10, time.Hour) {
+		errorResponse(w, http.StatusTooManyRequests, "rate limit: 10 resends per hour")
+		return
+	}
+
+	var body struct {
+		Email string `json:"email"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		errorResponse(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	email := strings.ToLower(strings.TrimSpace(body.Email))
+	if email == "" {
+		errorResponse(w, http.StatusBadRequest, "email is required")
+		return
+	}
+
+	ctx := r.Context()
+	plan, perr := h.loadInvitedPlanInfo(ctx, planID, ownerID)
+	if perr != nil {
+		h.respondAPIError(w, perr)
+		return
+	}
+
+	rawToken, tokenHash, terr := generateInviteToken()
+	if terr != nil {
+		errorResponse(w, http.StatusInternalServerError, "token generation failed")
+		return
+	}
+
+	rows, err := h.db.Query(ctx, `
+		UPDATE plan_members SET invite_token_hash = $1, updated_at = NOW()
+		WHERE plan_id = $2::uuid AND member_owner_id IS NULL AND lower(invite_email) = $3
+		  AND origin = 'invite' AND status = 'invited'
+		RETURNING plan_run_id::text
+	`, tokenHash, planID, email)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "resend failed")
+		return
+	}
+	var updatedRunIDs []string
+	for rows.Next() {
+		var runID *string
+		if serr := rows.Scan(&runID); serr == nil && runID != nil {
+			updatedRunIDs = append(updatedRunIDs, *runID)
+		}
+	}
+	rows.Close()
+
+	if len(updatedRunIDs) == 0 {
+		var anyRow bool
+		h.db.QueryRow(ctx, `
+			SELECT EXISTS(SELECT 1 FROM plan_members
+				WHERE plan_id = $1::uuid AND member_owner_id IS NULL AND lower(invite_email) = $2 AND origin = 'invite')
+		`, planID, email).Scan(&anyRow)
+		if !anyRow {
+			errorResponse(w, http.StatusNotFound, "no invited rows for that email")
+			return
+		}
+		errorResponse(w, http.StatusConflict, "all invites for that email have already been accepted or declined")
+		return
+	}
+
+	updated := make(map[string]bool, len(updatedRunIDs))
+	for _, id := range updatedRunIDs {
+		updated[id] = true
+	}
+	var invitedRuns []inviteRunInfo
+	for _, run := range plan.AllRuns {
+		if updated[run.ID] {
+			invitedRuns = append(invitedRuns, run)
+		}
+	}
+
+	go sendInviteMail(h.mailer, pendingInviteMail{
+		to: email, rawToken: rawToken, attachICS: true, plan: plan, invitedRuns: invitedRuns,
+	})
+
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"status":       "resent",
+		"plan_run_ids": updatedRunIDs,
 	})
 }
 
 // ── GET /me/invites ───────────────────────────────────────────────────────
+// #246 A7: rows are now run-scoped — grouped by plan into one feed item per
+// plan, each carrying its invited runs [{member_id, plan_run_id, run_name,
+// run_date, run_time, status, dismissed_at}] (contract §3). A runless-plan
+// invite (plan_run_id NULL, membership rule) still surfaces as one run-entry
+// with the run fields empty.
 
 func (h *InviteHandler) MyInvites(w http.ResponseWriter, r *http.Request) {
 	ownerID, ok := h.ownerID(r)
@@ -393,20 +765,22 @@ func (h *InviteHandler) MyInvites(w http.ResponseWriter, r *http.Request) {
 	// email may be "" for dev-fallback / API-key-style auth (auth.Claims.Email
 	// is only populated for real Supabase JWTs) — the LOWER(email)=LOWER('')
 	// comparison below never matches a real invite_email, so this safely
-	// degrades to member_owner_id-only matching (contract: "if absent from
-	// the token, document and fall back to member_owner_id-only").
+	// degrades to member_owner_id-only matching.
 	email, _ := auth.EmailFromContext(ctx)
 
 	rows, err := h.db.Query(ctx, `
 		SELECT pm.id, pm.status::text, pm.dismissed_at, (pm.invite_handle IS NOT NULL) AS via_handle, pm.created_at,
+		       pm.plan_run_id::text, pr.run_date::text, pr.run_time::text, COALESCE(ur.name, 'Paddle'),
 		       p.id, p.slug, p.name, p.type::text, p.start_date::text, p.end_date::text, p.location,
 		       COALESCE(up.handle, '')
 		FROM plan_members pm
 		JOIN plans p ON p.id = pm.plan_id AND p.deleted_at IS NULL
+		LEFT JOIN plan_runs pr ON pr.id = pm.plan_run_id AND pr.deleted_at IS NULL
+		LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
 		LEFT JOIN user_profiles up ON up.owner_id = p.owner_id
 		WHERE pm.origin = 'invite'
 		  AND (pm.member_owner_id = $1 OR (pm.member_owner_id IS NULL AND LOWER(pm.invite_email) = LOWER($2)))
-		ORDER BY pm.created_at DESC
+		ORDER BY p.start_date, pm.created_at
 	`, ownerID, email)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
@@ -424,39 +798,74 @@ func (h *InviteHandler) MyInvites(w http.ResponseWriter, r *http.Request) {
 		Location   *string `json:"location,omitempty"`
 		HostHandle string  `json:"host_handle"`
 	}
-	type myInvite struct {
-		MemberID    string      `json:"member_id"`
-		Status      string      `json:"status"`
-		DismissedAt *string     `json:"dismissed_at,omitempty"`
-		InvitedVia  string      `json:"invited_via"` // "handle" | "email"
-		CreatedAt   string      `json:"created_at"`
-		Plan        invitedPlan `json:"plan"`
+	type inviteRunEntry struct {
+		MemberID    string  `json:"member_id"`
+		PlanRunID   *string `json:"plan_run_id,omitempty"`
+		RunName     *string `json:"run_name,omitempty"`
+		RunDate     *string `json:"run_date,omitempty"`
+		RunTime     *string `json:"run_time,omitempty"`
+		Status      string  `json:"status"`
+		DismissedAt *string `json:"dismissed_at,omitempty"`
+	}
+	type invitedPlanFeedItem struct {
+		Plan       invitedPlan      `json:"plan"`
+		InvitedVia string           `json:"invited_via"` // "handle" | "email"
+		CreatedAt  string           `json:"created_at"`  // earliest row's created_at
+		Runs       []inviteRunEntry `json:"runs"`
 	}
 
-	out := []myInvite{}
+	order := []string{}
+	byPlan := map[string]*invitedPlanFeedItem{}
+
 	for rows.Next() {
-		var mi myInvite
+		var memberID, status string
 		var dismissedAtRaw *time.Time
 		var createdAtRaw time.Time
 		var viaHandle bool
+		var planRunID, runDate, runTime, runName *string
+		var pl invitedPlan
 		if err := rows.Scan(
-			&mi.MemberID, &mi.Status, &dismissedAtRaw, &viaHandle, &createdAtRaw,
-			&mi.Plan.ID, &mi.Plan.Slug, &mi.Plan.Name, &mi.Plan.Type, &mi.Plan.StartDate, &mi.Plan.EndDate, &mi.Plan.Location,
-			&mi.Plan.HostHandle,
+			&memberID, &status, &dismissedAtRaw, &viaHandle, &createdAtRaw,
+			&planRunID, &runDate, &runTime, &runName,
+			&pl.ID, &pl.Slug, &pl.Name, &pl.Type, &pl.StartDate, &pl.EndDate, &pl.Location,
+			&pl.HostHandle,
 		); err != nil {
 			errorResponse(w, http.StatusInternalServerError, "scan failed")
 			return
 		}
+
+		item, ok := byPlan[pl.ID]
+		if !ok {
+			item = &invitedPlanFeedItem{
+				Plan:       pl,
+				InvitedVia: "email",
+				CreatedAt:  createdAtRaw.Format(time.RFC3339),
+			}
+			if viaHandle {
+				item.InvitedVia = "handle"
+			}
+			byPlan[pl.ID] = item
+			order = append(order, pl.ID)
+		}
+
+		entry := inviteRunEntry{MemberID: memberID, PlanRunID: planRunID, Status: status}
+		if planRunID != nil {
+			entry.RunName = runName
+			entry.RunDate = runDate
+			if runTime != nil && *runTime != "" {
+				entry.RunTime = runTime
+			}
+		}
 		if dismissedAtRaw != nil {
 			s := dismissedAtRaw.Format(time.RFC3339)
-			mi.DismissedAt = &s
+			entry.DismissedAt = &s
 		}
-		mi.CreatedAt = createdAtRaw.Format(time.RFC3339)
-		mi.InvitedVia = "email"
-		if viaHandle {
-			mi.InvitedVia = "handle"
-		}
-		out = append(out, mi)
+		item.Runs = append(item.Runs, entry)
+	}
+
+	out := make([]invitedPlanFeedItem, 0, len(order))
+	for _, planID := range order {
+		out = append(out, *byPlan[planID])
 	}
 
 	jsonResponse(w, http.StatusOK, map[string]any{"invites": out})
@@ -479,12 +888,12 @@ func (h *InviteHandler) AcceptInvite(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	email, _ := auth.EmailFromContext(ctx)
 
-	var curMemberOwnerID, curEmail, curTokenHash *string
+	var curMemberOwnerID, curEmail, curTokenHash, curPlanRunID *string
 	var status, planID string
 	if err := h.db.QueryRow(ctx, `
-		SELECT member_owner_id, invite_email, invite_token_hash, status::text, plan_id::text
+		SELECT member_owner_id, invite_email, invite_token_hash, status::text, plan_id::text, plan_run_id::text
 		FROM plan_members WHERE id = $1::uuid AND origin = 'invite'
-	`, memberID).Scan(&curMemberOwnerID, &curEmail, &curTokenHash, &status, &planID); err != nil {
+	`, memberID).Scan(&curMemberOwnerID, &curEmail, &curTokenHash, &status, &planID, &curPlanRunID); err != nil {
 		errorResponse(w, http.StatusNotFound, "invite not found")
 		return
 	}
@@ -513,10 +922,12 @@ func (h *InviteHandler) AcceptInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Serialize against concurrent CrewAccept/JoinPlan/AcceptInvite on the
-	// same plan and recheck filled<max_crew inside the lock — invites count
-	// against the cap same as crew requests (contract: max_crew caps total
-	// accepted paddlers regardless of origin, see CrewList/CrewAccept).
+	// Serialize against concurrent RunCrewAccept/JoinRun/AcceptInvite on the
+	// same plan_run and recheck filled<max_crew inside the lock — invites
+	// count against the cap same as crew requests (contract: max_crew caps
+	// total accepted paddlers per run, regardless of origin). #246 A7: the
+	// cap is now the RUN's max_crew (curPlanRunID), not the plan's — a
+	// plan-level row (runless plan, membership rule) has no cap at all.
 	tx, err := h.db.Begin(ctx)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "tx failed")
@@ -524,23 +935,25 @@ func (h *InviteHandler) AcceptInvite(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
 
-	var maxCrew *int
-	if err := tx.QueryRow(ctx,
-		`SELECT max_crew FROM plans WHERE id = $1::uuid AND deleted_at IS NULL FOR UPDATE`, planID,
-	).Scan(&maxCrew); err != nil {
-		errorResponse(w, http.StatusNotFound, "plan not found")
-		return
-	}
-
-	if status != "accepted" {
-		filled, ferr := crewFilled(ctx, tx, planID)
-		if ferr != nil {
-			errorResponse(w, http.StatusInternalServerError, "crew count failed")
+	if curPlanRunID != nil {
+		var maxCrew *int
+		if err := tx.QueryRow(ctx,
+			`SELECT max_crew FROM plan_runs WHERE id = $1::uuid AND deleted_at IS NULL FOR UPDATE`, *curPlanRunID,
+		).Scan(&maxCrew); err != nil {
+			errorResponse(w, http.StatusNotFound, "plan run not found")
 			return
 		}
-		if maxCrew != nil && filled >= *maxCrew {
-			errorResponse(w, http.StatusConflict, "crew is full")
-			return
+
+		if status != "accepted" {
+			filled, ferr := runFilled(ctx, tx, *curPlanRunID)
+			if ferr != nil {
+				errorResponse(w, http.StatusInternalServerError, "crew count failed")
+				return
+			}
+			if maxCrew != nil && filled >= *maxCrew {
+				errorResponse(w, http.StatusConflict, "crew is full")
+				return
+			}
 		}
 	}
 
@@ -557,14 +970,15 @@ func (h *InviteHandler) AcceptInvite(w http.ResponseWriter, r *http.Request) {
 		  AND (member_owner_id IS NULL OR member_owner_id = $1)
 	`, ownerID, memberID)
 	if err != nil {
-		// Binding member_owner_id can collide with plan_members_owner_uk if
-		// the caller is already a member of this plan via a separate row
-		// (e.g. accepted a handle-invite, now also holds an email-invite
-		// link) — surface as 409. Any other DB error (timeout, connection
-		// drop) is a genuine 500, not a duplicate-membership conflict.
+		// Binding member_owner_id can collide with a run-scoped unique index
+		// if the caller is already a member of this SAME RUN via a separate
+		// row (e.g. accepted a handle-invite, now also holds an email-invite
+		// link for the same run) — surface as 409. Any other DB error
+		// (timeout, connection drop) is a genuine 500, not a duplicate-
+		// membership conflict.
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-			errorResponse(w, http.StatusConflict, "already a member of this plan")
+			errorResponse(w, http.StatusConflict, "already a member of this run")
 		} else {
 			errorResponse(w, http.StatusInternalServerError, "accept failed")
 		}
@@ -584,7 +998,8 @@ func (h *InviteHandler) AcceptInvite(w http.ResponseWriter, r *http.Request) {
 
 // ── POST /invites/{memberId}/dismiss ─────────────────────────────────────
 // Dismiss keeps the row (and its status) in GET /me/invites — only
-// dismissed_at is set (contract: "row STAYS listed").
+// dismissed_at is set (contract: "row STAYS listed"). Per-row (= per run),
+// unchanged shape from #246 A4.
 
 func (h *InviteHandler) DismissInvite(w http.ResponseWriter, r *http.Request) {
 	memberID := chi.URLParam(r, "memberId")
@@ -612,10 +1027,13 @@ func (h *InviteHandler) DismissInvite(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, map[string]string{"status": "dismissed"})
 }
 
-// ── POST /plans/{id}/join ─────────────────────────────────────────────────
+// ── POST /plan-runs/{id}/join ─────────────────────────────────────────────
+// #246 A7: replaces POST /plans/{id}/join (REMOVED, main.go) — crew requests
+// RSVP to a specific run, not the whole plan. Gates: parent plan public +
+// THAT RUN's looking_for_crew + run-filled < run-max_crew.
 
-func (h *InviteHandler) JoinPlan(w http.ResponseWriter, r *http.Request) {
-	planID := chi.URLParam(r, "id")
+func (h *InviteHandler) JoinRun(w http.ResponseWriter, r *http.Request) {
+	planRunID := chi.URLParam(r, "id")
 	ownerID, ok := h.ownerID(r)
 	if !ok {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
@@ -627,48 +1045,45 @@ func (h *InviteHandler) JoinPlan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		PlanRunID *string `json:"plan_run_id"`
-		Message   *string `json:"message"`
+		Message *string `json:"message"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		errorResponse(w, http.StatusBadRequest, "invalid JSON")
-		return
-	}
+	_ = json.NewDecoder(r.Body).Decode(&body) // optional body
 
 	ctx := r.Context()
 
-	var visibility string
+	var planID, visibility, hostOwnerID string
 	var lookingForCrew bool
 	var maxCrew *int
-	var hostOwnerID string
 	if err := h.db.QueryRow(ctx, `
-		SELECT visibility::text, looking_for_crew, max_crew, owner_id
-		FROM plans WHERE id = $1::uuid AND deleted_at IS NULL
-	`, planID).Scan(&visibility, &lookingForCrew, &maxCrew, &hostOwnerID); err != nil {
-		errorResponse(w, http.StatusNotFound, "plan not found")
+		SELECT pr.plan_id::text, p.visibility::text, p.owner_id, pr.looking_for_crew, pr.max_crew
+		FROM plan_runs pr
+		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
+		WHERE pr.id = $1::uuid AND pr.deleted_at IS NULL
+	`, planRunID).Scan(&planID, &visibility, &hostOwnerID, &lookingForCrew, &maxCrew); err != nil {
+		errorResponse(w, http.StatusNotFound, "plan run not found")
 		return
 	}
 	if hostOwnerID == ownerID {
-		errorResponse(w, http.StatusConflict, "host cannot request to join their own plan")
+		errorResponse(w, http.StatusConflict, "host cannot request to join their own run")
 		return
 	}
 
-	// Already a member (any origin/status) -> 200 existing, no dup.
+	// Already a member of THIS run (any origin/status) -> 200 existing, no dup.
 	var existingID, existingStatus string
 	if err := h.db.QueryRow(ctx,
-		`SELECT id, status::text FROM plan_members WHERE plan_id = $1::uuid AND member_owner_id = $2`,
-		planID, ownerID,
+		`SELECT id, status::text FROM plan_members WHERE plan_run_id = $1::uuid AND member_owner_id = $2`,
+		planRunID, ownerID,
 	).Scan(&existingID, &existingStatus); err == nil {
 		jsonResponse(w, http.StatusOK, map[string]string{"member_id": existingID, "status": existingStatus})
 		return
 	}
 
 	if visibility != "public" || !lookingForCrew {
-		errorResponse(w, http.StatusConflict, "this plan is not open for crew requests")
+		errorResponse(w, http.StatusConflict, "this run is not open for crew requests")
 		return
 	}
 
-	filled, ferr := crewFilled(ctx, h.db, planID)
+	filled, ferr := runFilled(ctx, h.db, planRunID)
 	if ferr != nil {
 		errorResponse(w, http.StatusInternalServerError, "crew count failed")
 		return
@@ -678,39 +1093,47 @@ func (h *InviteHandler) JoinPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var planRunID *string
-	if body.PlanRunID != nil && *body.PlanRunID != "" {
-		var exists bool
-		h.db.QueryRow(ctx,
-			`SELECT EXISTS(SELECT 1 FROM plan_runs WHERE id = $1::uuid AND plan_id = $2::uuid AND deleted_at IS NULL)`,
-			*body.PlanRunID, planID,
-		).Scan(&exists)
-		if exists {
-			planRunID = body.PlanRunID
-		}
-	}
-
-	var memberID string
+	// ON CONFLICT DO NOTHING guards the race the SELECT above can't: a
+	// double-clicked or concurrent join for the same (plan_run_id,
+	// member_owner_id) can pass the guard twice, and without this the second
+	// INSERT would hit plan_members_run_owner_uk and 500 with a raw pgx
+	// error string leaked to the client (#246 review).
+	var memberID, status string
 	err := h.db.QueryRow(ctx, `
 		INSERT INTO plan_members (plan_id, member_owner_id, origin, status, plan_run_id, message)
 		VALUES ($1::uuid, $2, 'request', 'requested', $3::uuid, $4)
-		RETURNING id
-	`, planID, ownerID, planRunID, body.Message).Scan(&memberID)
+		ON CONFLICT (plan_run_id, member_owner_id) WHERE member_owner_id IS NOT NULL AND plan_run_id IS NOT NULL DO NOTHING
+		RETURNING id, status::text
+	`, planID, ownerID, planRunID, body.Message).Scan(&memberID, &status)
 	if err != nil {
-		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("join request failed: %v", err))
+		if !errors.Is(err, pgx.ErrNoRows) {
+			errorResponse(w, http.StatusInternalServerError, "join request failed")
+			return
+		}
+		// Lost the race: re-select and return 200 existing (mirror inviteOne's
+		// handle path).
+		if serr := h.db.QueryRow(ctx,
+			`SELECT id, status::text FROM plan_members WHERE plan_run_id = $1::uuid AND member_owner_id = $2`,
+			planRunID, ownerID,
+		).Scan(&memberID, &status); serr != nil {
+			errorResponse(w, http.StatusInternalServerError, "join request failed")
+			return
+		}
+		jsonResponse(w, http.StatusOK, map[string]string{"member_id": memberID, "status": status})
 		return
 	}
-	jsonResponse(w, http.StatusCreated, map[string]string{"member_id": memberID, "status": "requested"})
+	jsonResponse(w, http.StatusCreated, map[string]string{"member_id": memberID, "status": status})
 }
 
-// ── GET /plans/{id}/crew ──────────────────────────────────────────────────
-// Both pending requests and accepted crew (of either origin — an accepted
-// handle-invite is also "crew") so the host sees one roster; filled counts
-// status='accepted' regardless of origin (contract: max_crew caps total
-// accepted paddlers, host not counted).
+// ── GET /plan-runs/{id}/crew ──────────────────────────────────────────────
+// #246 A7: replaces GET /plans/{id}/crew (REMOVED, main.go) — one roster per
+// run. Both pending requests and accepted crew (of either origin — an
+// accepted handle-invite is also "crew") so the host sees one roster; filled
+// counts status='accepted' regardless of origin (contract: max_crew caps
+// total accepted paddlers on THIS run, host not counted).
 
-func (h *InviteHandler) CrewList(w http.ResponseWriter, r *http.Request) {
-	planID := chi.URLParam(r, "id")
+func (h *InviteHandler) RunCrewList(w http.ResponseWriter, r *http.Request) {
+	planRunID := chi.URLParam(r, "id")
 	ownerID, ok := h.ownerID(r)
 	if !ok {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
@@ -720,10 +1143,14 @@ func (h *InviteHandler) CrewList(w http.ResponseWriter, r *http.Request) {
 
 	var hostOwnerID string
 	var maxCrew *int
-	if err := h.db.QueryRow(ctx,
-		`SELECT owner_id, max_crew FROM plans WHERE id = $1::uuid AND deleted_at IS NULL`, planID,
-	).Scan(&hostOwnerID, &maxCrew); err != nil {
-		errorResponse(w, http.StatusNotFound, "plan not found")
+	var lookingForCrew bool
+	if err := h.db.QueryRow(ctx, `
+		SELECT p.owner_id, pr.max_crew, pr.looking_for_crew
+		FROM plan_runs pr
+		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
+		WHERE pr.id = $1::uuid AND pr.deleted_at IS NULL
+	`, planRunID).Scan(&hostOwnerID, &maxCrew, &lookingForCrew); err != nil {
+		errorResponse(w, http.StatusNotFound, "plan run not found")
 		return
 	}
 	if hostOwnerID != ownerID {
@@ -735,9 +1162,9 @@ func (h *InviteHandler) CrewList(w http.ResponseWriter, r *http.Request) {
 		SELECT pm.id, pm.status::text, pm.origin::text, pm.message, pm.created_at, COALESCE(up.handle, pm.invite_handle, '')
 		FROM plan_members pm
 		LEFT JOIN user_profiles up ON up.owner_id = pm.member_owner_id
-		WHERE pm.plan_id = $1::uuid AND (pm.origin = 'request' OR pm.status = 'accepted')
+		WHERE pm.plan_run_id = $1::uuid AND (pm.origin = 'request' OR pm.status = 'accepted')
 		ORDER BY pm.created_at
-	`, planID)
+	`, planRunID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
 		return
@@ -764,7 +1191,7 @@ func (h *InviteHandler) CrewList(w http.ResponseWriter, r *http.Request) {
 		members = append(members, cm)
 	}
 
-	filled, ferr := crewFilled(ctx, h.db, planID)
+	filled, ferr := runFilled(ctx, h.db, planRunID)
 	if ferr != nil {
 		errorResponse(w, http.StatusInternalServerError, "crew count failed")
 		return
@@ -772,18 +1199,18 @@ func (h *InviteHandler) CrewList(w http.ResponseWriter, r *http.Request) {
 
 	jsonResponse(w, http.StatusOK, map[string]any{
 		"members": members,
-		"meter":   map[string]any{"filled": filled, "max": maxCrew},
+		"meter":   map[string]any{"filled": filled, "max": maxCrew, "looking_for_crew": lookingForCrew},
 	})
 }
 
-// ── POST /plans/{id}/crew/{memberId}/accept ──────────────────────────────
-// Locks the parent plans row for the duration of the tx so concurrent
-// accepts against the same plan serialize — the filled<max_crew recheck
-// must happen inside that lock, not as a separate pre-check (contract:
-// "recheck filled<max_crew inside the UPDATE tx (409 at cap)").
+// ── POST /plan-runs/{id}/crew/{memberId}/accept ──────────────────────────
+// #246 A7: replaces POST /plans/{id}/crew/{memberId}/accept. Locks the
+// plan_runs row for the duration of the tx so concurrent accepts against
+// the same run serialize — the filled<max_crew recheck must happen inside
+// that lock, not as a separate pre-check.
 
-func (h *InviteHandler) CrewAccept(w http.ResponseWriter, r *http.Request) {
-	planID := chi.URLParam(r, "id")
+func (h *InviteHandler) RunCrewAccept(w http.ResponseWriter, r *http.Request) {
+	planRunID := chi.URLParam(r, "id")
 	memberID := chi.URLParam(r, "memberId")
 	ownerID, ok := h.ownerID(r)
 	if !ok {
@@ -801,10 +1228,13 @@ func (h *InviteHandler) CrewAccept(w http.ResponseWriter, r *http.Request) {
 
 	var hostOwnerID string
 	var maxCrew *int
-	if err := tx.QueryRow(ctx,
-		`SELECT owner_id, max_crew FROM plans WHERE id = $1::uuid AND deleted_at IS NULL FOR UPDATE`, planID,
-	).Scan(&hostOwnerID, &maxCrew); err != nil {
-		errorResponse(w, http.StatusNotFound, "plan not found")
+	if err := tx.QueryRow(ctx, `
+		SELECT p.owner_id, pr.max_crew
+		FROM plan_runs pr
+		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
+		WHERE pr.id = $1::uuid AND pr.deleted_at IS NULL FOR UPDATE
+	`, planRunID).Scan(&hostOwnerID, &maxCrew); err != nil {
+		errorResponse(w, http.StatusNotFound, "plan run not found")
 		return
 	}
 	if hostOwnerID != ownerID {
@@ -814,7 +1244,7 @@ func (h *InviteHandler) CrewAccept(w http.ResponseWriter, r *http.Request) {
 
 	var curStatus string
 	if err := tx.QueryRow(ctx,
-		`SELECT status::text FROM plan_members WHERE id = $1::uuid AND plan_id = $2::uuid`, memberID, planID,
+		`SELECT status::text FROM plan_members WHERE id = $1::uuid AND plan_run_id = $2::uuid`, memberID, planRunID,
 	).Scan(&curStatus); err != nil {
 		errorResponse(w, http.StatusNotFound, "crew request not found")
 		return
@@ -825,7 +1255,7 @@ func (h *InviteHandler) CrewAccept(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if curStatus != "accepted" {
-		filled, ferr := crewFilled(ctx, tx, planID)
+		filled, ferr := runFilled(ctx, tx, planRunID)
 		if ferr != nil {
 			errorResponse(w, http.StatusInternalServerError, "crew count failed")
 			return
@@ -850,11 +1280,8 @@ func (h *InviteHandler) CrewAccept(w http.ResponseWriter, r *http.Request) {
 
 	// The accept itself already committed above — a count-read failure here
 	// only affects the meter numbers in this response body, not whether the
-	// accept succeeded. Still surfaced as 500 (not a silent filled=0) so a
-	// caller doesn't render a bogus "0 of N" meter as ground truth; the
-	// membership change is durable regardless and a follow-up GET
-	// /plans/{id}/crew will reflect it.
-	filled, ferr := crewFilled(ctx, h.db, planID)
+	// accept succeeded.
+	filled, ferr := runFilled(ctx, h.db, planRunID)
 	if ferr != nil {
 		errorResponse(w, http.StatusInternalServerError, "crew count failed")
 		return
@@ -862,10 +1289,11 @@ func (h *InviteHandler) CrewAccept(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, map[string]any{"status": "accepted", "filled": filled, "max": maxCrew})
 }
 
-// ── POST /plans/{id}/crew/{memberId}/decline ─────────────────────────────
+// ── POST /plan-runs/{id}/crew/{memberId}/decline ─────────────────────────
+// #246 A7: replaces POST /plans/{id}/crew/{memberId}/decline.
 
-func (h *InviteHandler) CrewDecline(w http.ResponseWriter, r *http.Request) {
-	planID := chi.URLParam(r, "id")
+func (h *InviteHandler) RunCrewDecline(w http.ResponseWriter, r *http.Request) {
+	planRunID := chi.URLParam(r, "id")
 	memberID := chi.URLParam(r, "memberId")
 	ownerID, ok := h.ownerID(r)
 	if !ok {
@@ -875,10 +1303,13 @@ func (h *InviteHandler) CrewDecline(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	var hostOwnerID string
-	if err := h.db.QueryRow(ctx,
-		`SELECT owner_id FROM plans WHERE id = $1::uuid AND deleted_at IS NULL`, planID,
-	).Scan(&hostOwnerID); err != nil {
-		errorResponse(w, http.StatusNotFound, "plan not found")
+	if err := h.db.QueryRow(ctx, `
+		SELECT p.owner_id
+		FROM plan_runs pr
+		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
+		WHERE pr.id = $1::uuid AND pr.deleted_at IS NULL
+	`, planRunID).Scan(&hostOwnerID); err != nil {
+		errorResponse(w, http.StatusNotFound, "plan run not found")
 		return
 	}
 	if hostOwnerID != ownerID {
@@ -888,8 +1319,8 @@ func (h *InviteHandler) CrewDecline(w http.ResponseWriter, r *http.Request) {
 
 	tag, err := h.db.Exec(ctx, `
 		UPDATE plan_members SET status = 'declined', responded_at = NOW(), updated_at = NOW()
-		WHERE id = $1::uuid AND plan_id = $2::uuid
-	`, memberID, planID)
+		WHERE id = $1::uuid AND plan_run_id = $2::uuid
+	`, memberID, planRunID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "decline failed")
 		return

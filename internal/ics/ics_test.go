@@ -101,6 +101,71 @@ func TestBuildPlanInvite_LongMultibyteName(t *testing.T) {
 	}
 }
 
+// TestBuildPlanInvite_MultiVEventWithRuns is the #246 A7 golden case: a plan
+// VEVENT plus two run VEVENTs — one timed + invited (SUMMARY prefixed,
+// DURATION-based end), one all-day + not invited (DTEND-exclusive, no
+// prefix) — verifying UID composition, per-VEVENT DTSTAMP, and the "You're
+// invited" marker. Short fake IDs (not full UUIDs) keep every line under the
+// 75-octet fold threshold so this test isolates multi-VEVENT structure from
+// the folding behavior already covered above. Also covers "meet up at"
+// (product request 2026-07-25): run-a has its own MeetupSpot (LOCATION
+// overrides the plan's), run-b has none (LOCATION falls back to the plan's
+// "Idaho"). run-a's MeetupSpot carries a comma, semicolon, and trailing
+// backslash — all three RFC 5545 TEXT special chars escapeText handles —
+// so a regression that drops escapeText(loc) in runVEvent fails this test
+// (plain apostrophes, as used here for "'T'", are NOT escaped and so don't
+// exercise this on their own).
+func TestBuildPlanInvite_MultiVEventWithRuns(t *testing.T) {
+	got := BuildPlanInvite(PlanInviteInput{
+		PlanID:    "plan1",
+		Name:      "Salmon Trip",
+		Location:  "Idaho",
+		StartDate: "2026-08-01",
+		EndDate:   "2026-08-02",
+		URL:       "https://h2oflows.app/plans/ianskluhsman/salmon-trip",
+		Now:       time.Date(2026, 7, 23, 18, 4, 5, 0, time.UTC),
+		Runs: []PlanInviteRun{
+			{ID: "run-a", Name: "Foxton", RunDate: "2026-08-01", RunTime: "10:00:00", Invited: true, MeetupSpot: "The 'T' lot, past the gate; muddy\\"},
+			{ID: "run-b", Name: "South Platte", RunDate: "2026-08-02", RunTime: "", Invited: false},
+		},
+	})
+
+	want := "BEGIN:VCALENDAR\r\n" +
+		"VERSION:2.0\r\n" +
+		"PRODID:-//h2oflows//Trip Calendar//EN\r\n" +
+		"METHOD:PUBLISH\r\n" +
+		"BEGIN:VEVENT\r\n" +
+		"UID:plan1@h2oflows.app\r\n" +
+		"DTSTAMP:20260723T180405Z\r\n" +
+		"DTSTART;VALUE=DATE:20260801\r\n" +
+		"DTEND;VALUE=DATE:20260803\r\n" +
+		"SUMMARY:Salmon Trip\r\n" +
+		"LOCATION:Idaho\r\n" +
+		"URL:https://h2oflows.app/plans/ianskluhsman/salmon-trip\r\n" +
+		"END:VEVENT\r\n" +
+		"BEGIN:VEVENT\r\n" +
+		"UID:plan1-run-a@h2oflows.app\r\n" +
+		"DTSTAMP:20260723T180405Z\r\n" +
+		"DTSTART:20260801T100000\r\n" +
+		"DURATION:PT2H\r\n" +
+		"SUMMARY:You're invited: Foxton\r\n" +
+		"LOCATION:The 'T' lot\\, past the gate\\; muddy\\\\\r\n" +
+		"END:VEVENT\r\n" +
+		"BEGIN:VEVENT\r\n" +
+		"UID:plan1-run-b@h2oflows.app\r\n" +
+		"DTSTAMP:20260723T180405Z\r\n" +
+		"DTSTART;VALUE=DATE:20260802\r\n" +
+		"DTEND;VALUE=DATE:20260803\r\n" +
+		"SUMMARY:South Platte\r\n" +
+		"LOCATION:Idaho\r\n" +
+		"END:VEVENT\r\n" +
+		"END:VCALENDAR\r\n"
+
+	if got != want {
+		t.Errorf("BuildPlanInvite mismatch:\ngot:  %q\nwant: %q", got, want)
+	}
+}
+
 func TestFoldLine_ShortLineUnchanged(t *testing.T) {
 	short := "SUMMARY:short and sweet"
 	if got := foldLine(short); got != short {
