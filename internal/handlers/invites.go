@@ -1067,17 +1067,36 @@ func (h *InviteHandler) JoinRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var memberID string
+	// ON CONFLICT DO NOTHING guards the race the SELECT above can't: a
+	// double-clicked or concurrent join for the same (plan_run_id,
+	// member_owner_id) can pass the guard twice, and without this the second
+	// INSERT would hit plan_members_run_owner_uk and 500 with a raw pgx
+	// error string leaked to the client (#246 review).
+	var memberID, status string
 	err := h.db.QueryRow(ctx, `
 		INSERT INTO plan_members (plan_id, member_owner_id, origin, status, plan_run_id, message)
 		VALUES ($1::uuid, $2, 'request', 'requested', $3::uuid, $4)
-		RETURNING id
-	`, planID, ownerID, planRunID, body.Message).Scan(&memberID)
+		ON CONFLICT (plan_run_id, member_owner_id) WHERE member_owner_id IS NOT NULL AND plan_run_id IS NOT NULL DO NOTHING
+		RETURNING id, status::text
+	`, planID, ownerID, planRunID, body.Message).Scan(&memberID, &status)
 	if err != nil {
-		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("join request failed: %v", err))
+		if !errors.Is(err, pgx.ErrNoRows) {
+			errorResponse(w, http.StatusInternalServerError, "join request failed")
+			return
+		}
+		// Lost the race: re-select and return 200 existing (mirror inviteOne's
+		// handle path).
+		if serr := h.db.QueryRow(ctx,
+			`SELECT id, status::text FROM plan_members WHERE plan_run_id = $1::uuid AND member_owner_id = $2`,
+			planRunID, ownerID,
+		).Scan(&memberID, &status); serr != nil {
+			errorResponse(w, http.StatusInternalServerError, "join request failed")
+			return
+		}
+		jsonResponse(w, http.StatusOK, map[string]string{"member_id": memberID, "status": status})
 		return
 	}
-	jsonResponse(w, http.StatusCreated, map[string]string{"member_id": memberID, "status": "requested"})
+	jsonResponse(w, http.StatusCreated, map[string]string{"member_id": memberID, "status": status})
 }
 
 // ── GET /plan-runs/{id}/crew ──────────────────────────────────────────────

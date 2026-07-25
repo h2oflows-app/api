@@ -295,7 +295,7 @@ func (h *DiscoverHandler) ListPlans(w http.ResponseWriter, r *http.Request) {
 		  AND ($2::float8 IS NULL OR ur.class_max >= $2)
 		  AND ($3::float8 IS NULL OR ur.class_min <= $3)
 		  AND ($4 = '' OR COALESCE(p.location, '') ILIKE '%' || $4 || '%')
-		ORDER BY p.start_date ASC
+		ORDER BY p.start_date::text ASC
 		LIMIT $6 OFFSET $7
 	`
 	rows, err := h.db.Query(ctx, planQuery, q, minClass, maxClass, location, todayStr, limit+1, offset)
