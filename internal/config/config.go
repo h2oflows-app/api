@@ -25,6 +25,7 @@ type Config struct {
 	MigrationsPath   string
 	ResendAPIKey     string // #246 A4: unset -> invite emails degrade to mail.NoopMailer (logs instead of sending)
 	MailFrom         string // #246 A4: RFC 5322 From header, e.g. "H2OFlows <trips@h2oflows.app>" — must be set together with ResendAPIKey
+	WebBaseURL       string // #246: web origin embedded in invite emails/.ics links — staging must point at its own web deploy, not prod
 }
 
 func Load() Config {
@@ -46,6 +47,7 @@ func Load() Config {
 		MigrationsPath:   env("MIGRATIONS_PATH", "migrations"),
 		ResendAPIKey:     env("RESEND_API_KEY", ""),
 		MailFrom:         env("MAIL_FROM", ""),
+		WebBaseURL:       env("WEB_BASE_URL", "https://h2oflows.app"),
 	}
 }
 

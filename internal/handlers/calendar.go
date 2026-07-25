@@ -156,21 +156,26 @@ func (h *PlanHandler) Calendar(w http.ResponseWriter, r *http.Request) {
 		Visibility   string  `json:"visibility"`
 		Role         string  `json:"role"`
 		MemberStatus *string `json:"member_status,omitempty"`
+		HostHandle   string  `json:"host_handle"`
 	}
 
 	planRows, err := h.db.Query(ctx, `
 		SELECT p.id, p.slug, p.name, p.type::text, p.start_date::text, p.end_date::text,
-		       p.visibility::text, 'own' AS role, NULL::text AS member_status
+		       p.visibility::text, 'own' AS role, NULL::text AS member_status,
+		       COALESCE(up.handle, '') AS host_handle
 		FROM plans p
+		LEFT JOIN user_profiles up ON up.owner_id = p.owner_id
 		WHERE p.owner_id = $1 AND p.deleted_at IS NULL
 		  AND p.start_date <= $3::date AND p.end_date >= $2::date
 		UNION ALL
 		SELECT p.id, p.slug, p.name, p.type::text, p.start_date::text, p.end_date::text,
 		       p.visibility::text,
 		       CASE WHEN pm.status = 'accepted' THEN 'member' ELSE 'invited' END AS role,
-		       pm.status::text AS member_status
+		       pm.status::text AS member_status,
+		       COALESCE(up.handle, '') AS host_handle
 		FROM plan_members pm
 		JOIN plans p ON p.id = pm.plan_id AND p.deleted_at IS NULL
+		LEFT JOIN user_profiles up ON up.owner_id = p.owner_id
 		WHERE pm.member_owner_id = $1
 		  AND (
 		    (pm.origin = 'invite' AND pm.status IN ('invited','accepted'))
@@ -189,7 +194,7 @@ func (h *PlanHandler) Calendar(w http.ResponseWriter, r *http.Request) {
 	for planRows.Next() {
 		var p calPlan
 		if err := planRows.Scan(&p.ID, &p.Slug, &p.Name, &p.Type, &p.StartDate, &p.EndDate,
-			&p.Visibility, &p.Role, &p.MemberStatus); err != nil {
+			&p.Visibility, &p.Role, &p.MemberStatus, &p.HostHandle); err != nil {
 			errorResponse(w, http.StatusInternalServerError, "scan failed")
 			return
 		}

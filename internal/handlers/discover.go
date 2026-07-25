@@ -6,16 +6,28 @@ import (
 	"strings"
 	"time"
 
+	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // DiscoverHandler serves unified ranked search across curated + community runs.
 type DiscoverHandler struct {
-	db *pgxpool.Pool
+	db            *pgxpool.Pool
+	devFallbackID string // #246 A6: ListPlans is now auth-only (see ownerID below)
 }
 
-func NewDiscoverHandler(db *pgxpool.Pool) *DiscoverHandler {
-	return &DiscoverHandler{db: db}
+func NewDiscoverHandler(db *pgxpool.Pool, devFallbackID string) *DiscoverHandler {
+	return &DiscoverHandler{db: db, devFallbackID: devFallbackID}
+}
+
+func (h *DiscoverHandler) ownerID(r *http.Request) (string, bool) {
+	if id, ok := auth.UserIDFromContext(r.Context()); ok {
+		return id, true
+	}
+	if h.devFallbackID != "" {
+		return h.devFallbackID, true
+	}
+	return "", false
 }
 
 type discoverRun struct {
@@ -198,12 +210,22 @@ type discoverCrewMeter struct {
 	Max    *int `json:"max"`
 }
 
-// ListPlans handles GET /api/v1/discover/plans — public crew-call browse,
-// anon OK (contract decision #7: gated by the plan's own visibility +
-// looking_for_crew, no anonPublicOnMapFilter/public_on_map owner gate — this
-// intentionally diverges from ListRuns above).
+// ListPlans handles GET /api/v1/discover/plans — public crew-call browse.
+// Gated by the plan's own visibility + looking_for_crew, no
+// anonPublicOnMapFilter/public_on_map owner gate (contract decision #7 —
+// this intentionally diverges from ListRuns above). #246 A6 anon scoping
+// (IMPLEMENTATION_PLAN.md §6 REVISED, PART 3 item 3, binding): the
+// anon-OK carve-out is DROPPED here — the calendar domain (plans, including
+// crew-call plans) is auth-only, so this now 401s anonymous callers same as
+// every other /discover/plans-adjacent calendar read.
 // Params: q, min_class, max_class, location, limit, offset.
 func (h *DiscoverHandler) ListPlans(w http.ResponseWriter, r *http.Request) {
+	ownerID, ok := h.ownerID(r)
+	if !ok {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	location := strings.TrimSpace(r.URL.Query().Get("location"))
 
@@ -227,6 +249,16 @@ func (h *DiscoverHandler) ListPlans(w http.ResponseWriter, r *http.Request) {
 	offset := 0
 	if o, err := strconv.Atoi(r.URL.Query().Get("offset")); err == nil && o >= 0 {
 		offset = o
+	}
+
+	// #246 A6 (PART 3 item 3): the caller is always authed now (anon 401s
+	// above), so this switches from the anon-caller-only bare CURRENT_DATE
+	// to userToday() — same timezone rule every other date guard in this
+	// package follows (contract "Timezone rule", binding).
+	today, terr := userToday(r.Context(), h.db, ownerID)
+	if terr != nil {
+		errorResponse(w, http.StatusInternalServerError, "could not resolve local date")
+		return
 	}
 
 	query := `
@@ -254,7 +286,7 @@ func (h *DiscoverHandler) ListPlans(w http.ResponseWriter, r *http.Request) {
 			FROM plan_runs pr
 			LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
 			WHERE pr.plan_id = p.id AND pr.deleted_at IS NULL
-			ORDER BY (pr.run_date < CURRENT_DATE), pr.run_date ASC
+			ORDER BY (pr.run_date < $5::date), pr.run_date ASC
 			LIMIT 1
 		) fr ON true
 		LEFT JOIN LATERAL (
@@ -262,21 +294,18 @@ func (h *DiscoverHandler) ListPlans(w http.ResponseWriter, r *http.Request) {
 			WHERE pm.plan_id = p.id AND pm.status = 'accepted'
 		) cm ON true
 		WHERE p.visibility = 'public' AND p.looking_for_crew AND p.deleted_at IS NULL
-		  -- Anon callers have no tz (no user_calendar_prefs row to resolve);
-		  -- plain CURRENT_DATE is used here deliberately rather than
-		  -- userToday(), unlike every authed date guard elsewhere in this
-		  -- package — worst case a plan lingers in (or drops out of) the
-		  -- feed a few hours off local midnight, which is acceptable for a
-		  -- public browse list (contract §4).
-		  AND p.end_date >= CURRENT_DATE
+		  -- #246 A6: caller is always authed now — local-today, not bare
+		  -- CURRENT_DATE (contract "Timezone rule", binding; PART 3 item 3).
+		  AND p.end_date >= $5::date
 		  AND ($1 = '' OR p.name ILIKE '%' || $1 || '%' OR COALESCE(p.location, '') ILIKE '%' || $1 || '%')
 		  AND ($2::float8 IS NULL OR fr.class_max >= $2)
 		  AND ($3::float8 IS NULL OR fr.class_min <= $3)
 		  AND ($4 = '' OR COALESCE(p.location, '') ILIKE '%' || $4 || '%')
 		ORDER BY p.start_date ASC
-		LIMIT $5 OFFSET $6
+		LIMIT $6 OFFSET $7
 	`
-	rows, err := h.db.Query(r.Context(), query, q, minClass, maxClass, location, limit+1, offset)
+	todayStr := today.Format("2006-01-02")
+	rows, err := h.db.Query(r.Context(), query, q, minClass, maxClass, location, todayStr, limit+1, offset)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
 		return

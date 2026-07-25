@@ -199,6 +199,16 @@ func (h *PlanHandler) GetRun(w http.ResponseWriter, r *http.Request) {
 func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runID string) {
 	ctx := r.Context()
 
+	// #246 A6 anon scoping (IMPLEMENTATION_PLAN.md §6 REVISED, PART 3 item
+	// 2 — binding): unlike the plan detail page (renderPlan), a plan_run
+	// item has no invite-token carve-out — the calendar domain is auth-only
+	// here, full stop.
+	callerID, callerOK := h.ownerID(r)
+	if !callerOK {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
 	var run planRunSummary
 	var runTime *string
 	var paddledAtRaw *time.Time
@@ -236,9 +246,8 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 	run.CreatedAt = createdAtRaw.Format(time.RFC3339)
 
 	if visibility != "public" {
-		callerID, callerOK := h.ownerID(r)
-		allowed := callerOK && callerID == hostOwnerID
-		if !allowed && callerOK {
+		allowed := callerID == hostOwnerID
+		if !allowed {
 			h.db.QueryRow(ctx, `
 				SELECT EXISTS(SELECT 1 FROM plan_members
 					WHERE plan_id = $1 AND member_owner_id = $2 AND status IN ('invited','accepted'))

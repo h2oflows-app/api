@@ -214,6 +214,35 @@ func generateInviteToken() (raw, hash string, err error) {
 	return raw, hash, nil
 }
 
+// inviteTokenMemberID resolves token (the raw ?invite= query param) to the
+// plan_members.id it hashes to, scoped to planID — the one read carve-out
+// for the calendar domain (#246 A6, PlanHandler.renderPlan), used both to
+// grant read access (ok==true is the old anonInviteTokenValid signal) and,
+// for an AUTHED caller, to tell the frontend which member row an
+// unbound (member_owner_id IS NULL) email invite corresponds to so it can
+// drive InviteAcceptCard/AcceptInvite before the invite is ever bound to
+// their account (review finding, W4 #246: signed-up-with-different-email
+// conversion was otherwise unreachable — no member_id, no accept). Package-
+// level (not a method) since it's needed from PlanHandler, mirroring this
+// file's dbQueryer-free helpers. An empty/absent token or a token for a
+// DIFFERENT plan_id both fail closed (""/false), same as AcceptInvite's
+// token check below — the token only ever grants access to the plan it was
+// minted for, never a general bearer credential.
+func inviteTokenMemberID(ctx context.Context, db *pgxpool.Pool, planID, token string) (string, bool) {
+	if token == "" {
+		return "", false
+	}
+	sum := sha256.Sum256([]byte(token))
+	hash := hex.EncodeToString(sum[:])
+	var memberID string
+	if err := db.QueryRow(ctx, `
+		SELECT id::text FROM plan_members WHERE plan_id = $1::uuid AND invite_token_hash = $2
+	`, planID, hash).Scan(&memberID); err != nil {
+		return "", false
+	}
+	return memberID, true
+}
+
 // sendInviteMail builds the invite email (+ .ics attachment when requested)
 // and sends it. Package-level (not a method) so both InviteHandler and
 // PlanHandler.Create can fire it after their respective transaction commits,
@@ -221,6 +250,19 @@ func generateInviteToken() (raw, hash string, err error) {
 // context dies at response, so a fresh context.Background()+timeout is used
 // per the contract ("Sends are async... go func with its own
 // context.Background+timeout").
+// webBaseURL is the web origin embedded in invite emails + .ics links.
+// Overridden from config (WEB_BASE_URL) in main.go so staging emails link to
+// the staging web deploy instead of prod (which bit the first staging test:
+// the emailed link went to prod, where the plan page wasn't deployed yet).
+var webBaseURL = "https://h2oflows.app"
+
+// SetWebBaseURL wires config.WebBaseURL at startup (trailing slash stripped).
+func SetWebBaseURL(u string) {
+	if u != "" {
+		webBaseURL = strings.TrimRight(u, "/")
+	}
+}
+
 func sendInviteMail(mailer mail.Mailer, p pendingInviteMail) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -229,7 +271,7 @@ func sendInviteMail(mailer mail.Mailer, p pendingInviteMail) {
 	if host == "" {
 		host = "a paddler"
 	}
-	planURL := fmt.Sprintf("https://h2oflows.app/plans/%s/%s", p.plan.HostHandle, p.plan.Slug)
+	planURL := fmt.Sprintf("%s/plans/%s/%s", webBaseURL, p.plan.HostHandle, p.plan.Slug)
 	acceptURL := fmt.Sprintf("%s?invite=%s", planURL, p.rawToken)
 
 	dateRange := p.plan.StartDate

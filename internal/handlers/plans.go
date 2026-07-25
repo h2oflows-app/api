@@ -286,6 +286,11 @@ type planRunSummary struct {
 type planMember struct {
 	Handle string `json:"handle"`
 	Status string `json:"status"`
+	// InviteEmail is populated ONLY when the viewer is the host — email-only
+	// invitees have no handle (member_owner_id NULL until accept), and without
+	// this the host's members row rendered them invisible. Never exposed to
+	// non-host viewers (invitee privacy).
+	InviteEmail *string `json:"invite_email,omitempty"`
 }
 
 type itineraryDay struct {
@@ -475,6 +480,12 @@ func (h *PlanHandler) GetByHandleSlug(w http.ResponseWriter, r *http.Request) {
 		WHERE LOWER(up.handle) = LOWER($1) AND p.slug = $2 AND p.deleted_at IS NULL
 	`, handle, slug).Scan(&planID)
 	if err != nil {
+		// Anon gets a uniform 401 whether or not the plan exists — a 404-vs-401
+		// split would let anon probe which handle/slug pairs exist.
+		if _, ok := h.ownerID(r); !ok {
+			errorResponse(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
 		errorResponse(w, http.StatusNotFound, "plan not found")
 		return
 	}
@@ -487,6 +498,11 @@ func (h *PlanHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 	if err := h.db.QueryRow(r.Context(),
 		`SELECT id FROM plans WHERE id = $1::uuid AND deleted_at IS NULL`, id,
 	).Scan(&planID); err != nil {
+		// Uniform 401 for anon — see GetByHandleSlug.
+		if _, ok := h.ownerID(r); !ok {
+			errorResponse(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
 		errorResponse(w, http.StatusNotFound, "plan not found")
 		return
 	}
@@ -495,6 +511,29 @@ func (h *PlanHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 
 func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, planID string) {
 	ctx := r.Context()
+
+	// #246 A6 anon scoping (IMPLEMENTATION_PLAN.md §6 REVISED — binding): the
+	// calendar domain is auth-only. Anon (no ownerID) gets 401 UNLESS a
+	// matching invite token is presented for THIS plan_id — the one
+	// carve-out (?invite=<raw token>, the exact param name the invite email
+	// link already embeds, invites.go sendInviteMail's acceptURL). A valid
+	// token grants read access to this plan regardless of its visibility:
+	// the whole point is letting an invited, logged-out recipient see what
+	// they were invited to before creating an account (accept itself still
+	// requires one — contract decision #8). Authed behavior is unchanged
+	// below (public readable to any authed user; private → host/invited/
+	// accepted member only, 404 no-leak) EXCEPT the token also has to be
+	// honored for an AUTHED caller (review finding): an email invite's
+	// plan_members row keeps member_owner_id NULL until accept, so an
+	// authed-but-not-yet-bound invitee matches neither the host nor the
+	// member_owner_id check below and would 404 despite holding a valid
+	// token — resolve the token once, up front, for both branches.
+	callerID, callerOK := h.ownerID(r)
+	tokenMemberID, tokenGrant := inviteTokenMemberID(ctx, h.db, planID, r.URL.Query().Get("invite"))
+	if !callerOK && !tokenGrant {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
 
 	var pd planDetail
 	var createdAt, updatedAt time.Time
@@ -522,8 +561,7 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, planID 
 	pd.UpdatedAt = updatedAt.Format(time.RFC3339)
 
 	if pd.Visibility != "public" {
-		callerID, callerOK := h.ownerID(r)
-		allowed := callerOK && callerID == pd.HostOwnerID
+		allowed := tokenGrant || (callerOK && callerID == pd.HostOwnerID)
 		if !allowed && callerOK {
 			h.db.QueryRow(ctx, `
 				SELECT EXISTS(SELECT 1 FROM plan_members
@@ -582,9 +620,11 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, planID 
 		itinerary = append(itinerary, itineraryDay{Date: d, Runs: runsByDate[d]})
 	}
 
+	viewerIsHost := callerOK && callerID == pd.HostOwnerID
 	members := []planMember{}
 	memberRows, err := h.db.Query(ctx, `
-		SELECT COALESCE(up.handle, pm.invite_handle, '') AS handle, pm.status::text
+		SELECT COALESCE(up.handle, pm.invite_handle, '') AS handle, pm.status::text,
+		       pm.invite_email
 		FROM plan_members pm
 		LEFT JOIN user_profiles up ON up.owner_id = pm.member_owner_id
 		WHERE pm.plan_id = $1
@@ -594,7 +634,10 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, planID 
 		defer memberRows.Close()
 		for memberRows.Next() {
 			var m planMember
-			if memberRows.Scan(&m.Handle, &m.Status) == nil {
+			if memberRows.Scan(&m.Handle, &m.Status, &m.InviteEmail) == nil {
+				if !viewerIsHost {
+					m.InviteEmail = nil // invitee privacy — emails are host-only
+				}
 				members = append(members, m)
 			}
 		}
@@ -606,12 +649,21 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, planID 
 		return
 	}
 
-	jsonResponse(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"plan":      pd,
 		"itinerary": itinerary,
 		"members":   members,
 		"crew":      map[string]any{"filled": filled, "max": pd.MaxCrew},
-	})
+	}
+	if tokenGrant {
+		// Lets the frontend drive InviteAcceptCard/POST /invites/{id}/accept
+		// for a caller who holds a valid invite token but isn't bound to the
+		// invite yet (member_owner_id still NULL — e.g. signed up with a
+		// different email than the invite, so it's absent from /me/invites
+		// too; review finding, #246 W4).
+		resp["invite_member_id"] = tokenMemberID
+	}
+	jsonResponse(w, http.StatusOK, resp)
 }
 
 // ── GET /me/plans?from=&to=&type= ─────────────────────────────────────────
