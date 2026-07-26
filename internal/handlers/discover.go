@@ -13,7 +13,7 @@ import (
 // DiscoverHandler serves unified ranked search across curated + community runs.
 type DiscoverHandler struct {
 	db            *pgxpool.Pool
-	devFallbackID string // #246 A6: ListPlans is now auth-only (see ownerID below)
+	devFallbackID string // ListPlans is auth-only (see ownerID below)
 }
 
 func NewDiscoverHandler(db *pgxpool.Pool, devFallbackID string) *DiscoverHandler {
@@ -179,15 +179,25 @@ func (h *DiscoverHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ── GET /discover/plans (#246 A4, regrouped per-run #246 A7) ──────────────
+// ── GET /discover/plans (web#354 A1 — regrouped by RUN, not event) ───────
 
-// discoverPlanRun is one looking-for-crew run under a discoverPlan (contract
-// §8): "items are PLANS but each carries runs_looking_for_crew: [...] (only
-// future/today runs w/ looking_for_crew, parent public); a plan appears iff
-// it has >=1 such run."
-type discoverPlanRun struct {
-	PlanRunID  string            `json:"plan_run_id"`
+// discoverCrewMeter is the crew embed on a discoverCrewRun: {filled,max}
+// (looking_for_crew is implied by appearing in this list at all).
+type discoverCrewMeter struct {
+	Filled int  `json:"filled"`
+	Max    *int `json:"max"`
+}
+
+// discoverCrewRun is one crew-seeking calendar_run — web#354 A1 regroups
+// this endpoint from "plans, each carrying runs_looking_for_crew[]" to a
+// flat, run_date-sorted list of runs directly: events are owner-only now
+// (no visibility concept to gate a public browse on), so a run's own
+// looking_for_crew + future/today is the only qualifying signal. Crew count
+// still reads plan_members (unchanged in A1, keyed by plan_run_id).
+type discoverCrewRun struct {
+	RunID      string            `json:"plan_run_id"`
 	Name       string            `json:"name"`
+	HostHandle string            `json:"host_handle"`
 	RunDate    string            `json:"run_date"`
 	RunTime    *string           `json:"run_time,omitempty"`
 	ClassMin   *float64          `json:"class_min,omitempty"`
@@ -195,38 +205,21 @@ type discoverPlanRun struct {
 	FlowBand   *string           `json:"flow_band,omitempty"`
 	FlowColor  *string           `json:"flow_color,omitempty"`
 	GaugeCFS   *float64          `json:"gauge_cfs,omitempty"`
-	Crew       discoverCrewMeter `json:"crew"`
 	MeetupSpot *string           `json:"meetup_spot,omitempty"`
-}
-
-type discoverPlan struct {
-	ID                 string            `json:"id"`
-	Slug               string            `json:"slug"`
-	Name               string            `json:"name"`
-	Type               string            `json:"type"`
-	HostHandle         string            `json:"host_handle"`
-	Location           *string           `json:"location,omitempty"`
-	StartDate          string            `json:"start_date"`
-	EndDate            string            `json:"end_date"`
-	RunCount           int               `json:"run_count"`
-	RunsLookingForCrew []discoverPlanRun `json:"runs_looking_for_crew"`
-}
-
-type discoverCrewMeter struct {
-	Filled int  `json:"filled"`
-	Max    *int `json:"max"`
+	Crew       discoverCrewMeter `json:"crew"`
 }
 
 // ListPlans handles GET /api/v1/discover/plans — public crew-call browse.
-// #246 A7: the looking_for_crew gate moved from plans to plan_runs — a plan
-// appears iff >=1 of its LIVE runs is looking_for_crew, future/today, and
-// (when class filters are given) within [min_class,max_class]; the plans-
-// level looking_for_crew column is GONE (dropped, mig 000144). Still no
-// anonPublicOnMapFilter/public_on_map owner gate (contract decision #7 —
-// diverges from ListRuns above). #246 A6 anon scoping (IMPLEMENTATION_PLAN.md
-// §6 REVISED, PART 3 item 3, binding): auth-only, 401s anon callers same as
-// every other /discover/plans-adjacent calendar read.
-// Params: q, min_class, max_class, location, limit, offset.
+// web#354 A1: regrouped by run (events dropped visibility/type entirely and
+// are owner-only now, so there is no more per-event public gate to browse
+// by). Flat, run_date-sorted list of calendar_runs where looking_for_crew
+// AND run_date >= the caller's local today AND deleted_at IS NULL. Class
+// filters stay; auth-only (unchanged — anon 401s, no calendar-domain
+// existence oracle). `q`/`location` no longer have an event name/location to
+// match against (events aren't joined at all here anymore) — both now match
+// against the run's own reach name / meetup_spot, the closest surviving
+// analogues; documented here since this is a behavior change, not a pure
+// rename.
 func (h *DiscoverHandler) ListPlans(w http.ResponseWriter, r *http.Request) {
 	ownerID, ok := h.ownerID(r)
 	if !ok {
@@ -260,9 +253,9 @@ func (h *DiscoverHandler) ListPlans(w http.ResponseWriter, r *http.Request) {
 		offset = o
 	}
 
-	// #246 A6 (PART 3 item 3): the caller is always authed now (anon 401s
-	// above), so this uses userToday() — same timezone rule every other date
-	// guard in this package follows (contract "Timezone rule", binding).
+	// Caller is always authed (anon 401s above), so this uses userToday() —
+	// same timezone rule every other date guard in this package follows
+	// (contract "Timezone rule", binding).
 	today, terr := userToday(ctx, h.db, ownerID)
 	if terr != nil {
 		errorResponse(w, http.StatusInternalServerError, "could not resolve local date")
@@ -270,105 +263,48 @@ func (h *DiscoverHandler) ListPlans(w http.ResponseWriter, r *http.Request) {
 	}
 	todayStr := today.Format("2006-01-02")
 
-	// Step 1: which plans qualify — INNER JOIN to at least one plan_run that
-	// is live, looking_for_crew, future/today, and (if class filters given)
-	// within range; DISTINCT collapses a plan with multiple qualifying runs
-	// down to one row (the SELECT list carries no per-run columns, so DISTINCT
-	// is safe here).
-	planQuery := `
-		SELECT DISTINCT
-			p.id, p.slug, p.name, p.type::text,
-			COALESCE(up.handle, 'h2oflows')   AS host_handle,
-			p.location, p.start_date::text, p.end_date::text,
-			COALESCE(rc.run_count, 0)         AS run_count
-		FROM plans p
-		LEFT JOIN user_profiles up ON up.owner_id = p.owner_id
-		JOIN plan_runs pr ON pr.plan_id = p.id AND pr.deleted_at IS NULL
-		  AND pr.looking_for_crew AND pr.run_date >= $5::date
-		LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
+	rows, err := h.db.Query(ctx, `
+		SELECT cr.id::text, COALESCE(ur.name, 'Paddle'), COALESCE(up.handle, 'h2oflows'),
+		       cr.run_date::text, cr.run_time::text,
+		       ur.class_min, ur.class_max, cr.flow_band, cr.flow_color, cr.gauge_cfs,
+		       cr.meetup_spot, cr.max_crew, COALESCE(cm.filled, 0)
+		FROM calendar_runs cr
+		LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
+		LEFT JOIN user_profiles up ON up.owner_id = cr.owner_id
 		LEFT JOIN LATERAL (
-			SELECT COUNT(*) AS run_count
-			FROM plan_runs pr2
-			WHERE pr2.plan_id = p.id AND pr2.deleted_at IS NULL
-		) rc ON true
-		WHERE p.visibility = 'public' AND p.deleted_at IS NULL
-		  AND ($1 = '' OR p.name ILIKE '%' || $1 || '%' OR COALESCE(p.location, '') ILIKE '%' || $1 || '%')
+			SELECT COUNT(*) AS filled FROM plan_members pm
+			WHERE pm.plan_run_id = cr.id AND pm.status = 'accepted'
+		) cm ON true
+		WHERE cr.looking_for_crew AND cr.run_date >= $5::date AND cr.deleted_at IS NULL
+		  AND ($1 = '' OR COALESCE(ur.name, '') ILIKE '%' || $1 || '%' OR COALESCE(cr.meetup_spot, '') ILIKE '%' || $1 || '%')
 		  AND ($2::float8 IS NULL OR ur.class_max >= $2)
 		  AND ($3::float8 IS NULL OR ur.class_min <= $3)
-		  AND ($4 = '' OR COALESCE(p.location, '') ILIKE '%' || $4 || '%')
-		ORDER BY p.start_date::text ASC
+		  AND ($4 = '' OR COALESCE(cr.meetup_spot, '') ILIKE '%' || $4 || '%')
+		ORDER BY cr.run_date, cr.run_time NULLS LAST
 		LIMIT $6 OFFSET $7
-	`
-	rows, err := h.db.Query(ctx, planQuery, q, minClass, maxClass, location, todayStr, limit+1, offset)
+	`, q, minClass, maxClass, location, todayStr, limit+1, offset)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
 		return
 	}
+	defer rows.Close()
 
-	items := make([]discoverPlan, 0)
-	order := make([]string, 0)
+	items := make([]discoverCrewRun, 0)
 	for rows.Next() {
-		var dp discoverPlan
+		var dr discoverCrewRun
 		if err := rows.Scan(
-			&dp.ID, &dp.Slug, &dp.Name, &dp.Type, &dp.HostHandle,
-			&dp.Location, &dp.StartDate, &dp.EndDate, &dp.RunCount,
+			&dr.RunID, &dr.Name, &dr.HostHandle, &dr.RunDate, &dr.RunTime,
+			&dr.ClassMin, &dr.ClassMax, &dr.FlowBand, &dr.FlowColor, &dr.GaugeCFS,
+			&dr.MeetupSpot, &dr.Crew.Max, &dr.Crew.Filled,
 		); err != nil {
 			continue
 		}
-		dp.RunsLookingForCrew = []discoverPlanRun{}
-		items = append(items, dp)
-		order = append(order, dp.ID)
+		items = append(items, dr)
 	}
-	rows.Close()
 
 	hasMore := len(items) > limit
 	if hasMore {
 		items = items[:limit]
-		order = order[:limit]
-	}
-
-	// Step 2: load the qualifying runs_looking_for_crew[] for exactly the
-	// matched plans (same looking_for_crew/future/class filters, so the
-	// displayed list matches what gated the plan's inclusion above).
-	if len(order) > 0 {
-		byPlan := make(map[string]*discoverPlan, len(items))
-		for i := range items {
-			byPlan[items[i].ID] = &items[i]
-		}
-
-		runRows, rerr := h.db.Query(ctx, `
-			SELECT pr.plan_id::text, pr.id::text, COALESCE(ur.name, 'Paddle'), pr.run_date::text, pr.run_time::text,
-			       ur.class_min, ur.class_max, pr.flow_band, pr.flow_color, pr.gauge_cfs,
-			       pr.max_crew, COALESCE(cm.filled, 0), pr.meetup_spot
-			FROM plan_runs pr
-			LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
-			LEFT JOIN LATERAL (
-				SELECT COUNT(*) AS filled FROM plan_members pm
-				WHERE pm.plan_run_id = pr.id AND pm.status = 'accepted'
-			) cm ON true
-			WHERE pr.plan_id = ANY($1::uuid[]) AND pr.deleted_at IS NULL
-			  AND pr.looking_for_crew AND pr.run_date >= $2::date
-			  AND ($3::float8 IS NULL OR ur.class_max >= $3)
-			  AND ($4::float8 IS NULL OR ur.class_min <= $4)
-			ORDER BY pr.plan_id, pr.run_date
-		`, order, todayStr, minClass, maxClass)
-		if rerr == nil {
-			defer runRows.Close()
-			for runRows.Next() {
-				var planID string
-				var dr discoverPlanRun
-				if serr := runRows.Scan(
-					&planID, &dr.PlanRunID, &dr.Name, &dr.RunDate, &dr.RunTime,
-					&dr.ClassMin, &dr.ClassMax, &dr.FlowBand, &dr.FlowColor, &dr.GaugeCFS,
-					&dr.Crew.Max, &dr.Crew.Filled, &dr.MeetupSpot,
-				); serr != nil {
-					continue
-				}
-				if dp, ok := byPlan[planID]; ok {
-					dp.RunsLookingForCrew = append(dp.RunsLookingForCrew, dr)
-				}
-			}
-		}
 	}
 
 	jsonResponse(w, http.StatusOK, map[string]any{

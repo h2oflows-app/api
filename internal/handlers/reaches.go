@@ -1014,14 +1014,14 @@ func (h *ReachHandler) Stats(w http.ResponseWriter, r *http.Request) {
 	// runs-unify 5a: count sentinel-owned twins in user_reaches (the curated runs).
 	h.db.QueryRow(r.Context(), `SELECT COUNT(*) FROM user_reaches WHERE owner_id = '00000000-0000-0000-0000-000000000001' AND deleted_at IS NULL`).Scan(&reaches)
 	h.db.QueryRow(r.Context(), `SELECT COUNT(*) FROM rivers`).Scan(&rivers)
-	// #246 A6 repoint (PART 2 item 4): plan_runs is the superset of `reports`
-	// post-000143 backfill — count live rows with a live parent plan, same
-	// tombstone + live-parent join discipline every other plan_runs read in
-	// this codebase follows.
+	// #246 A6 repoint (PART 2 item 4): calendar_runs (was plan_runs) is the
+	// superset of `reports` post-000143 backfill — count live rows. web#354
+	// A1 dropped calendar_runs.plan_id (decoupled from events) entirely, so
+	// the old "live parent plan" join is gone too — deleted_at IS NULL alone
+	// now determines liveness.
 	h.db.QueryRow(r.Context(), `
-		SELECT COUNT(*) FROM plan_runs pr
-		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
-		WHERE pr.deleted_at IS NULL
+		SELECT COUNT(*) FROM calendar_runs cr
+		WHERE cr.deleted_at IS NULL
 	`).Scan(&reports)
 	h.sc.set(reaches, rivers, reports)
 	jsonResponse(w, http.StatusOK, buildStatsResponse(reaches, rivers, reports))

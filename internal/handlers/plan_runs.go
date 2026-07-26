@@ -2,8 +2,9 @@ package handlers
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,7 +14,6 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
 	"github.com/h2oflow/h2oflow/apps/api/internal/flow"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -23,9 +23,9 @@ import (
 const maxMeetupSpotLen = 200
 
 // meetupFeatureBody is the optional "pick one of this run's own features"
-// half of Meet-up-at (product request 2026-07-25): a rapid or an access
-// point (#312) belonging to the SAME user_reach as the plan_run. Type
-// discriminates which table ID resolves against.
+// half of Meet-up-at: a rapid or an access point (#312) belonging to the
+// SAME user_reach as the calendar_run. Type discriminates which table ID
+// resolves against.
 type meetupFeatureBody struct {
 	Type string `json:"type"` // "rapid" | "access"
 	ID   string `json:"id"`
@@ -136,12 +136,10 @@ func meetupFeatureTypeID(rapidID, accessID *string) (featureType, featureID *str
 	}
 }
 
-// createPlanRunBody is the shared request shape for a calendar run, used
-// both by POST /plans (embedded `runs`) and POST /plans/{id}/runs.
-// LookingForCrew/MaxCrew are per-run (#246 A7 — crew moved off plans onto
-// plan_runs, product decision IMPLEMENTATION_PLAN.md §6 REVISED 2026-07-25).
-// MeetupSpot/MeetupFeature are "meet up at" (product request 2026-07-25;
-// see resolveMeetupFeature/validateMeetupSpot above).
+// createPlanRunBody is the request shape for a standalone calendar run
+// (POST /plan-runs, web#354 A1 — runs are no longer created inline under an
+// event; the old "add a run to this plan" endpoint is removed).
+// LookingForCrew/MaxCrew/MeetupSpot/MeetupFeature are per-run (unchanged).
 type createPlanRunBody struct {
 	UserReachID    *string            `json:"user_reach_id"`
 	ReachSlug      *string            `json:"reach_slug"`
@@ -156,9 +154,8 @@ type createPlanRunBody struct {
 	MeetupFeature  *meetupFeatureBody `json:"meetup_feature"`
 }
 
-// validateCrewFields enforces the same "looking_for_crew requires a positive
-// max_crew" rule that used to live on plans.Create/Update (#246 A4), now
-// applied per plan_run.
+// validateCrewFields enforces "looking_for_crew requires a positive
+// max_crew".
 func validateCrewFields(lookingForCrew *bool, maxCrew *int) error {
 	if lookingForCrew != nil && *lookingForCrew && (maxCrew == nil || *maxCrew <= 0) {
 		return fmt.Errorf("max_crew is required (and must be > 0) when looking_for_crew is true")
@@ -167,20 +164,20 @@ func validateCrewFields(lookingForCrew *bool, maxCrew *int) error {
 }
 
 // insertPlanRun resolves the river run (user_reach_id or reach_slug),
-// flow-stamps it, and inserts one plan_runs row via q — a pool or a tx, so
-// this is shared verbatim by POST /plans' single-tx create-with-runs and the
-// standalone POST /plans/{id}/runs. Returns an *apiError for anything that
-// should surface as non-500 (400/404/422).
+// flow-stamps it, and inserts one standalone calendar_runs row via q — a
+// pool or a tx. Returns an *apiError for anything that should surface as
+// non-500 (400/404/422).
+//
+// web#354 A1: runs are decoupled from events entirely (no plan_id column,
+// no parent date-range to validate against) — this used to take
+// planID/planStart/planEnd and call validateRunDateInRange; both are gone.
 func (h *PlanHandler) insertPlanRun(
 	ctx context.Context, q dbQueryer,
-	planID, hostOwnerID, planStart, planEnd string,
+	hostOwnerID string,
 	body createPlanRunBody,
 ) (id, slug string, err error) {
 	if body.RunDate == "" {
 		return "", "", &apiError{http.StatusBadRequest, "run_date is required"}
-	}
-	if verr := validateRunDateInRange(body.RunDate, planStart, planEnd); verr != nil {
-		return "", "", &apiError{http.StatusBadRequest, verr.Error()}
 	}
 	if verr := validateCrewFields(body.LookingForCrew, body.MaxCrew); verr != nil {
 		return "", "", &apiError{http.StatusBadRequest, verr.Error()}
@@ -270,15 +267,15 @@ func (h *PlanHandler) insertPlanRun(
 	lookingForCrew := body.LookingForCrew != nil && *body.LookingForCrew
 
 	err = q.QueryRow(ctx, `
-		INSERT INTO plan_runs
-			(plan_id, owner_id, user_reach_id, slug, run_date, run_time,
+		INSERT INTO calendar_runs
+			(owner_id, user_reach_id, slug, run_date, run_time,
 			 gauge_cfs, flow_band, flow_color, gauge_id, stamped_at,
 			 paddled, paddled_at, notes, companions, looking_for_crew, max_crew,
 			 meetup_spot, meetup_rapid_id, meetup_access_id)
-		VALUES ($1,$2,$3::uuid,$4,$5::date,$6,$7,$8,$9,$10::uuid,$11,$12,$13,$14,$15,$16,$17,$18,$19::uuid,$20::uuid)
+		VALUES ($1,$2::uuid,$3,$4::date,$5,$6,$7,$8,$9::uuid,$10,$11,$12,$13,$14,$15,$16,$17,$18::uuid,$19::uuid)
 		RETURNING id
 	`,
-		planID, hostOwnerID, userReachID, slug, body.RunDate, runTimeVal,
+		hostOwnerID, userReachID, slug, body.RunDate, runTimeVal,
 		stamp.CFS, stamp.Band, stamp.Color, stamp.GaugeID, stampedAt,
 		paddled, paddledAt, body.Notes, body.Companions, lookingForCrew, body.MaxCrew,
 		meetupSpot, rapidID, accessID,
@@ -289,10 +286,11 @@ func (h *PlanHandler) insertPlanRun(
 	return id, slug, nil
 }
 
-// ── POST /plans/{id}/runs ─────────────────────────────────────────────────
+// ── POST /plan-runs ───────────────────────────────────────────────────────
+// Standalone run create (web#354 A1 — replaces the removed
+// POST /plans/{id}/runs; runs are no longer children of an event).
 
 func (h *PlanHandler) CreateRun(w http.ResponseWriter, r *http.Request) {
-	planID := chi.URLParam(r, "id")
 	ownerID, ok := h.ownerID(r)
 	if !ok {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
@@ -307,16 +305,7 @@ func (h *PlanHandler) CreateRun(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	var startDate, endDate string
-	if err := h.db.QueryRow(ctx,
-		`SELECT start_date::text, end_date::text FROM plans WHERE id = $1::uuid AND owner_id = $2 AND deleted_at IS NULL`,
-		planID, ownerID,
-	).Scan(&startDate, &endDate); err != nil {
-		errorResponse(w, http.StatusNotFound, "plan not found")
-		return
-	}
-
-	id, slug, err := h.insertPlanRun(ctx, h.db, planID, ownerID, startDate, endDate, body)
+	id, slug, err := h.insertPlanRun(ctx, h.db, ownerID, body)
 	if err != nil {
 		h.respondAPIError(w, err)
 		return
@@ -326,8 +315,9 @@ func (h *PlanHandler) CreateRun(w http.ResponseWriter, r *http.Request) {
 }
 
 // ── GET /plan-runs/{param} ───────────────────────────────────────────────
-// Resolution order (binding): (1) id, (2) source_report_id (preserves old
-// /reports/{uuid} links), (3) slug — only if globally unique across owners.
+// Resolution order (binding, permalink-critical — unchanged by web#354):
+// (1) id, (2) source_report_id (preserves old /reports/{uuid} links),
+// (3) slug — only if globally unique across owners.
 
 func (h *PlanHandler) GetRun(w http.ResponseWriter, r *http.Request) {
 	param := chi.URLParam(r, "param")
@@ -335,17 +325,17 @@ func (h *PlanHandler) GetRun(w http.ResponseWriter, r *http.Request) {
 
 	var runID string
 	if err := h.db.QueryRow(ctx,
-		`SELECT id FROM plan_runs WHERE id = $1::uuid AND deleted_at IS NULL`, param,
+		`SELECT id FROM calendar_runs WHERE id = $1::uuid AND deleted_at IS NULL`, param,
 	).Scan(&runID); err != nil {
 		if err2 := h.db.QueryRow(ctx,
-			`SELECT id FROM plan_runs WHERE source_report_id = $1::uuid AND deleted_at IS NULL`, param,
+			`SELECT id FROM calendar_runs WHERE source_report_id = $1::uuid AND deleted_at IS NULL`, param,
 		).Scan(&runID); err2 != nil {
 			if err3 := h.db.QueryRow(ctx, `
-				SELECT id FROM plan_runs
+				SELECT id FROM calendar_runs
 				WHERE slug = $1 AND deleted_at IS NULL
-				  AND (SELECT COUNT(*) FROM plan_runs WHERE slug = $1 AND deleted_at IS NULL) = 1
+				  AND (SELECT COUNT(*) FROM calendar_runs WHERE slug = $1 AND deleted_at IS NULL) = 1
 			`, param).Scan(&runID); err3 != nil {
-				errorResponse(w, http.StatusNotFound, "plan run not found")
+				errorResponse(w, http.StatusNotFound, "run not found")
 				return
 			}
 		}
@@ -354,59 +344,64 @@ func (h *PlanHandler) GetRun(w http.ResponseWriter, r *http.Request) {
 	h.renderPlanRun(w, r, runID)
 }
 
+// runInviteTokenGrant reports whether the raw ?invite= token (hashed) grants
+// access to THIS specific run — web#354 A1: the token carve-out moves from
+// the event page to the run page, and now grants exactly the one run it's
+// checked against, not a whole event's fan-out. Still reads plan_members
+// (unchanged in A1); re-keyed to plan_run_id instead of plan_id.
+func runInviteTokenGrant(ctx context.Context, db *pgxpool.Pool, runID, token string) bool {
+	if token == "" || runID == "" {
+		return false
+	}
+	sum := sha256.Sum256([]byte(token))
+	hash := hex.EncodeToString(sum[:])
+	var exists bool
+	_ = db.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM plan_members WHERE plan_run_id = $1::uuid AND invite_token_hash = $2)
+	`, runID, hash).Scan(&exists)
+	return exists
+}
+
 func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runID string) {
 	ctx := r.Context()
 
-	// #246 A6 anon scoping (IMPLEMENTATION_PLAN.md §6 REVISED, PART 3 item
-	// 2 — binding): unlike the plan detail page (renderPlan), a plan_run
-	// item has no invite-token carve-out — the calendar domain is auth-only
-	// here, full stop.
 	callerID, callerOK := h.ownerID(r)
-	if !callerOK {
-		errorResponse(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
 
 	var run planRunSummary
 	var runTime *string
 	var paddledAtRaw *time.Time
 	var createdAtRaw time.Time
-	var planID, planSlug, planName, hostOwnerID, hostHandle, visibility string
-	var planStart, planEnd string
+	var hostOwnerID string
 	var meetupRapidID, meetupAccessID *string
 	var userReachOwnerID, userReachOwnerHandle *string
 
 	err := h.db.QueryRow(ctx, `
-		SELECT pr.id, pr.slug, pr.user_reach_id::text, ur.name, pr.run_date::text, pr.run_time::text,
-		       pr.sort_order, pr.gauge_cfs, pr.flow_band, pr.flow_color, pr.paddled, pr.paddled_at,
-		       pr.notes, pr.companions, pr.created_at,
-		       pr.looking_for_crew, pr.max_crew, COALESCE(cm.filled, 0),
-		       pr.meetup_spot, pr.meetup_rapid_id::text, pr.meetup_access_id::text,
-		       p.id, p.slug, p.name, p.owner_id, COALESCE(up.handle, ''), p.visibility::text,
-		       p.start_date::text, p.end_date::text,
+		SELECT cr.id, cr.slug, cr.user_reach_id::text, ur.name, cr.run_date::text, cr.run_time::text,
+		       cr.sort_order, cr.gauge_cfs, cr.flow_band, cr.flow_color, cr.paddled, cr.paddled_at,
+		       cr.notes, cr.companions, cr.created_at,
+		       cr.looking_for_crew, cr.max_crew, COALESCE(cm.filled, 0),
+		       cr.meetup_spot, cr.meetup_rapid_id::text, cr.meetup_access_id::text,
+		       cr.owner_id,
 		       ur.slug, ur.owner_id::text, urp.handle
-		FROM plan_runs pr
-		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
-		LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
-		LEFT JOIN user_profiles up ON up.owner_id = p.owner_id
+		FROM calendar_runs cr
+		LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
 		LEFT JOIN user_profiles urp ON urp.owner_id = ur.owner_id
 		LEFT JOIN LATERAL (
 			SELECT COUNT(*) AS filled FROM plan_members pm
-			WHERE pm.plan_run_id = pr.id AND pm.status = 'accepted'
+			WHERE pm.plan_run_id = cr.id AND pm.status = 'accepted'
 		) cm ON true
-		WHERE pr.id = $1 AND pr.deleted_at IS NULL
+		WHERE cr.id = $1 AND cr.deleted_at IS NULL
 	`, runID).Scan(
 		&run.ID, &run.Slug, &run.UserReachID, &run.Name, &run.RunDate, &runTime,
 		&run.SortOrder, &run.GaugeCFS, &run.FlowBand, &run.FlowColor, &run.Paddled, &paddledAtRaw,
 		&run.Notes, &run.Companions, &createdAtRaw,
 		&run.Crew.LookingForCrew, &run.Crew.Max, &run.Crew.Filled,
 		&run.MeetupSpot, &meetupRapidID, &meetupAccessID,
-		&planID, &planSlug, &planName, &hostOwnerID, &hostHandle, &visibility,
-		&planStart, &planEnd,
+		&hostOwnerID,
 		&run.UserReachSlug, &userReachOwnerID, &userReachOwnerHandle,
 	)
 	if err != nil {
-		errorResponse(w, http.StatusNotFound, "plan run not found")
+		errorResponse(w, http.StatusNotFound, "run not found")
 		return
 	}
 	run.RunTime = runTime
@@ -424,32 +419,43 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 		run.UserReachOwnerHandle = userReachOwnerHandle
 	}
 
-	if visibility != "public" {
-		allowed := callerID == hostOwnerID
+	// web#354 A1 visibility gate (§1, binding), replacing the old
+	// "parent event public/private" check: owner, OR paddled=true (any
+	// authenticated user — "only trips that have logs may be seen by other
+	// h2oflows users"), OR invited/crew (a plan_members row for THIS run,
+	// unchanged in A1), OR looking_for_crew AND run_date >= the caller's
+	// local today, OR a valid ?invite= token scoped to this run (the sole
+	// anon carve-out — moved here from the event page). Anon without a
+	// grant gets 401 (never an existence oracle); authed without a grant
+	// gets 404.
+	tokenGrant := runInviteTokenGrant(ctx, h.db, run.ID, r.URL.Query().Get("invite"))
+	if !callerOK && !tokenGrant {
+		errorResponse(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	allowed := tokenGrant || run.Paddled || (callerOK && callerID == hostOwnerID)
+	if !allowed && callerOK {
+		if run.Crew.LookingForCrew {
+			if today, terr := userToday(ctx, h.db, callerID); terr == nil {
+				allowed = run.RunDate >= today.Format("2006-01-02")
+			}
+		}
 		if !allowed {
 			h.db.QueryRow(ctx, `
 				SELECT EXISTS(SELECT 1 FROM plan_members
-					WHERE plan_id = $1 AND member_owner_id = $2 AND status IN ('invited','accepted'))
-			`, planID, callerID).Scan(&allowed)
-		}
-		if !allowed {
-			errorResponse(w, http.StatusNotFound, "plan run not found")
-			return
+					WHERE plan_run_id = $1 AND member_owner_id = $2 AND status IN ('invited','accepted'))
+			`, run.ID, callerID).Scan(&allowed)
 		}
 	}
+	if !allowed {
+		errorResponse(w, http.StatusNotFound, "run not found")
+		return
+	}
 
-	jsonResponse(w, http.StatusOK, map[string]any{
-		"run": run,
-		"plan": map[string]any{
-			"id":          planID,
-			"slug":        planSlug,
-			"name":        planName,
-			"host_handle": hostHandle,
-			"visibility":  visibility,
-			"start_date":  planStart,
-			"end_date":    planEnd,
-		},
-	})
+	// web#354 A1: drop the `plan` wrapper — the run is standalone now, its
+	// fields stay flat under `run`.
+	jsonResponse(w, http.StatusOK, map[string]any{"run": run})
 }
 
 // ── PATCH /plan-runs/{id} ────────────────────────────────────────────────
@@ -516,21 +522,20 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	var planID, curUserReachID, curRunDate, planStart, planEnd string
+	var curUserReachID, curRunDate string
 	var curPaddled, curLookingForCrew bool
 	var curPaddledAt *time.Time
 	var curMaxCrew *int
 	err := h.db.QueryRow(ctx, `
-		SELECT pr.plan_id, COALESCE(pr.user_reach_id::text, ''), pr.run_date::text,
-		       pr.paddled, pr.paddled_at, p.start_date::text, p.end_date::text,
-		       pr.looking_for_crew, pr.max_crew
-		FROM plan_runs pr
-		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
-		WHERE pr.id = $1 AND pr.owner_id = $2 AND pr.deleted_at IS NULL
-	`, runID, ownerID).Scan(&planID, &curUserReachID, &curRunDate, &curPaddled, &curPaddledAt, &planStart, &planEnd,
+		SELECT COALESCE(cr.user_reach_id::text, ''), cr.run_date::text,
+		       cr.paddled, cr.paddled_at,
+		       cr.looking_for_crew, cr.max_crew
+		FROM calendar_runs cr
+		WHERE cr.id = $1 AND cr.owner_id = $2 AND cr.deleted_at IS NULL
+	`, runID, ownerID).Scan(&curUserReachID, &curRunDate, &curPaddled, &curPaddledAt,
 		&curLookingForCrew, &curMaxCrew)
 	if err != nil {
-		errorResponse(w, http.StatusNotFound, "plan run not found")
+		errorResponse(w, http.StatusNotFound, "run not found")
 		return
 	}
 
@@ -541,7 +546,7 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 			body.SortOrder != nil || body.Paddled != nil ||
 			body.LookingForCrew != nil || body.MaxCrew != nil ||
 			body.MeetupSpot != nil || body.MeetupFeature != nil || meetupFeatureKeyPresent {
-			errorResponse(w, http.StatusBadRequest, "plan run is locked after paddling — only notes can be edited")
+			errorResponse(w, http.StatusBadRequest, "run is locked after paddling — only notes can be edited")
 			return
 		}
 		if body.Notes == nil {
@@ -549,11 +554,11 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if curPaddledAt == nil || time.Since(*curPaddledAt) > 24*time.Hour {
-			errorResponse(w, http.StatusForbidden, "plan runs are locked for editing 24 hours after being marked paddled")
+			errorResponse(w, http.StatusForbidden, "runs are locked for editing 24 hours after being marked paddled")
 			return
 		}
 		if _, err := h.db.Exec(ctx,
-			`UPDATE plan_runs SET notes = $1, updated_at = NOW() WHERE id = $2 AND owner_id = $3`,
+			`UPDATE calendar_runs SET notes = $1, updated_at = NOW() WHERE id = $2 AND owner_id = $3`,
 			body.Notes, runID, ownerID,
 		); err != nil {
 			errorResponse(w, http.StatusInternalServerError, "update failed")
@@ -564,14 +569,11 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Planned (unpaddled): run_date/run_time/notes/companions/sort_order are
-	// freely editable. paddled:true is the mark-paddled transition.
+	// freely editable. paddled:true is the mark-paddled transition. No
+	// parent event date-range to validate against (decoupled, web#354 A1).
 	newRunDate := curRunDate
 	if body.RunDate != nil {
 		newRunDate = *body.RunDate
-		if verr := validateRunDateInRange(newRunDate, planStart, planEnd); verr != nil {
-			errorResponse(w, http.StatusBadRequest, verr.Error())
-			return
-		}
 	}
 
 	newLookingForCrew := curLookingForCrew
@@ -659,11 +661,11 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 		stamp = flow.StampFull(ctx, h.db, curUserReachID, flow.ObservedAt(newRunDate, runTimeStr))
 	}
 
-	// #246 A4 carry-over fix: StampFull returning no reading (nil CFS — no
-	// gauge/no data at the target time) must never blank out a previously
-	// stamped snapshot. restampFlow (not the bare restamp intent) gates the
-	// flow columns, so a re-stamp attempt that finds nothing simply keeps
-	// whatever was already on the row.
+	// StampFull returning no reading (nil CFS — no gauge/no data at the
+	// target time) must never blank out a previously stamped snapshot.
+	// restampFlow (not the bare restamp intent) gates the flow columns, so a
+	// re-stamp attempt that finds nothing simply keeps whatever was already
+	// on the row.
 	restampFlow := restamp && stamp.CFS != nil
 
 	var stampedAt *time.Time
@@ -673,7 +675,7 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_, err = h.db.Exec(ctx, `
-		UPDATE plan_runs SET
+		UPDATE calendar_runs SET
 			run_date         = COALESCE($1::date, run_date),
 			run_time         = COALESCE($2, run_time),
 			notes            = COALESCE($3, notes),
@@ -720,29 +722,27 @@ func (h *PlanHandler) DeleteRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// web#354 A1: no parent-event guard anymore (decoupled) — tombstone by
+	// owner_id alone.
 	tag, err := h.db.Exec(r.Context(), `
-		UPDATE plan_runs SET deleted_at = NOW(), updated_at = NOW()
+		UPDATE calendar_runs SET deleted_at = NOW(), updated_at = NOW()
 		WHERE id = $1 AND owner_id = $2 AND deleted_at IS NULL
-		  AND EXISTS (SELECT 1 FROM plans p WHERE p.id = plan_runs.plan_id AND p.deleted_at IS NULL)
 	`, runID, ownerID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "delete failed")
 		return
 	}
 	if tag.RowsAffected() == 0 {
-		errorResponse(w, http.StatusNotFound, "plan run not found")
+		errorResponse(w, http.StatusNotFound, "run not found")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
 // ── POST /plan-runs/{id}/log-mine ────────────────────────────────────────
-// Invite-accept hybrid (contract decision #1, §6): the caller — the host or
-// an accepted crew member of the parent plan — gets their own paddled log
-// of this same river run without touching the host's plan: "your logged
-// flows stay yours." Reuses (or creates) a 1-run Personal plan for that
-// date, matching the A6 backfill's per-day natural key + 'log-{date}' slug
-// convention (contract §1/§3 "one plans row per (owner_id, report_date)").
+// The caller — the host or an accepted crew member (plan_members, unchanged
+// in A1) — gets their own paddled log of this same river run without
+// touching the host's run: "your logged flows stay yours."
 
 func (h *PlanHandler) LogMine(w http.ResponseWriter, r *http.Request) {
 	sourceRunID := chi.URLParam(r, "id")
@@ -753,16 +753,15 @@ func (h *PlanHandler) LogMine(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 
-	var planID, hostOwnerID, userReachID, runDate, reachSlug string
+	var hostOwnerID, userReachID, runDate, reachSlug string
 	err := h.db.QueryRow(ctx, `
-		SELECT pr.plan_id, p.owner_id, COALESCE(pr.user_reach_id::text, ''), pr.run_date::text, COALESCE(ur.slug, '')
-		FROM plan_runs pr
-		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
-		LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
-		WHERE pr.id = $1::uuid AND pr.deleted_at IS NULL
-	`, sourceRunID).Scan(&planID, &hostOwnerID, &userReachID, &runDate, &reachSlug)
+		SELECT cr.owner_id, COALESCE(cr.user_reach_id::text, ''), cr.run_date::text, COALESCE(ur.slug, '')
+		FROM calendar_runs cr
+		LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
+		WHERE cr.id = $1::uuid AND cr.deleted_at IS NULL
+	`, sourceRunID).Scan(&hostOwnerID, &userReachID, &runDate, &reachSlug)
 	if err != nil {
-		errorResponse(w, http.StatusNotFound, "plan run not found")
+		errorResponse(w, http.StatusNotFound, "run not found")
 		return
 	}
 	if userReachID == "" {
@@ -773,8 +772,8 @@ func (h *PlanHandler) LogMine(w http.ResponseWriter, r *http.Request) {
 	allowed := ownerID == hostOwnerID
 	if !allowed {
 		h.db.QueryRow(ctx,
-			`SELECT EXISTS(SELECT 1 FROM plan_members WHERE plan_id = $1::uuid AND member_owner_id = $2 AND status = 'accepted')`,
-			planID, ownerID,
+			`SELECT EXISTS(SELECT 1 FROM plan_members WHERE plan_run_id = $1::uuid AND member_owner_id = $2 AND status = 'accepted')`,
+			sourceRunID, ownerID,
 		).Scan(&allowed)
 	}
 	if !allowed {
@@ -797,7 +796,7 @@ func (h *PlanHandler) LogMine(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	myPlanID, myRunID, existed, ferr := findOrCreatePaddledLog(ctx, h.db, ownerID, userReachID, reachSlug, runDate, nil)
+	myRunID, existed, ferr := findOrCreatePaddledLog(ctx, h.db, ownerID, userReachID, reachSlug, runDate, nil)
 	if ferr != nil {
 		errorResponse(w, http.StatusInternalServerError, ferr.Error())
 		return
@@ -806,93 +805,51 @@ func (h *PlanHandler) LogMine(w http.ResponseWriter, r *http.Request) {
 	if existed {
 		status = http.StatusOK
 	}
-	jsonResponse(w, status, map[string]string{"plan_id": myPlanID, "plan_run_id": myRunID})
+	jsonResponse(w, status, map[string]string{"plan_run_id": myRunID})
 }
 
 // findOrCreatePaddledLog is the "log-mine" find-or-create machinery shared
 // by PlanHandler.LogMine (POST /plan-runs/{id}/log-mine — the host or an
-// accepted crew member logging their own paddle of a visible plan_run) and
+// accepted crew member logging their own paddle of a visible run) and
 // NudgeHandler.Confirm (POST /me/nudge/confirm — a user confirming a Tier-A
-// nudge candidate they paddled). Both need the identical "reuse-or-create
-// today's Personal plan, insert a paddled plan_run" transaction, so it's
-// extracted once here rather than duplicated (#246 A5 task 1).
+// nudge candidate they paddled).
 //
-// Idempotent: if the caller already has a live paddled plan_run for this
+// web#354 A1 MAJOR SIMPLIFICATION: no more "log-{date} Personal event"
+// find/create/un-tombstone dance — runs are standalone now, so this just
+// finds-or-creates one paddled calendar_runs row for (owner, user_reach_id,
+// run_date). No event is created or touched, so no tx is needed either (a
+// single INSERT, no multi-table coordination to keep atomic).
+//
+// Idempotent: if the caller already has a live paddled calendar_run for this
 // exact reach+date, returns that existing row instead of creating a
 // duplicate (existed=true — callers use this to pick 200 vs 201).
 func findOrCreatePaddledLog(
 	ctx context.Context, db *pgxpool.Pool,
 	ownerID, userReachID, reachSlug, runDate string, notes *string,
-) (planID, runID string, existed bool, err error) {
-	// Idempotent-ish: caller already logged this reach+date as paddled ->
-	// return the existing row, no dup.
-	var existingPlanID, existingRunID string
+) (runID string, existed bool, err error) {
+	var existingRunID string
 	if qerr := db.QueryRow(ctx, `
-		SELECT pr2.plan_id, pr2.id
-		FROM plan_runs pr2
-		JOIN plans p2 ON p2.id = pr2.plan_id AND p2.deleted_at IS NULL
-		WHERE pr2.owner_id = $1 AND pr2.user_reach_id = $2::uuid AND pr2.run_date = $3::date
-		  AND pr2.paddled AND pr2.deleted_at IS NULL
+		SELECT id FROM calendar_runs
+		WHERE owner_id = $1 AND user_reach_id = $2::uuid AND run_date = $3::date
+		  AND paddled AND deleted_at IS NULL
 		LIMIT 1
-	`, ownerID, userReachID, runDate).Scan(&existingPlanID, &existingRunID); qerr == nil {
-		return existingPlanID, existingRunID, true, nil
+	`, ownerID, userReachID, runDate).Scan(&existingRunID); qerr == nil {
+		return existingRunID, true, nil
 	}
 
-	// plans.owner_id has a hard FK to user_profiles(owner_id) — ensure the
-	// caller's profile exists before the plan INSERT, same as Create.
+	// calendar_runs.owner_id has no hard FK to user_profiles, but ensure the
+	// caller's profile exists anyway (same as every other write path in this
+	// package) so a first-time paddler's handle/share surfaces are ready.
 	email, _ := auth.EmailFromContext(ctx)
 	if _, herr := ensureHandle(ctx, db, ownerID, email); herr != nil {
-		return "", "", false, fmt.Errorf("could not assign user profile: %w", herr)
+		return "", false, fmt.Errorf("could not assign user profile: %w", herr)
 	}
 
-	tx, berr := db.Begin(ctx)
-	if berr != nil {
-		return "", "", false, fmt.Errorf("tx failed: %w", berr)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
-
-	logSlug := "log-" + runDate
-	var myPlanID string
-	var deletedAt *time.Time
-	lookupErr := tx.QueryRow(ctx,
-		`SELECT id, deleted_at FROM plans WHERE owner_id = $1 AND slug = $2`,
-		ownerID, logSlug,
-	).Scan(&myPlanID, &deletedAt)
-	switch {
-	case lookupErr == nil && deletedAt != nil:
-		// #246 A5 carry-over fix (task 6b): UNIQUE(owner_id,slug) on `plans`
-		// is non-partial, so a tombstoned "log-{date}" plan (the user
-		// previously deleted that whole day's log) would collide with a
-		// 23505 unique violation on a bare re-INSERT below. We un-tombstone
-		// rather than slug-suffixing: "log-{date}" is the same natural-key
-		// day-plan every other log-mine/nudge-confirm/backfill caller
-		// expects to find at that slug, and reviving the row also
-		// reattaches any surviving (non-deleted) child plan_runs instead of
-		// orphaning them behind a newly minted "log-{date}-2" plan.
-		if _, uerr := tx.Exec(ctx,
-			`UPDATE plans SET deleted_at = NULL, updated_at = NOW() WHERE id = $1`, myPlanID,
-		); uerr != nil {
-			return "", "", false, fmt.Errorf("un-tombstone personal plan: %w", uerr)
-		}
-	case lookupErr != nil && !errors.Is(lookupErr, pgx.ErrNoRows):
-		return "", "", false, fmt.Errorf("plan lookup failed: %w", lookupErr)
-	case errors.Is(lookupErr, pgx.ErrNoRows):
-		if ierr := tx.QueryRow(ctx, `
-			INSERT INTO plans (owner_id, slug, name, type, visibility, start_date, end_date)
-			VALUES ($1, $2, $3, 'personal', 'public', $4::date, $4::date)
-			RETURNING id
-		`, ownerID, logSlug, "Paddle "+runDate, runDate).Scan(&myPlanID); ierr != nil {
-			return "", "", false, fmt.Errorf("create personal plan failed: %w", ierr)
-		}
-	default:
-		// lookupErr == nil && deletedAt == nil -> live plan already exists, reuse as-is.
-	}
-
-	noon, nerr := localNoonUTC(ctx, tx, ownerID, runDate)
+	noon, nerr := localNoonUTC(ctx, db, ownerID, runDate)
 	if nerr != nil {
-		return "", "", false, fmt.Errorf("could not resolve local time: %w", nerr)
+		return "", false, fmt.Errorf("could not resolve local time: %w", nerr)
 	}
-	stamp := flow.StampFull(ctx, tx, userReachID, noon)
+	stamp := flow.StampFull(ctx, db, userReachID, noon)
 	stampedAt := time.Now().UTC()
 	paddledAt := time.Now().UTC()
 
@@ -900,24 +857,21 @@ func findOrCreatePaddledLog(
 	if slugBase == "" {
 		slugBase = "run"
 	}
-	mySlug := uniqueRunSlug(ctx, tx, ownerID, slugBase+"-"+runDate)
+	mySlug := uniqueRunSlug(ctx, db, ownerID, slugBase+"-"+runDate)
 
 	var myRunID string
-	if ierr := tx.QueryRow(ctx, `
-		INSERT INTO plan_runs
-			(plan_id, owner_id, user_reach_id, slug, run_date,
+	if ierr := db.QueryRow(ctx, `
+		INSERT INTO calendar_runs
+			(owner_id, user_reach_id, slug, run_date,
 			 gauge_cfs, flow_band, flow_color, gauge_id, stamped_at,
 			 paddled, paddled_at, notes)
-		VALUES ($1,$2,$3::uuid,$4,$5::date,$6,$7,$8,$9::uuid,$10,TRUE,$11,$12)
+		VALUES ($1,$2::uuid,$3,$4::date,$5,$6,$7,$8::uuid,$9,TRUE,$10,$11)
 		RETURNING id
-	`, myPlanID, ownerID, userReachID, mySlug, runDate,
+	`, ownerID, userReachID, mySlug, runDate,
 		stamp.CFS, stamp.Band, stamp.Color, stamp.GaugeID, stampedAt, paddledAt, notes,
 	).Scan(&myRunID); ierr != nil {
-		return "", "", false, fmt.Errorf("create logged run failed: %w", ierr)
+		return "", false, fmt.Errorf("create logged run failed: %w", ierr)
 	}
 
-	if cerr := tx.Commit(ctx); cerr != nil {
-		return "", "", false, fmt.Errorf("commit failed: %w", cerr)
-	}
-	return myPlanID, myRunID, false, nil
+	return myRunID, false, nil
 }

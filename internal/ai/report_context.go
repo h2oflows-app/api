@@ -23,30 +23,33 @@ type reportForContext struct {
 // loadReachReports fetches all reports for a reach, capped at 24 months back
 // and a maximum of 500 rows, most recent first.
 //
-// #246 A6 repoint (IMPLEMENTATION_PLAN.md §3 PART 2 item 2): reads plan_runs
-// (superset of `reports` post-000143 backfill) instead — paddled + public
-// only ("keeps the ask-AI corpus live" per the plan; the anon-scoping REVISED
-// block flags that this still lets a public paddled plan_run's notes surface
-// via the AI corpus even though the calendar domain itself is now auth-only —
-// accepted for now, "same text was always public as reports", revisit if it
-// stings). `name` has no plan_runs equivalent (the free-text author-name
-// snapshot was dropped in the new schema) — reuses the resolved handle, same
-// as buildReportsBlock's own `author` fallback-to-name logic below.
+// #246 A6 repoint (IMPLEMENTATION_PLAN.md §3 PART 2 item 2): reads
+// calendar_runs (was plan_runs, superset of `reports` post-000143 backfill)
+// instead — paddled only ("keeps the ask-AI corpus live" per the plan; the
+// anon-scoping REVISED block flags that this still lets a paddled run's
+// notes surface via the AI corpus even though the calendar domain itself is
+// auth-only — accepted for now, "same text was always public as reports",
+// revisit if it stings). web#354 A1: the old "JOIN plans WHERE
+// plans.visibility='public'" gate is gone along with the visibility concept
+// (and calendar_runs.plan_id) entirely — paddled alone gates now, same as
+// every other paddled-run reader post-A1. `name` has no calendar_runs
+// equivalent (the free-text author-name snapshot was dropped in the new
+// schema) — reuses the resolved handle, same as buildReportsBlock's own
+// `author` fallback-to-name logic below.
 func loadReachReports(ctx context.Context, db *pgxpool.Pool, reachID string) ([]reportForContext, error) {
 	rows, err := db.Query(ctx, `
 		SELECT
-			pr.id, pr.slug,
+			cr.id, cr.slug,
 			COALESCE(up.handle, '') AS handle,
 			COALESCE(up.handle, '') AS name,
-			pr.run_date::TEXT,
-			COALESCE(pr.notes, ''),
-			pr.paddled, pr.gauge_cfs, pr.flow_band
-		FROM plan_runs pr
-		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL AND p.visibility = 'public'
-		LEFT JOIN user_profiles up ON up.owner_id = pr.owner_id
-		WHERE pr.user_reach_id = $1 AND pr.paddled AND pr.deleted_at IS NULL
-		  AND pr.run_date >= CURRENT_DATE - INTERVAL '24 months'
-		ORDER BY pr.run_date DESC, pr.created_at DESC
+			cr.run_date::TEXT,
+			COALESCE(cr.notes, ''),
+			cr.paddled, cr.gauge_cfs, cr.flow_band
+		FROM calendar_runs cr
+		LEFT JOIN user_profiles up ON up.owner_id = cr.owner_id
+		WHERE cr.user_reach_id = $1 AND cr.paddled AND cr.deleted_at IS NULL
+		  AND cr.run_date >= CURRENT_DATE - INTERVAL '24 months'
+		ORDER BY cr.run_date DESC, cr.created_at DESC
 		LIMIT 500
 	`, reachID)
 	if err != nil {

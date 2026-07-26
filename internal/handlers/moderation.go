@@ -161,23 +161,24 @@ func (h *ModerationHandler) FlagPlanRun(w http.ResponseWriter, r *http.Request) 
 
 	ctx := r.Context()
 
-	// Gate on plan visibility (not just parent deleted_at) so a private plan's
-	// plan_run UUID isn't an existence oracle for non-members: 404 unless the
-	// plan is public, or the reporter is the host or an accepted/invited
-	// member — mirrors renderPlan's visibility check (plans.go) and FlagRun's
-	// public gate above.
+	// web#354 A1: the old "parent plan visibility=public" gate is gone along
+	// with the visibility concept entirely (calendar_runs has no plan_id to
+	// join on either) — mirror renderPlanRun's new gate instead: 404 unless
+	// the run is paddled (any authed user may see/flag a logged run), the
+	// reporter is the run's own owner, or an accepted/invited crew member
+	// (plan_members, unchanged in A1, keyed by plan_run_id) — same
+	// no-existence-oracle shape as FlagRun's public gate above.
 	var exists bool
 	if err := h.db.QueryRow(ctx, `
 		SELECT EXISTS(
-			SELECT 1 FROM plan_runs pr
-			JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
-			WHERE pr.id = $1 AND pr.deleted_at IS NULL
+			SELECT 1 FROM calendar_runs cr
+			WHERE cr.id = $1 AND cr.deleted_at IS NULL
 			  AND (
-			    p.visibility = 'public'
-			    OR p.owner_id = $2
+			    cr.paddled
+			    OR cr.owner_id = $2
 			    OR EXISTS(
 			      SELECT 1 FROM plan_members pm
-			      WHERE pm.plan_id = p.id AND pm.member_owner_id = $2
+			      WHERE pm.plan_run_id = cr.id AND pm.member_owner_id = $2
 			        AND pm.status IN ('invited','accepted')
 			    )
 			  )
@@ -223,9 +224,9 @@ func (h *ModerationHandler) Queue(w http.ResponseWriter, r *http.Request) {
 				WHEN af.target_type = 'report'
 					THEN (SELECT rp.name FROM reports rp WHERE rp.id = af.target_id)
 				WHEN af.target_type = 'plan_run'
-					THEN (SELECT p.name || ' — ' || pr.run_date::text
-					      FROM plan_runs pr JOIN plans p ON p.id = pr.plan_id
-					      WHERE pr.id = af.target_id)
+					THEN (SELECT COALESCE(ur.name, 'Paddle') || ' — ' || cr.run_date::text
+					      FROM calendar_runs cr LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
+					      WHERE cr.id = af.target_id)
 			END AS target_name,
 			CASE
 				WHEN af.target_type = 'run'
@@ -233,7 +234,7 @@ func (h *ModerationHandler) Queue(w http.ResponseWriter, r *http.Request) {
 				WHEN af.target_type = 'report'
 					THEN (SELECT rp.slug FROM reports rp WHERE rp.id = af.target_id)
 				WHEN af.target_type = 'plan_run'
-					THEN (SELECT pr.slug FROM plan_runs pr WHERE pr.id = af.target_id)
+					THEN (SELECT cr.slug FROM calendar_runs cr WHERE cr.id = af.target_id)
 			END AS target_slug
 		FROM abuse_flags af
 		LEFT JOIN user_profiles up ON up.owner_id = af.reporter_id
@@ -335,7 +336,7 @@ func (h *ModerationHandler) Action(w http.ResponseWriter, r *http.Request) {
 			`UPDATE reports SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL`, targetID)
 	case "plan_run":
 		_, deleteErr = h.db.Exec(ctx,
-			`UPDATE plan_runs SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL`, targetID)
+			`UPDATE calendar_runs SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL`, targetID)
 	default:
 		errorResponse(w, http.StatusBadRequest, "unknown target type")
 		return

@@ -6,10 +6,17 @@ import (
 )
 
 // ── GET /me/calendar?from=&to=&tz= ────────────────────────────────────────
-// One range query -> {days, plans, nudge_dot_dates}. Upserts tz when given
+// One range query -> {days, events, nudge_dot_dates}. Upserts tz when given
 // (contract "Timezone rule": client sends Intl.DateTimeFormat().resolvedOptions().timeZone
-// on every call). needs_confirm/nudge_dot_dates are hardcoded empty — A5 fills
-// them; the fields stay in the shape so the web contract is stable.
+// on every call).
+//
+// web#354 A1: days[].runs come straight from calendar_runs by owner+range —
+// no JOIN, no plan_id (runs are decoupled from events). events[] (renamed
+// from plans[]) is the owner's OWN events overlapping the range only — the
+// old member/role/visibility UNION ALL branch is gone (events are owner-only
+// now; the "crew-run inclusion" enhancement — accepted-crew runs surfaced
+// with a role flag — is deferred to A2, since crew join reads plan_members
+// but full run_invites-driven crew semantics land there).
 
 func (h *PlanHandler) Calendar(w http.ResponseWriter, r *http.Request) {
 	ownerID, ok := h.ownerID(r)
@@ -63,7 +70,6 @@ func (h *PlanHandler) Calendar(w http.ResponseWriter, r *http.Request) {
 		GaugeCFS    *float64 `json:"gauge_cfs,omitempty"`
 		Paddled     bool     `json:"paddled"`
 		RunTime     *string  `json:"run_time,omitempty"`
-		PlanID      string   `json:"plan_id"`
 	}
 	type calDay struct {
 		Date         string   `json:"date"`
@@ -72,14 +78,13 @@ func (h *PlanHandler) Calendar(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := h.db.Query(ctx, `
-		SELECT pr.id, pr.user_reach_id::text, ur.name, pr.run_date::text,
-		       pr.flow_band, pr.flow_color, pr.gauge_cfs, pr.paddled, pr.run_time::text, pr.plan_id::text
-		FROM plan_runs pr
-		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
-		LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
-		WHERE pr.owner_id = $1 AND pr.deleted_at IS NULL
-		  AND pr.run_date BETWEEN $2::date AND $3::date
-		ORDER BY pr.run_date, pr.sort_order
+		SELECT cr.id, cr.user_reach_id::text, ur.name, cr.run_date::text,
+		       cr.flow_band, cr.flow_color, cr.gauge_cfs, cr.paddled, cr.run_time::text
+		FROM calendar_runs cr
+		LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
+		WHERE cr.owner_id = $1 AND cr.deleted_at IS NULL
+		  AND cr.run_date BETWEEN $2::date AND $3::date
+		ORDER BY cr.run_date, cr.sort_order
 	`, ownerID, from, to)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
@@ -93,7 +98,7 @@ func (h *PlanHandler) Calendar(w http.ResponseWriter, r *http.Request) {
 		var cr calRun
 		var runDate string
 		if err := rows.Scan(&cr.ID, &cr.UserReachID, &cr.Name, &runDate,
-			&cr.FlowBand, &cr.FlowColor, &cr.GaugeCFS, &cr.Paddled, &cr.RunTime, &cr.PlanID); err != nil {
+			&cr.FlowBand, &cr.FlowColor, &cr.GaugeCFS, &cr.Paddled, &cr.RunTime); err != nil {
 			errorResponse(w, http.StatusInternalServerError, "scan failed")
 			return
 		}
@@ -140,78 +145,41 @@ func (h *PlanHandler) Calendar(w http.ResponseWriter, r *http.Request) {
 		days = append(days, calDay{Date: d, Runs: runsByDate[d], NeedsConfirm: needsConfirmDates[d]})
 	}
 
-	// plans[] = own plans in range PLUS plans where caller is a plan_members
-	// member, regardless of how membership was obtained: an invitee
-	// (origin='invite', status IN invited/accepted) or an accepted crew
-	// request (origin='request', status='accepted'). role: own | member
-	// (accepted) | invited. Ordered by column position (2 UNION ALL
-	// branches — ORDER BY name is ambiguous across a union).
-	type calPlan struct {
-		ID           string  `json:"id"`
-		Slug         string  `json:"slug"`
-		Name         string  `json:"name"`
-		Type         string  `json:"type"`
-		StartDate    string  `json:"start_date"`
-		EndDate      string  `json:"end_date"`
-		Visibility   string  `json:"visibility"`
-		Role         string  `json:"role"`
-		MemberStatus *string `json:"member_status,omitempty"`
-		HostHandle   string  `json:"host_handle"`
+	// events[] = the owner's own events overlapping [from,to] — owner-only,
+	// no member/role/visibility branch (web#354 A1).
+	type calEvent struct {
+		ID         string  `json:"id"`
+		Slug       string  `json:"slug"`
+		Name       string  `json:"name"`
+		StartDate  string  `json:"start_date"`
+		EndDate    string  `json:"end_date"`
+		Location   *string `json:"location,omitempty"`
+		HostHandle string  `json:"host_handle"`
 	}
 
-	// Member branch collapses to one row per plan (DISTINCT ON p.id,
-	// preferring accepted over invited): A7's per-run fan-out (mig 000144)
-	// means plan_members now carries one row PER RUN for a multi-run plan,
-	// so a plain JOIN here would emit the same plan once per accepted/invited
-	// run — violating the plans[] "each plan once, with role" contract and
-	// producing overlapping/dashed calendar ribbons (#246 review).
-	planRows, err := h.db.Query(ctx, `
-		SELECT p.id, p.slug, p.name, p.type::text, p.start_date::text, p.end_date::text,
-		       p.visibility::text, 'own' AS role, NULL::text AS member_status,
+	eventRows, err := h.db.Query(ctx, `
+		SELECT e.id, e.slug, e.name, e.start_date::text, e.end_date::text, e.location,
 		       COALESCE(up.handle, '') AS host_handle
-		FROM plans p
-		LEFT JOIN user_profiles up ON up.owner_id = p.owner_id
-		WHERE p.owner_id = $1 AND p.deleted_at IS NULL
-		  AND p.start_date <= $3::date AND p.end_date >= $2::date
-		UNION ALL
-		SELECT mp.id, mp.slug, mp.name, mp.type, mp.start_date, mp.end_date,
-		       mp.visibility, mp.role, mp.member_status, mp.host_handle
-		FROM (
-			SELECT DISTINCT ON (p.id)
-			       p.id, p.slug, p.name, p.type::text AS type,
-			       p.start_date::text AS start_date, p.end_date::text AS end_date,
-			       p.visibility::text AS visibility,
-			       CASE WHEN pm.status = 'accepted' THEN 'member' ELSE 'invited' END AS role,
-			       pm.status::text AS member_status,
-			       COALESCE(up.handle, '') AS host_handle
-			FROM plan_members pm
-			JOIN plans p ON p.id = pm.plan_id AND p.deleted_at IS NULL
-			LEFT JOIN user_profiles up ON up.owner_id = p.owner_id
-			WHERE pm.member_owner_id = $1
-			  AND (
-			    (pm.origin = 'invite' AND pm.status IN ('invited','accepted'))
-			    OR (pm.origin = 'request' AND pm.status = 'accepted')
-			  )
-			  AND p.start_date <= $3::date AND p.end_date >= $2::date
-			ORDER BY p.id, (pm.status = 'accepted') DESC
-		) mp
-		ORDER BY 5
+		FROM events e
+		LEFT JOIN user_profiles up ON up.owner_id = e.owner_id
+		WHERE e.owner_id = $1 AND e.deleted_at IS NULL
+		  AND e.start_date <= $3::date AND e.end_date >= $2::date
+		ORDER BY e.start_date
 	`, ownerID, from, to)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
 		return
 	}
-	defer planRows.Close()
+	defer eventRows.Close()
 
-	plans := []calPlan{}
-	for planRows.Next() {
-		var p calPlan
-		if err := planRows.Scan(&p.ID, &p.Slug, &p.Name, &p.Type, &p.StartDate, &p.EndDate,
-			&p.Visibility, &p.Role, &p.MemberStatus, &p.HostHandle); err != nil {
+	events := []calEvent{}
+	for eventRows.Next() {
+		var e calEvent
+		if err := eventRows.Scan(&e.ID, &e.Slug, &e.Name, &e.StartDate, &e.EndDate, &e.Location, &e.HostHandle); err != nil {
 			errorResponse(w, http.StatusInternalServerError, "scan failed")
 			return
 		}
-		plans = append(plans, p)
+		events = append(events, e)
 	}
 
 	// nudge_dot_dates (#246 A5): Tier-B "quiet dot" — in-band + previously
@@ -250,7 +218,7 @@ func (h *PlanHandler) Calendar(w http.ResponseWriter, r *http.Request) {
 
 	jsonResponse(w, http.StatusOK, map[string]any{
 		"days":            days,
-		"plans":           plans,
+		"events":          events,
 		"nudge_dot_dates": nudgeDotDates,
 	})
 }
@@ -283,15 +251,15 @@ func (h *PlanHandler) CalendarDay(w http.ResponseWriter, r *http.Request) {
 	}
 	canMark := !d.After(today)
 
+	// web#354 A1: no plan_id / JOIN plans — calendar_runs by owner+date only.
 	rows, err := h.db.Query(ctx, `
-		SELECT pr.id, pr.plan_id::text, pr.slug, pr.user_reach_id::text, ur.name,
-		       pr.flow_band, pr.flow_color, pr.gauge_cfs, pr.paddled, pr.run_time::text, pr.notes,
-		       pr.meetup_spot, pr.meetup_rapid_id::text, pr.meetup_access_id::text
-		FROM plan_runs pr
-		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
-		LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
-		WHERE pr.owner_id = $1 AND pr.run_date = $2::date AND pr.deleted_at IS NULL
-		ORDER BY pr.sort_order
+		SELECT cr.id, cr.slug, cr.user_reach_id::text, ur.name,
+		       cr.flow_band, cr.flow_color, cr.gauge_cfs, cr.paddled, cr.run_time::text, cr.notes,
+		       cr.meetup_spot, cr.meetup_rapid_id::text, cr.meetup_access_id::text
+		FROM calendar_runs cr
+		LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
+		WHERE cr.owner_id = $1 AND cr.run_date = $2::date AND cr.deleted_at IS NULL
+		ORDER BY cr.sort_order
 	`, ownerID, date)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
@@ -301,7 +269,6 @@ func (h *PlanHandler) CalendarDay(w http.ResponseWriter, r *http.Request) {
 
 	type dayRun struct {
 		ID                string   `json:"id"`
-		PlanID            string   `json:"plan_id"`
 		Slug              string   `json:"slug"`
 		UserReachID       *string  `json:"user_reach_id,omitempty"`
 		Name              *string  `json:"name,omitempty"`
@@ -321,7 +288,7 @@ func (h *PlanHandler) CalendarDay(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var dr dayRun
 		var meetupRapidID, meetupAccessID *string
-		if err := rows.Scan(&dr.ID, &dr.PlanID, &dr.Slug, &dr.UserReachID, &dr.Name,
+		if err := rows.Scan(&dr.ID, &dr.Slug, &dr.UserReachID, &dr.Name,
 			&dr.FlowBand, &dr.FlowColor, &dr.GaugeCFS, &dr.Paddled, &dr.RunTime, &dr.Notes,
 			&dr.MeetupSpot, &meetupRapidID, &meetupAccessID); err != nil {
 			errorResponse(w, http.StatusInternalServerError, "scan failed")

@@ -204,20 +204,26 @@ func (h *OGHandler) Report(w http.ResponseWriter, r *http.Request) {
 	writePNG(w, png)
 }
 
-// PlanRun renders the OG image for a plan_run (calendar run). Path:
-// /og/plan-runs/{id}.png (#246 A5). Fixes the handle bug the contract calls
-// out in Report above: that query selects `rep.handle` straight off
-// `reports` (a denormalized, easily-stale column); this one resolves the
-// host's handle live via a proper user_profiles JOIN on plans.owner_id.
+// PlanRun renders the OG image for a calendar run (was "plan_run"). Path:
+// /og/plan-runs/{id}.png. Fixes the handle bug the contract calls out in
+// Report above: that query selects `rep.handle` straight off `reports` (a
+// denormalized, easily-stale column); this one resolves the owner's handle
+// live via a proper user_profiles JOIN on calendar_runs.owner_id.
 //
-// #246 A6 anon scoping (IMPLEMENTATION_PLAN.md §6 REVISED, PART 3 item 4 —
-// binding): the calendar domain is auth-only and the page no longer
-// advertises this URL, so an anonymous request (crawlers have no JWT to
-// send — bearerToken() finds nothing without an Authorization header) 404s
-// rather than 401 — a 401/WWW-Authenticate would just be noise scrapers
-// can't act on. Route is registered with auth.Optional (main.go) so a
-// signed-in caller's own token IS honored here, unlike the other top-level
-// /og/* routes which run with no auth middleware at all.
+// Anon scoping (binding): the calendar domain is auth-only and the page no
+// longer advertises this URL, so an anonymous request (crawlers have no JWT
+// to send — bearerToken() finds nothing without an Authorization header)
+// 404s rather than 401 — a 401/WWW-Authenticate would just be noise
+// scrapers can't act on. Route is registered with auth.Optional (main.go) so
+// a signed-in caller's own token IS honored here, unlike the other
+// top-level /og/* routes which run with no auth middleware at all.
+//
+// web#354 A1: the old "parent event visibility=public" gate is gone along
+// with the visibility concept entirely — gate on paddled=true instead
+// ("only logged runs are shareable" per plan §3), same not-found-over-
+// unauthorized shape as before. The eyebrow line (ReachName) used to show
+// the parent event's name; standalone runs have none, so it now shows the
+// river name instead.
 func (h *OGHandler) PlanRun(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.ownerID(r); !ok {
 		http.Error(w, "plan run not found", http.StatusNotFound)
@@ -232,42 +238,41 @@ func (h *OGHandler) PlanRun(w http.ResponseWriter, r *http.Request) {
 
 	d := og.PlanRunData{ID: id}
 	var (
-		title      string
-		planName   string
-		handle     *string
-		runDate    string
-		gaugeCfs   *float64
-		flowBand   *string
-		paddled    bool
-		visibility string
+		title     string
+		riverName *string
+		handle    *string
+		runDate   string
+		gaugeCfs  *float64
+		flowBand  *string
+		paddled   bool
 	)
 	err := h.db.QueryRow(r.Context(), `
 		SELECT
 			COALESCE(ur.long_name, ur.name, 'Paddle'),
-			p.name,
+			ur.river_name,
 			up.handle,
-			pr.run_date::text,
-			pr.gauge_cfs,
-			pr.flow_band,
-			pr.paddled,
-			p.visibility::text
-		FROM plan_runs pr
-		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
-		LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
-		LEFT JOIN user_profiles up ON up.owner_id = p.owner_id
-		WHERE pr.id = $1::uuid AND pr.deleted_at IS NULL
-	`, id).Scan(&title, &planName, &handle, &runDate, &gaugeCfs, &flowBand, &paddled, &visibility)
+			cr.run_date::text,
+			cr.gauge_cfs,
+			cr.flow_band,
+			cr.paddled
+		FROM calendar_runs cr
+		LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
+		LEFT JOIN user_profiles up ON up.owner_id = cr.owner_id
+		WHERE cr.id = $1::uuid AND cr.deleted_at IS NULL
+	`, id).Scan(&title, &riverName, &handle, &runDate, &gaugeCfs, &flowBand, &paddled)
 	if err != nil {
 		http.Error(w, "plan run not found", http.StatusNotFound)
 		return
 	}
-	if visibility != "public" {
+	if !paddled {
 		http.Error(w, "plan run not found", http.StatusNotFound)
 		return
 	}
 
 	d.Title = title
-	d.ReachName = planName
+	if riverName != nil {
+		d.ReachName = *riverName
+	}
 	if handle != nil {
 		d.Handle = *handle
 	}

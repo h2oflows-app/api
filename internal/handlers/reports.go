@@ -479,44 +479,45 @@ func (h *ReportHandler) ListByRunID(w http.ResponseWriter, r *http.Request) {
 	const limit = 25
 	cursor := r.URL.Query().Get("cursor")
 
-	// #246 A6 repoint (PART 2): plan_runs is a strict superset of `reports`
-	// post-000143 backfill — reads switch over, `reports` write path + table
-	// stay live-but-dormant (table retirement is a separate later PR).
-	// Matches the FINAL contract's retained-endpoint note verbatim:
-	// "plan_runs JOIN plans WHERE user_reach_id=$1 AND paddled AND
-	// plans.visibility='public'" (both deleted_at IS NULL). `name` has no
-	// plan_runs equivalent (reports' free-text author-name snapshot was
-	// dropped in the new schema) — resolved to the live handle instead, same
-	// as `handle`, so the JSON shape/field names the web run-detail pages
-	// already consume (recon_api-reports.md §2) do not change.
+	// #246 A6 repoint (PART 2): calendar_runs (was plan_runs) is a strict
+	// superset of `reports` post-000143 backfill — reads switch over,
+	// `reports` write path + table stay live-but-dormant (table retirement
+	// is a separate later PR). web#354 A1: the old "JOIN plans WHERE
+	// plans.visibility='public'" gate is gone along with the visibility
+	// concept (and calendar_runs.plan_id) entirely — a paddled run is
+	// visible to any authenticated user regardless of any (now nonexistent)
+	// parent event, so the join is dropped too; `paddled AND deleted_at IS
+	// NULL` alone gates now. `name` has no calendar_runs equivalent
+	// (reports' free-text author-name snapshot was dropped in the new
+	// schema) — resolved to the live handle instead, same as `handle`, so
+	// the JSON shape/field names the web run-detail pages already consume
+	// (recon_api-reports.md §2) do not change.
 	var (
 		query string
 		args  []any
 	)
 	if cursor != "" {
 		query = `
-			SELECT pr.id, pr.slug, COALESCE(up.handle, ''), pr.run_date::TEXT, pr.run_time::TEXT,
-			       COALESCE(pr.notes, ''), pr.paddled,
-			       pr.gauge_cfs, pr.flow_band, pr.created_at, up.handle
-			FROM plan_runs pr
-			JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL AND p.visibility = 'public'
-			LEFT JOIN user_profiles up ON up.owner_id = pr.owner_id
-			WHERE pr.user_reach_id = $1 AND pr.run_date < $2::DATE
-			  AND pr.paddled AND pr.deleted_at IS NULL
-			ORDER BY pr.run_date DESC, pr.created_at DESC
+			SELECT cr.id, cr.slug, COALESCE(up.handle, ''), cr.run_date::TEXT, cr.run_time::TEXT,
+			       COALESCE(cr.notes, ''), cr.paddled,
+			       cr.gauge_cfs, cr.flow_band, cr.created_at, up.handle
+			FROM calendar_runs cr
+			LEFT JOIN user_profiles up ON up.owner_id = cr.owner_id
+			WHERE cr.user_reach_id = $1 AND cr.run_date < $2::DATE
+			  AND cr.paddled AND cr.deleted_at IS NULL
+			ORDER BY cr.run_date DESC, cr.created_at DESC
 			LIMIT $3`
 		args = []any{userReachID, cursor, limit + 1}
 	} else {
 		query = `
-			SELECT pr.id, pr.slug, COALESCE(up.handle, ''), pr.run_date::TEXT, pr.run_time::TEXT,
-			       COALESCE(pr.notes, ''), pr.paddled,
-			       pr.gauge_cfs, pr.flow_band, pr.created_at, up.handle
-			FROM plan_runs pr
-			JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL AND p.visibility = 'public'
-			LEFT JOIN user_profiles up ON up.owner_id = pr.owner_id
-			WHERE pr.user_reach_id = $1
-			  AND pr.paddled AND pr.deleted_at IS NULL
-			ORDER BY pr.run_date DESC, pr.created_at DESC
+			SELECT cr.id, cr.slug, COALESCE(up.handle, ''), cr.run_date::TEXT, cr.run_time::TEXT,
+			       COALESCE(cr.notes, ''), cr.paddled,
+			       cr.gauge_cfs, cr.flow_band, cr.created_at, up.handle
+			FROM calendar_runs cr
+			LEFT JOIN user_profiles up ON up.owner_id = cr.owner_id
+			WHERE cr.user_reach_id = $1
+			  AND cr.paddled AND cr.deleted_at IS NULL
+			ORDER BY cr.run_date DESC, cr.created_at DESC
 			LIMIT $2`
 		args = []any{userReachID, limit + 1}
 	}

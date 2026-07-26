@@ -136,7 +136,7 @@ func main() {
 	userProfiles := handlers.NewUserProfileHandler(pool)
 	moderation := handlers.NewModerationHandler(pool, devFallbackID)
 	handlers.SetWebBaseURL(cfg.WebBaseURL)
-	plans := handlers.NewPlanHandler(pool, devFallbackID).WithMailer(mailer)
+	plans := handlers.NewPlanHandler(pool, devFallbackID)
 	invites := handlers.NewInviteHandler(pool, devFallbackID, mailer)
 	nudges := handlers.NewNudgeHandler(pool, devFallbackID)
 	discover := handlers.NewDiscoverHandler(pool, devFallbackID)
@@ -190,9 +190,9 @@ func main() {
 		r.Post("/ask", reaches.GlobalAsk)
 		r.Get("/stats", reaches.Stats)
 		r.Get("/discover/runs", discover.ListRuns)
-		// #246 A6: auth-only (anon scoping REVISED block) — gated by the
-		// plan's own visibility (contract decision #7). #246 A7: the
-		// looking_for_crew gate moved to plan_runs (per-run crew).
+		// #246 A6: auth-only (anon scoping REVISED block). web#354 A1:
+		// regrouped by run — events dropped visibility entirely (owner-only
+		// now), so a run's own looking_for_crew is the only gate.
 		r.Get("/discover/plans", discover.ListPlans)
 		r.Get("/admin/slug-check", admin.SlugCheck)
 		// NLDI upstream-tributaries is public — run detail page needs it without auth.
@@ -298,9 +298,11 @@ func main() {
 		r.Post("/reports/{reportId}/flag", moderation.FlagReport)
 		r.Post("/me/river-corrections", corrections.CreateRiverCorrection)
 
-		// #246 A3: Trip Calendar — plans + calendar runs + /me/calendar.
-		// Auth optional here; handlers self-gate via ownerID(), same as
-		// reports/dashboards/etc. Public plans are anon-readable.
+		// web#354 A1: Events (was "plans") + standalone calendar Runs (table
+		// calendar_runs, was "plan_runs") + /me/calendar. Auth optional here;
+		// handlers self-gate via ownerID() — events are owner-only now (no
+		// more public/private), same uniform-401-for-anon shape as the rest
+		// of the calendar domain.
 		r.Post("/plans", plans.Create)
 		r.Get("/plans/{handle}/{slug}", plans.GetByHandleSlug)
 		r.Get("/plans/{id}", plans.GetByID)
@@ -308,7 +310,10 @@ func main() {
 		r.Patch("/plans/{id}", plans.Update)
 		r.Delete("/plans/{id}", plans.Delete)
 
-		r.Post("/plans/{id}/runs", plans.CreateRun)
+		// POST /plan-runs (standalone create) registered before the
+		// GET /plan-runs/{param} wildcard for readability — chi disambiguates
+		// by method already, so there's no actual routing collision here.
+		r.Post("/plan-runs", plans.CreateRun)
 		r.Get("/plan-runs/{param}", plans.GetRun)
 		r.Patch("/plan-runs/{id}", plans.UpdateRun)
 		r.Delete("/plan-runs/{id}", plans.DeleteRun)
