@@ -10,6 +10,12 @@
 -- Reverses up steps in opposite order: 5, 4, (3 unrecoverable, skipped),
 -- 2, 1.
 
+-- reverse addendum: best-effort only, intentionally a no-op. Any
+-- plan_members row created with plan_id NULL during the A1 window (JoinRun
+-- against a standalone run) would violate NOT NULL if restored here, and
+-- there's no event to backfill it with — schema-smoke reversibility, not
+-- data-fidelity (same caveat as every other step below). Left nullable.
+
 -- reverse step 5: visibility.
 CREATE TYPE plan_visibility AS ENUM ('public', 'private');
 ALTER TABLE events ADD COLUMN visibility plan_visibility NOT NULL DEFAULT 'private';
@@ -23,10 +29,19 @@ ALTER TABLE events ADD COLUMN type plan_type NOT NULL DEFAULT 'personal';
 
 -- reverse step 2: decouple (best-effort; linkage unrecoverable).
 DROP INDEX calendar_runs_owner_date_idx;
--- Nullable, all NULL — cannot restore historical values, the NOT NULL
--- constraint, or the ON DELETE CASCADE FK (its target event may no longer
--- exist post-step-3 delete anyway).
+-- Nullable, all NULL — cannot restore historical per-row values or the NOT
+-- NULL-ness, but the FK shape itself (ON DELETE CASCADE to the renamed-back
+-- events/plans table) IS restored below: a nullable FK is valid SQL (NULLs
+-- are simply exempt), and the up migration's step 2 unconditionally expects
+-- a constraint of this exact name to DROP — required for a clean
+-- up/down/up round trip (verified via local smoke test).
 ALTER TABLE calendar_runs ADD COLUMN plan_id UUID;
+ALTER TABLE calendar_runs ADD CONSTRAINT plan_runs_plan_id_fkey
+  FOREIGN KEY (plan_id) REFERENCES events(id) ON DELETE CASCADE;
+-- Recreate the index the up migration's step 2 unconditionally DROPs (same
+-- round-trip reasoning as the constraint above).
+CREATE INDEX plan_runs_plan_idx ON calendar_runs (plan_id, run_date, sort_order)
+  WHERE deleted_at IS NULL;
 
 -- reverse step 1: renames.
 ALTER INDEX events_owner_dates_idx       RENAME TO plans_owner_dates_idx;

@@ -59,3 +59,20 @@ DROP TYPE plan_type;
 -- (events themselves become owner-only, unconditionally).
 ALTER TABLE events DROP COLUMN visibility;
 DROP TYPE plan_visibility;
+
+-- Addendum (NOT one of plan §2's 5 listed steps — a necessary corollary of
+-- step 2, called out here rather than silently folded in): plan_members.
+-- plan_id is NOT NULL, FK'd to events(id) (mig 000140). Every run created
+-- from now on is standalone (POST /plan-runs has no parent event —
+-- plan_runs.go's old "add a run to this plan" endpoint is removed), so a
+-- NEW crew-join-request row against such a run (InviteHandler.JoinRun,
+-- internal/handlers/invites.go) has no event to supply here and would
+-- violate the NOT NULL constraint. Loosening it to nullable is the minimal
+-- schema change that keeps the join/crew flow alive through the A1->A2
+-- bridge window (A2's 000146 drops plan_id from plan_members entirely via
+-- run_invites) — plan_members otherwise keeps its name, shape, and every
+-- other column/constraint untouched, so this does not contradict "steps
+-- 1-5 ONLY": it isn't step 6 (no DROP/CREATE of plan_members), just a
+-- one-column relaxation forced by step 2. Flagged in the PR/report for
+-- review.
+ALTER TABLE plan_members ALTER COLUMN plan_id DROP NOT NULL;
