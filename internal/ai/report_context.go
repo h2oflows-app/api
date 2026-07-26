@@ -21,7 +21,13 @@ type reportForContext struct {
 }
 
 // loadReachReports fetches all reports for a reach, capped at 24 months back
-// and a maximum of 500 rows, most recent first.
+// and a maximum of 500 rows, most recent first. authed gates the whole
+// corpus (web#354 A1 major fix, findings[1]): anonymous POST /ask must not
+// receive calendar-run notes at all ("Anon: sees no calendar items" — §1)
+// — !authed short-circuits to an empty result before ever querying
+// calendar_runs, so a private-intent plan's paddled-run notes (gate codes,
+// meetup details, etc.) can never reach an anonymous asker via the AI
+// corpus. Authenticated callers keep the full corpus below.
 //
 // #246 A6 repoint (IMPLEMENTATION_PLAN.md §3 PART 2 item 2): reads
 // calendar_runs (was plan_runs, superset of `reports` post-000143 backfill)
@@ -32,11 +38,15 @@ type reportForContext struct {
 // revisit if it stings). web#354 A1: the old "JOIN plans WHERE
 // plans.visibility='public'" gate is gone along with the visibility concept
 // (and calendar_runs.plan_id) entirely — paddled alone gates now, same as
-// every other paddled-run reader post-A1. `name` has no calendar_runs
+// every other paddled-run reader post-A1, PROVIDED the caller is
+// authenticated (see authed above). `name` has no calendar_runs
 // equivalent (the free-text author-name snapshot was dropped in the new
 // schema) — reuses the resolved handle, same as buildReportsBlock's own
 // `author` fallback-to-name logic below.
-func loadReachReports(ctx context.Context, db *pgxpool.Pool, reachID string) ([]reportForContext, error) {
+func loadReachReports(ctx context.Context, db *pgxpool.Pool, reachID string, authed bool) ([]reportForContext, error) {
+	if !authed {
+		return nil, nil
+	}
 	rows, err := db.Query(ctx, `
 		SELECT
 			cr.id, cr.slug,

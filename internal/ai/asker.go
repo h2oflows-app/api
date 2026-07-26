@@ -138,8 +138,12 @@ func (a *ReachAsker) IdentifyReach(ctx context.Context, question string, reaches
 // Answer loads the reach's full structured data (description, rapids, access,
 // flow ranges) directly from the DB and injects all community reports using
 // long-context prompt stuffing (no vector retrieval). The reports block is
-// prompt-cached per reach.
-func (a *ReachAsker) Answer(ctx context.Context, reachID, reachName, question string) (string, error) {
+// prompt-cached per reach. authed is threaded from the caller's request
+// (GlobalAsk) down to loadReachReports (web#354 A1 major fix, findings[1]):
+// when false, the calendar_runs notes corpus is skipped entirely — gauge/
+// reach/structured context (loaded above, unaffected) still answers the
+// question, just without any paddled-run free-text notes.
+func (a *ReachAsker) Answer(ctx context.Context, reachID, reachName, question string, authed bool) (string, error) {
 	// 1. Load live structured data directly from DB.
 	r, err := loadEmbedReach(ctx, a.db, reachID)
 	if err != nil {
@@ -157,7 +161,7 @@ func (a *ReachAsker) Answer(ctx context.Context, reachID, reachName, question st
 	}
 
 	// 2. Load community reports for long-context grounding.
-	reachReports, _ := loadReachReports(ctx, a.db, reachID)
+	reachReports, _ := loadReachReports(ctx, a.db, reachID, authed)
 
 	// 3. Build system blocks. Reports block carries a prompt-cache breakpoint
 	//    so repeat queries to the same reach (within 5 min) skip re-tokenisation.

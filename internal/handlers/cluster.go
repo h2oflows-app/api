@@ -38,6 +38,14 @@ func (h *ClusterHandler) callerID(r *http.Request) string {
 	return h.devFallbackID
 }
 
+// isAuthed reports whether r carries an identity (real JWT or dev fallback)
+// — web#354 A1 major fix (findings[2]/§1: "Anon: sees no calendar items"):
+// nearbyRuns' rank_score/report_count are partly calendar_runs-derived, and
+// must contribute nothing for an anonymous caller.
+func (h *ClusterHandler) isAuthed(r *http.Request) bool {
+	return h.callerID(r) != ""
+}
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 type clusterRun struct {
@@ -59,13 +67,18 @@ type clusterRun struct {
 // nearbyRuns finds curated + public community runs near the given put-in and
 // take-out, filtered by up_comid (may be empty to skip ComID filter).
 // excludeID excludes a specific run ID (for the "view cluster" use case).
-func (h *ClusterHandler) nearbyRuns(r *http.Request, putInLat, putInLng, takeOutLat, takeOutLng float64, upComID, excludeID string) ([]clusterRun, error) {
+// authed gates the calendar_runs-derived contribution to rank_score/
+// report_count (web#354 A1 major fix, findings[2]/§1: "Anon: sees no
+// calendar items") — an anonymous caller gets report_count=0 and no paddled-
+// run boost to rank_score; everything else (upvotes, special-user boost,
+// completeness) is unaffected.
+func (h *ClusterHandler) nearbyRuns(r *http.Request, putInLat, putInLng, takeOutLat, takeOutLng float64, upComID, excludeID string, authed bool) ([]clusterRun, error) {
 	ctx := r.Context()
 	const radiusMeters = 1609.34 // 1 mile
 
 	comidFilter := ""
 	if upComID != "" {
-		comidFilter = "AND ur.up_comid = $7"
+		comidFilter = "AND ur.up_comid = $8"
 	}
 
 	// Community (user_reaches) — public, non-deleted, not the excluded run.
@@ -94,12 +107,14 @@ func (h *ClusterHandler) nearbyRuns(r *http.Request, putInLat, putInLng, takeOut
 				-- visibility concept (and calendar_runs.plan_id) entirely — a
 				-- paddled run is visible to any authenticated user regardless of
 				-- any (now nonexistent) parent event, so the join is dropped too.
-				+ COALESCE((SELECT COUNT(*) FROM calendar_runs cr WHERE cr.user_reach_id = ur.id AND cr.paddled AND cr.deleted_at IS NULL), 0) * 2
+				-- web#354 A1 major fix (findings[2]): $7 (authed) zeroes this
+				-- contribution for an anonymous caller.
+				+ CASE WHEN $7 THEN COALESCE((SELECT COUNT(*) FROM calendar_runs cr WHERE cr.user_reach_id = ur.id AND cr.paddled AND cr.deleted_at IS NULL), 0) ELSE 0 END * 2
 				+ (CASE WHEN ur.centerline IS NOT NULL THEN 1 ELSE 0 END
 				   + CASE WHEN EXISTS(SELECT 1 FROM user_reach_flow_ranges WHERE user_reach_id = ur.id) THEN 1 ELSE 0 END
 				   + CASE WHEN ur.note IS NOT NULL AND char_length(ur.note) >= 20 THEN 1 ELSE 0 END) * 5
 			)::int AS rank_score,
-			COALESCE((SELECT COUNT(*) FROM calendar_runs cr WHERE cr.user_reach_id = ur.id AND cr.paddled AND cr.deleted_at IS NULL), 0)::int AS report_count
+			CASE WHEN $7 THEN COALESCE((SELECT COUNT(*) FROM calendar_runs cr WHERE cr.user_reach_id = ur.id AND cr.paddled AND cr.deleted_at IS NULL), 0) ELSE 0 END::int AS report_count
 		FROM user_reaches ur
 		LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
 		WHERE ur.visibility = 'public' AND ur.deleted_at IS NULL
@@ -113,7 +128,7 @@ func (h *ClusterHandler) nearbyRuns(r *http.Request, putInLat, putInLng, takeOut
 	// was retired in runs-unify Phase 4.
 	fullQ := `(` + communityQ + `) ORDER BY rank_score DESC LIMIT 20`
 
-	args := []any{putInLat, putInLng, takeOutLat, takeOutLng, radiusMeters, excludeID}
+	args := []any{putInLat, putInLng, takeOutLat, takeOutLng, radiusMeters, excludeID, authed}
 	if upComID != "" {
 		args = append(args, upComID)
 	}
@@ -163,7 +178,7 @@ func (h *ClusterHandler) DupeCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	runs, err := h.nearbyRuns(r, body.PutInLat, body.PutInLng, body.TakeOutLat, body.TakeOutLng, body.UpComID, "")
+	runs, err := h.nearbyRuns(r, body.PutInLat, body.PutInLng, body.TakeOutLat, body.TakeOutLng, body.UpComID, "", h.isAuthed(r))
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
 		return
@@ -212,7 +227,7 @@ func (h *ClusterHandler) ClusterForRun(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = radius // used in nearbyRuns via constant — override not threaded through yet
 
-	runs, err := h.nearbyRuns(r, putInLat, putInLng, takeOutLat, takeOutLng, upComID, runID)
+	runs, err := h.nearbyRuns(r, putInLat, putInLng, takeOutLat, takeOutLng, upComID, runID, h.isAuthed(r))
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
 		return

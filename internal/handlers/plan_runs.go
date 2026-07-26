@@ -322,6 +322,7 @@ func (h *PlanHandler) CreateRun(w http.ResponseWriter, r *http.Request) {
 func (h *PlanHandler) GetRun(w http.ResponseWriter, r *http.Request) {
 	param := chi.URLParam(r, "param")
 	ctx := r.Context()
+	_, callerOK := h.ownerID(r)
 
 	var runID string
 	if err := h.db.QueryRow(ctx,
@@ -335,6 +336,19 @@ func (h *PlanHandler) GetRun(w http.ResponseWriter, r *http.Request) {
 				WHERE slug = $1 AND deleted_at IS NULL
 				  AND (SELECT COUNT(*) FROM calendar_runs WHERE slug = $1 AND deleted_at IS NULL) = 1
 			`, param).Scan(&runID); err3 != nil {
+				// web#354 A1 minor fix (findings[3]): an anonymous caller must
+				// get the SAME 401 here as an existing-but-unauthorized run
+				// gets below in renderPlanRun — a 404-here/401-there split let
+				// anon distinguish "no such run" from "real run I can't see"
+				// purely by status code, an existence oracle the renderPlanRun
+				// gate below claims (in comment) not to allow. Authenticated
+				// callers are unaffected and keep the ordinary 404. A valid
+				// ?invite= token only ever matters once a run actually
+				// resolves, so it plays no part in this branch.
+				if !callerOK {
+					errorResponse(w, http.StatusUnauthorized, "authentication required")
+					return
+				}
 				errorResponse(w, http.StatusNotFound, "run not found")
 				return
 			}
@@ -426,8 +440,10 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 	// unchanged in A1), OR looking_for_crew AND run_date >= the caller's
 	// local today, OR a valid ?invite= token scoped to this run (the sole
 	// anon carve-out — moved here from the event page). Anon without a
-	// grant gets 401 (never an existence oracle); authed without a grant
-	// gets 404.
+	// grant gets 401; authed without a grant gets 404. This is NOT an
+	// existence oracle on its own ONLY because GetRun's not-found path
+	// (above) also 401s an anonymous caller before ever reaching here
+	// (web#354 A1 minor fix, findings[3]) — the two must be kept in sync.
 	tokenGrant := runInviteTokenGrant(ctx, h.db, run.ID, r.URL.Query().Get("invite"))
 	if !callerOK && !tokenGrant {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
