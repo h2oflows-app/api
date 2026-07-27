@@ -383,6 +383,12 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 	ctx := r.Context()
 
 	callerID, callerOK := h.ownerID(r)
+	// A pending email invite carries member_owner_id=NULL until accept (see
+	// run_invites DDL) — matching only member_owner_id=$2 below would 404 a
+	// logged-in invitee whose JWT email matches a still-pending invite_email,
+	// same class of bug MyInvites/AcceptInvite/DismissInvite already guard
+	// against with this same email fallback (invites.go).
+	callerEmail, _ := auth.EmailFromContext(ctx)
 
 	var run planRunSummary
 	var runTime *string
@@ -410,10 +416,11 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 		) cm ON true
 		LEFT JOIN LATERAL (
 			SELECT ri.id::text, ri.status::text FROM run_invites ri
-			WHERE ri.run_id = cr.id AND ri.member_owner_id = $2
+			WHERE ri.run_id = cr.id
+			  AND (ri.member_owner_id = $2 OR (ri.member_owner_id IS NULL AND LOWER(ri.invite_email) = LOWER($3)))
 		) me ON true
 		WHERE cr.id = $1 AND cr.deleted_at IS NULL
-	`, runID, callerID).Scan(
+	`, runID, callerID, callerEmail).Scan(
 		&run.ID, &run.Slug, &run.UserReachID, &run.Name, &run.RunDate, &runTime,
 		&run.SortOrder, &run.GaugeCFS, &run.FlowBand, &run.FlowColor, &run.Paddled, &paddledAtRaw,
 		&run.Notes, &run.Companions, &createdAtRaw,
@@ -473,8 +480,9 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 		if !allowed {
 			h.db.QueryRow(ctx, `
 				SELECT EXISTS(SELECT 1 FROM run_invites
-					WHERE run_id = $1 AND member_owner_id = $2 AND status IN ('invited','accepted'))
-			`, run.ID, callerID).Scan(&allowed)
+					WHERE run_id = $1 AND status IN ('invited','accepted')
+					  AND (member_owner_id = $2 OR (member_owner_id IS NULL AND LOWER(invite_email) = LOWER($3))))
+			`, run.ID, callerID, callerEmail).Scan(&allowed)
 		}
 	}
 	if !allowed {

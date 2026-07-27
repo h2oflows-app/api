@@ -84,10 +84,11 @@ func (h *PlanHandler) Calendar(w http.ResponseWriter, r *http.Request) {
 
 	// web#354 A2 decision #8: union the owner's own runs with runs they have
 	// an ACCEPTED run_invites row on (crew) — SELECT DISTINCT in the inner
-	// query is defensive (a host can never also hold an accepted invite on
-	// their own run — JoinRun/InviteToRun both reject host-self — so the two
-	// branches of the OR are already disjoint in practice, but DISTINCT
-	// keeps this query correct even if that invariant is ever broken).
+	// query is defensive (a host is NOT supposed to also hold an accepted
+	// invite on their own run — JoinRun rejects host-self, and InviteToRun's
+	// handle branch does too, but this is a should-not-happen invariant, not
+	// a guaranteed one: DISTINCT keeps this query correct even if it's ever
+	// violated).
 	rows, err := h.db.Query(ctx, `
 		SELECT id, user_reach_id, name, run_date, flow_band, flow_color, gauge_cfs, paddled, run_time, role
 		FROM (

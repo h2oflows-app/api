@@ -25,7 +25,7 @@ CREATE TABLE plan_members (
   invited_by         TEXT,
   origin             plan_member_origin  NOT NULL,
   status             plan_member_status  NOT NULL,
-  plan_run_id        UUID                REFERENCES calendar_runs(id) ON DELETE CASCADE, -- added 000144
+  plan_run_id        UUID                REFERENCES calendar_runs(id) ON DELETE CASCADE, -- present since 000140
   invite_token_hash  TEXT,
   message            TEXT,
   dismissed_at       TIMESTAMPTZ,

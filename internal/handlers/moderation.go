@@ -160,6 +160,12 @@ func (h *ModerationHandler) FlagPlanRun(w http.ResponseWriter, r *http.Request) 
 	}
 
 	ctx := r.Context()
+	// Same email fallback as renderPlanRun's visibility gate (plan_runs.go)
+	// and MyInvites/AcceptInvite/DismissInvite (invites.go): a pending email
+	// invite has member_owner_id=NULL until accept, so matching only
+	// member_owner_id=$2 below would 404 a logged-in invitee whose JWT email
+	// matches a still-pending invite_email.
+	reporterEmail, _ := auth.EmailFromContext(ctx)
 
 	// web#354 A1: the old "parent plan visibility=public" gate is gone along
 	// with the visibility concept entirely (calendar_runs has no plan_id to
@@ -179,12 +185,12 @@ func (h *ModerationHandler) FlagPlanRun(w http.ResponseWriter, r *http.Request) 
 			    OR cr.owner_id = $2
 			    OR EXISTS(
 			      SELECT 1 FROM run_invites ri
-			      WHERE ri.run_id = cr.id AND ri.member_owner_id = $2
-			        AND ri.status IN ('invited','accepted')
+			      WHERE ri.run_id = cr.id AND ri.status IN ('invited','accepted')
+			        AND (ri.member_owner_id = $2 OR (ri.member_owner_id IS NULL AND LOWER(ri.invite_email) = LOWER($3)))
 			    )
 			  )
 		)
-	`, planRunID, reporterID).Scan(&exists); err != nil || !exists {
+	`, planRunID, reporterID, reporterEmail).Scan(&exists); err != nil || !exists {
 		errorResponse(w, http.StatusNotFound, "plan run not found")
 		return
 	}

@@ -368,6 +368,20 @@ func (h *InviteHandler) InviteToRun(w http.ResponseWriter, r *http.Request) {
 
 	case body.Email != nil && strings.TrimSpace(*body.Email) != "":
 		email := strings.ToLower(strings.TrimSpace(*body.Email))
+
+		// Mirror the handle branch's host-self guard above: a host emailing
+		// their own login address has no user_profiles.email to resolve
+		// against (that table has no email column — see MyInvites/
+		// AcceptInvite/DismissInvite, which all read the caller's email off
+		// the JWT via auth.EmailFromContext instead), so compare against the
+		// HOST's own JWT email the same way. Without this, InviteToRun would
+		// insert a real run_invites row the host could later accept via
+		// AcceptInvite's email match, becoming accepted crew on their own run.
+		if hostEmail, hok := auth.EmailFromContext(ctx); hok && hostEmail != "" && strings.EqualFold(hostEmail, email) {
+			jsonResponse(w, http.StatusOK, map[string]string{"status": "existing"})
+			return
+		}
+
 		attachICS := body.AttachICS == nil || *body.AttachICS // default TRUE
 
 		rawToken, tokenHash, terr := generateInviteToken()
@@ -467,11 +481,23 @@ func (h *InviteHandler) ResendInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := h.db.Exec(ctx,
-		`UPDATE run_invites SET invite_token_hash = $1, updated_at = NOW() WHERE id = $2::uuid`,
+	// AND status = 'invited' closes a TOCTOU window against the SELECT above:
+	// without it, an accept that commits between the SELECT and this UPDATE
+	// would have this blind write re-arm a fresh invite_token_hash on a row
+	// AcceptInvite had just nulled to make single-use, resurrecting the
+	// ?invite= anon-read carve-out on an already-consumed invite.
+	// RowsAffected()==0 means the invite resolved (accepted/declined) in
+	// that window — a no-op 409 instead of silently reviving it.
+	tag, err := h.db.Exec(ctx,
+		`UPDATE run_invites SET invite_token_hash = $1, updated_at = NOW() WHERE id = $2::uuid AND status = 'invited'`,
 		tokenHash, inviteID,
-	); err != nil {
+	)
+	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "resend failed")
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		errorResponse(w, http.StatusConflict, "invite has already been accepted or declined")
 		return
 	}
 
@@ -848,6 +874,18 @@ func (h *InviteHandler) JoinRun(w http.ResponseWriter, r *http.Request) {
 // requests and accepted crew (of either origin — an accepted handle-invite is
 // also "crew") so the host sees one roster; filled counts status='accepted'
 // regardless of origin. web#354 A2: re-keyed plan_members -> run_invites.
+//
+// Host-only feedback gap fix (post-A2, W2 review): the roster ALSO now
+// includes still-pending, non-dismissed invites (origin='invite',
+// status='invited') — previously invisible here, so a host had no way to see
+// who they'd already invited or to know who a resend targets. This endpoint
+// is host-gated (403 below for anyone else), so the added rows — and the new
+// InviteEmail field they carry for email-only invites — are owner-only by
+// construction; there is no non-owner branch of this response that could
+// leak invite_email to another crew member. Origin+Status together
+// disambiguate a row's kind: origin='invite'+status='invited' = pending
+// invite (this addition); origin='request'+status='requested' = pending
+// join request; status='accepted' = seated crew (either origin).
 
 func (h *InviteHandler) RunCrewList(w http.ResponseWriter, r *http.Request) {
 	runID := chi.URLParam(r, "id")
@@ -875,10 +913,16 @@ func (h *InviteHandler) RunCrewList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := h.db.Query(ctx, `
-		SELECT ri.id, ri.status::text, ri.origin::text, ri.message, ri.created_at, COALESCE(up.handle, ri.invite_handle, '')
+		SELECT ri.id, ri.status::text, ri.origin::text, ri.message, ri.created_at,
+		       COALESCE(up.handle, ri.invite_handle, ''), ri.invite_email
 		FROM run_invites ri
 		LEFT JOIN user_profiles up ON up.owner_id = ri.member_owner_id
-		WHERE ri.run_id = $1::uuid AND (ri.origin = 'request' OR ri.status = 'accepted')
+		WHERE ri.run_id = $1::uuid
+		  AND (
+		    ri.origin = 'request'
+		    OR ri.status = 'accepted'
+		    OR (ri.origin = 'invite' AND ri.status = 'invited' AND ri.dismissed_at IS NULL)
+		  )
 		ORDER BY ri.created_at
 	`, runID)
 	if err != nil {
@@ -888,18 +932,19 @@ func (h *InviteHandler) RunCrewList(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type crewMember struct {
-		MemberID  string  `json:"member_id"`
-		Status    string  `json:"status"`
-		Origin    string  `json:"origin"`
-		Message   *string `json:"message,omitempty"`
-		CreatedAt string  `json:"created_at"`
-		Handle    string  `json:"handle"`
+		MemberID    string  `json:"member_id"`
+		Status      string  `json:"status"`
+		Origin      string  `json:"origin"`
+		Message     *string `json:"message,omitempty"`
+		CreatedAt   string  `json:"created_at"`
+		Handle      string  `json:"handle"`
+		InviteEmail *string `json:"invite_email,omitempty"` // owner-only (see doc comment above); set only for pending email invites
 	}
 	members := []crewMember{}
 	for rows.Next() {
 		var cm crewMember
 		var createdAtRaw time.Time
-		if err := rows.Scan(&cm.MemberID, &cm.Status, &cm.Origin, &cm.Message, &createdAtRaw, &cm.Handle); err != nil {
+		if err := rows.Scan(&cm.MemberID, &cm.Status, &cm.Origin, &cm.Message, &createdAtRaw, &cm.Handle, &cm.InviteEmail); err != nil {
 			errorResponse(w, http.StatusInternalServerError, "scan failed")
 			return
 		}
