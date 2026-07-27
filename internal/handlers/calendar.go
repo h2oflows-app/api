@@ -14,9 +14,13 @@ import (
 // no JOIN, no plan_id (runs are decoupled from events). events[] (renamed
 // from plans[]) is the owner's OWN events overlapping the range only — the
 // old member/role/visibility UNION ALL branch is gone (events are owner-only
-// now; the "crew-run inclusion" enhancement — accepted-crew runs surfaced
-// with a role flag — is deferred to A2, since crew join reads plan_members
-// but full run_invites-driven crew semantics land there).
+// now).
+//
+// web#354 A2 (decision #8): days[].runs ALSO includes runs the caller has an
+// ACCEPTED run_invites row on (crew, not owner) — each run item now carries
+// a `role` field ('owner'|'crew') so "trips I joined" surface on the
+// calendar too, not just the host's own. events[] stays owner-only,
+// unchanged.
 
 func (h *PlanHandler) Calendar(w http.ResponseWriter, r *http.Request) {
 	ownerID, ok := h.ownerID(r)
@@ -70,6 +74,7 @@ func (h *PlanHandler) Calendar(w http.ResponseWriter, r *http.Request) {
 		GaugeCFS    *float64 `json:"gauge_cfs,omitempty"`
 		Paddled     bool     `json:"paddled"`
 		RunTime     *string  `json:"run_time,omitempty"`
+		Role        string   `json:"role"` // "owner" | "crew" (web#354 A2 decision #8)
 	}
 	type calDay struct {
 		Date         string   `json:"date"`
@@ -77,14 +82,28 @@ func (h *PlanHandler) Calendar(w http.ResponseWriter, r *http.Request) {
 		NeedsConfirm bool     `json:"needs_confirm"`
 	}
 
+	// web#354 A2 decision #8: union the owner's own runs with runs they have
+	// an ACCEPTED run_invites row on (crew) — SELECT DISTINCT in the inner
+	// query is defensive (a host can never also hold an accepted invite on
+	// their own run — JoinRun/InviteToRun both reject host-self — so the two
+	// branches of the OR are already disjoint in practice, but DISTINCT
+	// keeps this query correct even if that invariant is ever broken).
 	rows, err := h.db.Query(ctx, `
-		SELECT cr.id, cr.user_reach_id::text, ur.name, cr.run_date::text,
-		       cr.flow_band, cr.flow_color, cr.gauge_cfs, cr.paddled, cr.run_time::text
-		FROM calendar_runs cr
-		LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
-		WHERE cr.owner_id = $1 AND cr.deleted_at IS NULL
-		  AND cr.run_date BETWEEN $2::date AND $3::date
-		ORDER BY cr.run_date, cr.sort_order
+		SELECT id, user_reach_id, name, run_date, flow_band, flow_color, gauge_cfs, paddled, run_time, role
+		FROM (
+			SELECT DISTINCT cr.id, cr.user_reach_id::text AS user_reach_id, ur.name,
+			       cr.run_date::text AS run_date, cr.flow_band, cr.flow_color, cr.gauge_cfs, cr.paddled,
+			       cr.run_time::text AS run_time, cr.sort_order,
+			       CASE WHEN cr.owner_id = $1 THEN 'owner' ELSE 'crew' END AS role
+			FROM calendar_runs cr
+			LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
+			WHERE cr.deleted_at IS NULL AND cr.run_date BETWEEN $2::date AND $3::date
+			  AND (
+			    cr.owner_id = $1
+			    OR EXISTS(SELECT 1 FROM run_invites ri WHERE ri.run_id = cr.id AND ri.member_owner_id = $1 AND ri.status = 'accepted')
+			  )
+		) sub
+		ORDER BY run_date, sort_order
 	`, ownerID, from, to)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
@@ -98,7 +117,7 @@ func (h *PlanHandler) Calendar(w http.ResponseWriter, r *http.Request) {
 		var cr calRun
 		var runDate string
 		if err := rows.Scan(&cr.ID, &cr.UserReachID, &cr.Name, &runDate,
-			&cr.FlowBand, &cr.FlowColor, &cr.GaugeCFS, &cr.Paddled, &cr.RunTime); err != nil {
+			&cr.FlowBand, &cr.FlowColor, &cr.GaugeCFS, &cr.Paddled, &cr.RunTime, &cr.Role); err != nil {
 			errorResponse(w, http.StatusInternalServerError, "scan failed")
 			return
 		}
@@ -252,14 +271,27 @@ func (h *PlanHandler) CalendarDay(w http.ResponseWriter, r *http.Request) {
 	canMark := !d.After(today)
 
 	// web#354 A1: no plan_id / JOIN plans — calendar_runs by owner+date only.
+	// web#354 A2 (decision #8, "same for CalendarDay"): also include runs the
+	// caller has an ACCEPTED run_invites row on (crew) — same union + role
+	// shape as Calendar above.
 	rows, err := h.db.Query(ctx, `
-		SELECT cr.id, cr.slug, cr.user_reach_id::text, ur.name,
-		       cr.flow_band, cr.flow_color, cr.gauge_cfs, cr.paddled, cr.run_time::text, cr.notes,
-		       cr.meetup_spot, cr.meetup_rapid_id::text, cr.meetup_access_id::text
-		FROM calendar_runs cr
-		LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
-		WHERE cr.owner_id = $1 AND cr.run_date = $2::date AND cr.deleted_at IS NULL
-		ORDER BY cr.sort_order
+		SELECT id, slug, user_reach_id, name, flow_band, flow_color, gauge_cfs, paddled, run_time, notes,
+		       meetup_spot, meetup_rapid_id, meetup_access_id, role
+		FROM (
+			SELECT DISTINCT cr.id, cr.slug, cr.user_reach_id::text AS user_reach_id, ur.name,
+			       cr.flow_band, cr.flow_color, cr.gauge_cfs, cr.paddled, cr.run_time::text AS run_time, cr.notes,
+			       cr.meetup_spot, cr.meetup_rapid_id::text AS meetup_rapid_id, cr.meetup_access_id::text AS meetup_access_id,
+			       cr.sort_order,
+			       CASE WHEN cr.owner_id = $1 THEN 'owner' ELSE 'crew' END AS role
+			FROM calendar_runs cr
+			LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
+			WHERE cr.run_date = $2::date AND cr.deleted_at IS NULL
+			  AND (
+			    cr.owner_id = $1
+			    OR EXISTS(SELECT 1 FROM run_invites ri WHERE ri.run_id = cr.id AND ri.member_owner_id = $1 AND ri.status = 'accepted')
+			  )
+		) sub
+		ORDER BY sort_order
 	`, ownerID, date)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
@@ -282,6 +314,7 @@ func (h *PlanHandler) CalendarDay(w http.ResponseWriter, r *http.Request) {
 		MeetupSpot        *string  `json:"meetup_spot,omitempty"`
 		MeetupFeatureType *string  `json:"meetup_feature_type,omitempty"`
 		MeetupFeatureID   *string  `json:"meetup_feature_id,omitempty"`
+		Role              string   `json:"role"` // "owner" | "crew" (web#354 A2 decision #8)
 	}
 
 	runs := []dayRun{}
@@ -290,11 +323,14 @@ func (h *PlanHandler) CalendarDay(w http.ResponseWriter, r *http.Request) {
 		var meetupRapidID, meetupAccessID *string
 		if err := rows.Scan(&dr.ID, &dr.Slug, &dr.UserReachID, &dr.Name,
 			&dr.FlowBand, &dr.FlowColor, &dr.GaugeCFS, &dr.Paddled, &dr.RunTime, &dr.Notes,
-			&dr.MeetupSpot, &meetupRapidID, &meetupAccessID); err != nil {
+			&dr.MeetupSpot, &meetupRapidID, &meetupAccessID, &dr.Role); err != nil {
 			errorResponse(w, http.StatusInternalServerError, "scan failed")
 			return
 		}
-		dr.CanMarkPaddled = !dr.Paddled && canMark
+		// CanMarkPaddled only applies to the caller's OWN run — PATCH
+		// /plan-runs/{id} is owner_id-gated, so a crew member could never
+		// exercise this action on the host's run.
+		dr.CanMarkPaddled = dr.Role == "owner" && !dr.Paddled && canMark
 		dr.MeetupFeatureType, dr.MeetupFeatureID = meetupFeatureTypeID(meetupRapidID, meetupAccessID)
 		runs = append(runs, dr)
 	}
