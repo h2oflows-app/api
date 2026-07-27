@@ -1,12 +1,12 @@
-// Package ics builds RFC 5545 iCalendar payloads for plan invites (#246 A4,
-// reworked #246 A7 for per-run crew: BuildPlanInvite emits one VCALENDAR
-// with MULTIPLE VEVENTs — the plan-spanning all-day event (as before) plus
-// one VEVENT per plan_run, so a recipient can live entirely off the
-// calendar attachment without ever loading the web page (§6 REVISED
-// 2026-07-25: "ICS carries the whole plan"). Pure string templating, no
-// third-party library — hand-rolling keeps the escaping/folding exactly
-// matched to what Apple/Google Calendar import needs (verified against
-// both, see ics_test.go).
+// Package ics builds RFC 5545 iCalendar payloads for run invites (#246 A4,
+// reworked #246 A7 for per-run crew, reworked AGAIN web#354 A2: invites are
+// Run-scoped only now — BuildRunInvite emits ONE VCALENDAR with a SINGLE
+// VEVENT for exactly one run, replacing the old multi-VEVENT whole-plan
+// BuildPlanInvite (one plan-spanning all-day VEVENT + one VEVENT per
+// invited run). Pure string templating, no third-party library —
+// hand-rolling keeps the escaping/folding exactly matched to what
+// Apple/Google Calendar import needs (verified against both, see
+// ics_test.go).
 package ics
 
 import (
@@ -14,60 +14,29 @@ import (
 	"time"
 )
 
-// PlanInviteRun is one plan_run rendered as its own VEVENT inside the plan's
-// VCALENDAR — RunTime set renders a timed event (DTSTART date+time, no
-// TZID/Z — RFC 5545 "floating time" form, interpreted in the viewer's local
-// zone, the simplest correct choice absent a stored per-run TZID) with a
-// placeholder PT2H DURATION (river-run length isn't tracked); RunTime empty
-// renders an all-day event on RunDate, same DTEND-exclusive convention as
-// the plan VEVENT.
-type PlanInviteRun struct {
-	// ID becomes part of UID={PlanID}-{ID}@h2oflows.app — unique per run
-	// within the plan.
-	ID string
+// RunInviteInput is the data BuildRunInvite needs to render one run invite
+// as a single-VEVENT VCALENDAR.
+type RunInviteInput struct {
+	// RunID becomes UID={RunID}@h2oflows.app.
+	RunID string
 	// Name is user/reach-derived -> SUMMARY, TEXT-escaped.
 	Name string
 	// RunDate is YYYY-MM-DD.
 	RunDate string
-	// RunTime is HH:MM or HH:MM:SS (24h), or "" for an all-day run.
+	// RunTime is HH:MM or HH:MM:SS (24h), or "" for an all-day run —
+	// renders a timed event (DTSTART floating date-time + a placeholder
+	// PT2H DURATION; river-run length isn't tracked) when set, else an
+	// all-day event on RunDate (DTSTART/DTEND;VALUE=DATE, DTEND exclusive
+	// per the RFC 5545 all-day convention).
 	RunTime string
-	// Invited marks this as one of the recipient's invited runs — prefixes
-	// SUMMARY with "You're invited: " (contract §6: "invited runs marked in
-	// their SUMMARY/DESCRIPTION").
-	Invited bool
-	// MeetupSpot ("meet up at", product request 2026-07-25) -> this VEVENT's
-	// LOCATION, TEXT-escaped, when non-empty. Empty falls back to the
-	// enclosing PlanInviteInput.Location (the plan-level location) — see
-	// BuildPlanInvite/runVEvent.
-	MeetupSpot string
-}
-
-// PlanInviteInput is the data BuildPlanInvite needs to render one plan as a
-// multi-VEVENT VCALENDAR: one all-day VEVENT spanning the whole plan, plus
-// one VEVENT per entry in Runs.
-type PlanInviteInput struct {
-	// PlanID becomes UID={PlanID}@h2oflows.app for the plan-spanning VEVENT,
-	// and the UID prefix ({PlanID}-{run.ID}@h2oflows.app) for each run VEVENT.
-	PlanID string
-	// Name is user input -> SUMMARY, TEXT-escaped.
-	Name string
-	// Location is user input -> LOCATION, TEXT-escaped. Omitted entirely
+	// MeetupSpot ("meet up at") -> LOCATION, TEXT-escaped. Omitted entirely
 	// when empty.
-	Location string
-	// StartDate/EndDate are YYYY-MM-DD, both inclusive of the trip's actual
-	// dates -> DTSTART;VALUE=DATE=StartDate, DTEND;VALUE=DATE=EndDate+1 (the
-	// RFC 5545 all-day convention: DTEND is exclusive).
-	StartDate string
-	EndDate   string
+	MeetupSpot string
 	// URL -> URL (not escaped; this is always a URI we construct, never raw
 	// user input).
 	URL string
-	// Runs renders one additional VEVENT per entry, in the given order
-	// (callers pass them run_date/sort_order-ordered — the itinerary order).
-	Runs []PlanInviteRun
-	// Now stamps DTSTAMP (same instant reused for every VEVENT in the
-	// output). Zero value defaults to time.Now().UTC() — tests pin this
-	// explicitly for deterministic golden output.
+	// Now stamps DTSTAMP. Zero value defaults to time.Now().UTC() — tests
+	// pin this explicitly for deterministic golden output.
 	Now time.Time
 }
 
@@ -86,92 +55,36 @@ const (
 	maxFoldOctets = 75
 )
 
-// BuildPlanInvite renders a multi-VEVENT VCALENDAR for a plan invite email
-// attachment. Strictly RFC 5545: VERSION:2.0, PRODID, METHOD:PUBLISH, one
-// DTSTAMP (UTC, required) per VEVENT, TEXT-escaped SUMMARY/LOCATION (plan
-// names/run names are user/reach-derived input), CRLF line endings,
-// 75-octet line folding. Shaped for, and manually verified against, Apple
-// Calendar and Google Calendar .ics import.
-func BuildPlanInvite(in PlanInviteInput) string {
+// BuildRunInvite renders a single-VEVENT VCALENDAR for a run invite email
+// attachment (web#354 A2 — replaces the multi-VEVENT whole-plan
+// BuildPlanInvite). Strictly RFC 5545: VERSION:2.0, PRODID, METHOD:PUBLISH,
+// one DTSTAMP (UTC, required), TEXT-escaped SUMMARY/LOCATION (run/reach
+// names are user/reach-derived input), CRLF line endings, 75-octet line
+// folding. Shaped for, and manually verified against, Apple Calendar and
+// Google Calendar .ics import.
+func BuildRunInvite(in RunInviteInput) string {
 	now := in.Now
 	if now.IsZero() {
 		now = time.Now()
 	}
 	now = now.UTC()
 
-	start, err := time.Parse(inputDateLayout, in.StartDate)
+	rd, err := time.Parse(inputDateLayout, in.RunDate)
 	if err != nil {
-		start = now
+		rd = now
 	}
-	end, err := time.Parse(inputDateLayout, in.EndDate)
-	if err != nil {
-		end = start
-	}
-	dtend := end.AddDate(0, 0, 1) // exclusive per RFC 5545 all-day convention
 
 	lines := []string{
 		"BEGIN:VCALENDAR",
 		"VERSION:2.0",
 		"PRODID:-//h2oflows//Trip Calendar//EN",
 		"METHOD:PUBLISH",
-	}
-	lines = append(lines, planVEvent(in, now, start, dtend)...)
-	for _, run := range in.Runs {
-		lines = append(lines, runVEvent(in.PlanID, run, in.Location, now)...)
-	}
-	lines = append(lines, "END:VCALENDAR")
-
-	folded := make([]string, len(lines))
-	for i, l := range lines {
-		folded[i] = foldLine(l)
-	}
-	return strings.Join(folded, "\r\n") + "\r\n"
-}
-
-// planVEvent is the plan-spanning all-day VEVENT — unchanged in shape from
-// the original single-VEVENT BuildPlanInvite (#246 A4).
-func planVEvent(in PlanInviteInput, now, start, dtend time.Time) []string {
-	lines := []string{
 		"BEGIN:VEVENT",
-		"UID:" + in.PlanID + "@h2oflows.app",
-		"DTSTAMP:" + now.Format(icsDateTimeLayout),
-		"DTSTART;VALUE=DATE:" + start.Format(icsDateLayout),
-		"DTEND;VALUE=DATE:" + dtend.Format(icsDateLayout),
-		"SUMMARY:" + escapeText(in.Name),
-	}
-	if in.Location != "" {
-		lines = append(lines, "LOCATION:"+escapeText(in.Location))
-	}
-	if in.URL != "" {
-		lines = append(lines, "URL:"+in.URL)
-	}
-	lines = append(lines, "END:VEVENT")
-	return lines
-}
-
-// runVEvent renders one plan_run as its own VEVENT — timed (DTSTART
-// floating date-time + DURATION:PT2H) when RunTime is set, else all-day
-// (DTSTART/DTEND;VALUE=DATE) on RunDate, matching planVEvent's exclusive-
-// DTEND convention. LOCATION ("meet up at", product request 2026-07-25) is
-// run.MeetupSpot when set, else planLocation (the plan-level LOCATION) —
-// omitted entirely when both are empty, same as planVEvent's LOCATION.
-func runVEvent(planID string, run PlanInviteRun, planLocation string, now time.Time) []string {
-	rd, err := time.Parse(inputDateLayout, run.RunDate)
-	if err != nil {
-		rd = now
-	}
-
-	summary := run.Name
-	if run.Invited {
-		summary = "You're invited: " + summary
-	}
-
-	lines := []string{
-		"BEGIN:VEVENT",
-		"UID:" + planID + "-" + run.ID + "@h2oflows.app",
+		"UID:" + in.RunID + "@h2oflows.app",
 		"DTSTAMP:" + now.Format(icsDateTimeLayout),
 	}
-	if rt, ok := parseRunTime(run.RunTime); ok {
+
+	if rt, ok := parseRunTime(in.RunTime); ok {
 		dtstart := time.Date(rd.Year(), rd.Month(), rd.Day(), rt.Hour(), rt.Minute(), rt.Second(), 0, time.UTC)
 		lines = append(lines,
 			"DTSTART:"+dtstart.Format(icsFloatingLayout),
@@ -183,19 +96,26 @@ func runVEvent(planID string, run PlanInviteRun, planLocation string, now time.T
 			"DTEND;VALUE=DATE:"+rd.AddDate(0, 0, 1).Format(icsDateLayout),
 		)
 	}
-	lines = append(lines, "SUMMARY:"+escapeText(summary))
-	if loc := run.MeetupSpot; loc != "" {
-		lines = append(lines, "LOCATION:"+escapeText(loc))
-	} else if planLocation != "" {
-		lines = append(lines, "LOCATION:"+escapeText(planLocation))
+
+	lines = append(lines, "SUMMARY:"+escapeText(in.Name))
+	if in.MeetupSpot != "" {
+		lines = append(lines, "LOCATION:"+escapeText(in.MeetupSpot))
 	}
-	lines = append(lines, "END:VEVENT")
-	return lines
+	if in.URL != "" {
+		lines = append(lines, "URL:"+in.URL)
+	}
+	lines = append(lines, "END:VEVENT", "END:VCALENDAR")
+
+	folded := make([]string, len(lines))
+	for i, l := range lines {
+		folded[i] = foldLine(l)
+	}
+	return strings.Join(folded, "\r\n") + "\r\n"
 }
 
-// parseRunTime accepts "HH:MM:SS" or "HH:MM" (both shapes plan_runs.run_time
-// can come back as text ::text-cast from Postgres TIME); ok=false for ""
-// (all-day run) or an unparseable value.
+// parseRunTime accepts "HH:MM:SS" or "HH:MM" (both shapes calendar_runs.
+// run_time can come back as text ::text-cast from Postgres TIME); ok=false
+// for "" (all-day run) or an unparseable value.
 func parseRunTime(s string) (time.Time, bool) {
 	if s == "" {
 		return time.Time{}, false
@@ -213,7 +133,7 @@ func parseRunTime(s string) (time.Time, bool) {
 // semicolon are backslash-escaped, and newlines become the literal two-byte
 // sequence "\n" (a backslash followed by the letter n — NOT an actual line
 // break, which would corrupt the content-line structure of the .ics file).
-// Required because plan names/locations are free-form user input that can
+// Required because run names/meetup spots are free-form user input that can
 // contain any of these.
 func escapeText(s string) string {
 	var b strings.Builder

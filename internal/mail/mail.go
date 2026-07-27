@@ -43,7 +43,7 @@ type Message struct {
 // Mailer sends a single Message. Implementations must be safe to call from a
 // detached goroutine — invite sends are fired async with their own
 // context.Background()-derived context (see internal/handlers/invites.go
-// sendInviteMail) because the triggering HTTP request's context dies at
+// sendRunInviteMail) because the triggering HTTP request's context dies at
 // response.
 type Mailer interface {
 	Send(ctx context.Context, msg Message) error

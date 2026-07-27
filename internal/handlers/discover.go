@@ -193,7 +193,8 @@ type discoverCrewMeter struct {
 // flat, run_date-sorted list of runs directly: events are owner-only now
 // (no visibility concept to gate a public browse on), so a run's own
 // looking_for_crew + future/today is the only qualifying signal. Crew count
-// still reads plan_members (unchanged in A1, keyed by plan_run_id).
+// reads run_invites (re-keyed web#354 A2, was plan_members, keyed by
+// plan_run_id).
 type discoverCrewRun struct {
 	RunID      string            `json:"plan_run_id"`
 	Name       string            `json:"name"`
@@ -263,6 +264,9 @@ func (h *DiscoverHandler) ListPlans(w http.ResponseWriter, r *http.Request) {
 	}
 	todayStr := today.Format("2006-01-02")
 
+	// AND NOT cr.paddled (web#354 A2 review follow-up): a run someone already
+	// logged is no longer a live crew-call — exclude it from the public
+	// browse even if looking_for_crew was never explicitly turned off.
 	rows, err := h.db.Query(ctx, `
 		SELECT cr.id::text, COALESCE(ur.name, 'Paddle'), COALESCE(up.handle, 'h2oflows'),
 		       cr.run_date::text, cr.run_time::text,
@@ -272,10 +276,10 @@ func (h *DiscoverHandler) ListPlans(w http.ResponseWriter, r *http.Request) {
 		LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
 		LEFT JOIN user_profiles up ON up.owner_id = cr.owner_id
 		LEFT JOIN LATERAL (
-			SELECT COUNT(*) AS filled FROM plan_members pm
-			WHERE pm.plan_run_id = cr.id AND pm.status = 'accepted'
+			SELECT COUNT(*) AS filled FROM run_invites ri
+			WHERE ri.run_id = cr.id AND ri.status = 'accepted'
 		) cm ON true
-		WHERE cr.looking_for_crew AND cr.run_date >= $5::date AND cr.deleted_at IS NULL
+		WHERE cr.looking_for_crew AND NOT cr.paddled AND cr.run_date >= $5::date AND cr.deleted_at IS NULL
 		  AND ($1 = '' OR COALESCE(ur.name, '') ILIKE '%' || $1 || '%' OR COALESCE(cr.meetup_spot, '') ILIKE '%' || $1 || '%')
 		  AND ($2::float8 IS NULL OR ur.class_max >= $2)
 		  AND ($3::float8 IS NULL OR ur.class_min <= $3)

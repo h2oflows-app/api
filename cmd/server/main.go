@@ -323,19 +323,28 @@ func main() {
 		r.Get("/me/calendar", plans.Calendar)
 		r.Get("/me/calendar/day", plans.CalendarDay)
 
-		// #246 A4: invites + crew (plan_members) + mail/.ics.
-		// #246 A7: crew/RSVP is now PER-RUN — POST /plans/{id}/join and
+		// #246 A4: invites + crew (table run_invites, was plan_members through
+		// the A1 bridge — web#354 A2/migration 000146 dropped plan_members
+		// entirely) + mail/.ics.
+		// #246 A7: crew/RSVP is PER-RUN — POST /plans/{id}/join and
 		// /plans/{id}/crew* are REMOVED (replaced by the /plan-runs/{id}/*
 		// routes below, grouped with the rest of the plan-run routes).
-		r.Post("/plans/{id}/invite", invites.InviteToPlan)
-		r.Post("/plans/{id}/invite/resend", invites.ResendInvite)
+		// web#354 A2: invites are ALSO per-run now — POST /plans/{id}/invite(
+		// +/resend) are REMOVED (replaced by /plan-runs/{id}/invite(+/resend)
+		// below; a single invite targets exactly one run, no more plan-wide
+		// fan-out). Route param names below are cosmetic (chi doesn't expose
+		// them on the wire) — {id}/{inviteId} read more clearly than the old
+		// {memberId} now that the underlying table is run_invites, not
+		// plan_members.
+		r.Post("/plan-runs/{id}/invite", invites.InviteToRun)
+		r.Post("/plan-runs/{id}/invite/resend", invites.ResendInvite)
 		r.Get("/me/invites", invites.MyInvites)
-		r.Post("/invites/{memberId}/accept", invites.AcceptInvite)
-		r.Post("/invites/{memberId}/dismiss", invites.DismissInvite)
+		r.Post("/invites/{id}/accept", invites.AcceptInvite)
+		r.Post("/invites/{id}/dismiss", invites.DismissInvite)
 		r.Post("/plan-runs/{id}/join", invites.JoinRun)
 		r.Get("/plan-runs/{id}/crew", invites.RunCrewList)
-		r.Post("/plan-runs/{id}/crew/{memberId}/accept", invites.RunCrewAccept)
-		r.Post("/plan-runs/{id}/crew/{memberId}/decline", invites.RunCrewDecline)
+		r.Post("/plan-runs/{id}/crew/{inviteId}/accept", invites.RunCrewAccept)
+		r.Post("/plan-runs/{id}/crew/{inviteId}/decline", invites.RunCrewDecline)
 
 		// #246 A5: nudge + season + calendar prefs.
 		r.Get("/me/nudge/candidate", nudges.Candidate)
