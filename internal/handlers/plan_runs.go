@@ -361,8 +361,11 @@ func (h *PlanHandler) GetRun(w http.ResponseWriter, r *http.Request) {
 // runInviteTokenGrant reports whether the raw ?invite= token (hashed) grants
 // access to THIS specific run — web#354 A1: the token carve-out moves from
 // the event page to the run page, and now grants exactly the one run it's
-// checked against, not a whole event's fan-out. Still reads plan_members
-// (unchanged in A1); re-keyed to plan_run_id instead of plan_id.
+// checked against, not a whole event's fan-out. web#354 A2: re-keyed to
+// run_invites (run_id, was plan_members.plan_run_id) — a token stops
+// granting access the moment AcceptInvite consumes it (nulls
+// invite_token_hash on accept), so this is single-use by construction, not
+// by any extra bookkeeping here.
 func runInviteTokenGrant(ctx context.Context, db *pgxpool.Pool, runID, token string) bool {
 	if token == "" || runID == "" {
 		return false
@@ -371,7 +374,7 @@ func runInviteTokenGrant(ctx context.Context, db *pgxpool.Pool, runID, token str
 	hash := hex.EncodeToString(sum[:])
 	var exists bool
 	_ = db.QueryRow(ctx, `
-		SELECT EXISTS(SELECT 1 FROM plan_members WHERE plan_run_id = $1::uuid AND invite_token_hash = $2)
+		SELECT EXISTS(SELECT 1 FROM run_invites WHERE run_id = $1::uuid AND invite_token_hash = $2)
 	`, runID, hash).Scan(&exists)
 	return exists
 }
@@ -396,16 +399,21 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 		       cr.looking_for_crew, cr.max_crew, COALESCE(cm.filled, 0),
 		       cr.meetup_spot, cr.meetup_rapid_id::text, cr.meetup_access_id::text,
 		       cr.owner_id,
-		       ur.slug, ur.owner_id::text, urp.handle
+		       ur.slug, ur.owner_id::text, urp.handle,
+		       me.status, me.id
 		FROM calendar_runs cr
 		LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
 		LEFT JOIN user_profiles urp ON urp.owner_id = ur.owner_id
 		LEFT JOIN LATERAL (
-			SELECT COUNT(*) AS filled FROM plan_members pm
-			WHERE pm.plan_run_id = cr.id AND pm.status = 'accepted'
+			SELECT COUNT(*) AS filled FROM run_invites ri
+			WHERE ri.run_id = cr.id AND ri.status = 'accepted'
 		) cm ON true
+		LEFT JOIN LATERAL (
+			SELECT ri.id::text, ri.status::text FROM run_invites ri
+			WHERE ri.run_id = cr.id AND ri.member_owner_id = $2
+		) me ON true
 		WHERE cr.id = $1 AND cr.deleted_at IS NULL
-	`, runID).Scan(
+	`, runID, callerID).Scan(
 		&run.ID, &run.Slug, &run.UserReachID, &run.Name, &run.RunDate, &runTime,
 		&run.SortOrder, &run.GaugeCFS, &run.FlowBand, &run.FlowColor, &run.Paddled, &paddledAtRaw,
 		&run.Notes, &run.Companions, &createdAtRaw,
@@ -413,12 +421,17 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 		&run.MeetupSpot, &meetupRapidID, &meetupAccessID,
 		&hostOwnerID,
 		&run.UserReachSlug, &userReachOwnerID, &userReachOwnerHandle,
+		&run.MyRSVP, &run.MyMemberID,
 	)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "run not found")
 		return
 	}
 	run.RunTime = runTime
+	// is_owner (web#354 A2 — added on top of A1/W1 review: W1 hid owner
+	// affordances for lack of a signal). callerID is "" for an anonymous
+	// caller, which never equals a real hostOwnerID.
+	run.IsOwner = callerOK && callerID == hostOwnerID
 	if paddledAtRaw != nil {
 		s := paddledAtRaw.Format(time.RFC3339)
 		run.PaddledAt = &s
@@ -436,8 +449,8 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 	// web#354 A1 visibility gate (§1, binding), replacing the old
 	// "parent event public/private" check: owner, OR paddled=true (any
 	// authenticated user — "only trips that have logs may be seen by other
-	// h2oflows users"), OR invited/crew (a plan_members row for THIS run,
-	// unchanged in A1), OR looking_for_crew AND run_date >= the caller's
+	// h2oflows users"), OR invited/crew (a run_invites row for THIS run,
+	// re-keyed web#354 A2), OR looking_for_crew AND run_date >= the caller's
 	// local today, OR a valid ?invite= token scoped to this run (the sole
 	// anon carve-out — moved here from the event page). Anon without a
 	// grant gets 401; authed without a grant gets 404. This is NOT an
@@ -450,7 +463,7 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 		return
 	}
 
-	allowed := tokenGrant || run.Paddled || (callerOK && callerID == hostOwnerID)
+	allowed := tokenGrant || run.Paddled || run.IsOwner
 	if !allowed && callerOK {
 		if run.Crew.LookingForCrew {
 			if today, terr := userToday(ctx, h.db, callerID); terr == nil {
@@ -459,8 +472,8 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 		}
 		if !allowed {
 			h.db.QueryRow(ctx, `
-				SELECT EXISTS(SELECT 1 FROM plan_members
-					WHERE plan_run_id = $1 AND member_owner_id = $2 AND status IN ('invited','accepted'))
+				SELECT EXISTS(SELECT 1 FROM run_invites
+					WHERE run_id = $1 AND member_owner_id = $2 AND status IN ('invited','accepted'))
 			`, run.ID, callerID).Scan(&allowed)
 		}
 	}
@@ -756,8 +769,8 @@ func (h *PlanHandler) DeleteRun(w http.ResponseWriter, r *http.Request) {
 }
 
 // ── POST /plan-runs/{id}/log-mine ────────────────────────────────────────
-// The caller — the host or an accepted crew member (plan_members, unchanged
-// in A1) — gets their own paddled log of this same river run without
+// The caller — the host or an accepted crew member (run_invites, re-keyed
+// web#354 A2) — gets their own paddled log of this same river run without
 // touching the host's run: "your logged flows stay yours."
 
 func (h *PlanHandler) LogMine(w http.ResponseWriter, r *http.Request) {
@@ -788,7 +801,7 @@ func (h *PlanHandler) LogMine(w http.ResponseWriter, r *http.Request) {
 	allowed := ownerID == hostOwnerID
 	if !allowed {
 		h.db.QueryRow(ctx,
-			`SELECT EXISTS(SELECT 1 FROM plan_members WHERE plan_run_id = $1::uuid AND member_owner_id = $2 AND status = 'accepted')`,
+			`SELECT EXISTS(SELECT 1 FROM run_invites WHERE run_id = $1::uuid AND member_owner_id = $2 AND status = 'accepted')`,
 			sourceRunID, ownerID,
 		).Scan(&allowed)
 	}
