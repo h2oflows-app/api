@@ -32,9 +32,11 @@ import (
 // anymore — both dropped). Deleting an event tombstones the event alone;
 // its runs are never touched.
 //
-// plan_members (crew/RSVP + invites) is UNCHANGED in A1 — it outlives this
-// migration wave and gets replaced by run_invites in A2 (000146). Its
-// plan_run_id column still keys per-run crew/RSVP embeds below.
+// run_invites (crew/RSVP + invites, table `run_invites`, was `plan_members`
+// through the A1 bridge window) is web#354 A2's rework — migration 000146
+// drops plan_members and replaces it with a fresh, Run-scoped-only table
+// (no plan_id/event_id at all). Its run_id column keys the per-run crew/RSVP
+// embeds below.
 type PlanHandler struct {
 	db            *pgxpool.Pool
 	devFallbackID string
@@ -206,19 +208,19 @@ func uniqueRunSlug(ctx context.Context, q dbQueryer, ownerID, base string) strin
 	return fmt.Sprintf("%s-%d", base, time.Now().UnixMilli())
 }
 
-// runFilled counts plan_members rows with status='accepted' for planRunID —
-// the shared crew-meter read used by renderPlan/renderPlanRun (per itinerary
+// runFilled counts run_invites rows with status='accepted' for runID — the
+// shared crew-meter read used by renderPlan/renderPlanRun (per itinerary
 // run) and RunCrewList/RunCrewAccept/JoinRun/AcceptInvite (invites.go).
-// plan_members is unchanged in A1 (outlives this migration wave — see the
-// package comment above); this needed no changes for the rename beyond
-// staying as-is. Host is never counted (no membership row for the host).
-// Scan errors propagate as a real error rather than silently failing open to
-// filled=0, which would let an over-cap join/accept through on a transient
-// DB error at any of this function's gating call sites.
-func runFilled(ctx context.Context, q dbQueryer, planRunID string) (int, error) {
+// web#354 A2: re-keyed from plan_members (plan_run_id) to run_invites
+// (run_id) — table dropped/replaced by migration 000146. Host is never
+// counted (no membership row for the host). Scan errors propagate as a real
+// error rather than silently failing open to filled=0, which would let an
+// over-cap join/accept through on a transient DB error at any of this
+// function's gating call sites.
+func runFilled(ctx context.Context, q dbQueryer, runID string) (int, error) {
 	var filled int
 	if err := q.QueryRow(ctx,
-		`SELECT COUNT(*) FROM plan_members WHERE plan_run_id = $1::uuid AND status = 'accepted'`, planRunID,
+		`SELECT COUNT(*) FROM run_invites WHERE run_id = $1::uuid AND status = 'accepted'`, runID,
 	).Scan(&filled); err != nil {
 		return 0, fmt.Errorf("runFilled: %w", err)
 	}
@@ -284,7 +286,12 @@ type planRunSummary struct {
 	MeetupSpot        *string `json:"meetup_spot,omitempty"`
 	MeetupFeatureType *string `json:"meetup_feature_type,omitempty"`
 	MeetupFeatureID   *string `json:"meetup_feature_id,omitempty"`
-	// Per-viewer RSVP on THIS run (the caller's own plan_members row, if
+	// IsOwner: true when the viewer is this run's own owner (web#354 A2,
+	// added on top of A1/W1 review — W1 hid owner-only affordances in the UI
+	// for lack of a signal on GET /plan-runs/{id}). Always populated (not
+	// omitempty) so the web can trust its zero value.
+	IsOwner bool `json:"is_owner"`
+	// Per-viewer RSVP on THIS run (the caller's own run_invites row, if
 	// any): status invited|requested|accepted|declined + the row id the
 	// accept/dismiss endpoints take. Drives the itinerary's per-run accept
 	// buttons + "You're in" state.
@@ -329,12 +336,16 @@ func (h *PlanHandler) Create(w http.ResponseWriter, r *http.Request) {
 		// MaxCrew below) — the event-type/visibility concepts and inline
 		// run/invite creation are gone entirely as of web#354 A1 (runs are
 		// standalone now, created via POST /plan-runs; invites are
-		// event-scoped only via InviteHandler, unchanged), so a stale client
-		// posting any of these must not 400.
+		// Run-scoped only via InviteHandler's POST /plan-runs/{id}/invite,
+		// web#354 A2), so a stale client posting any of these must not 400.
+		// Invites decodes as raw JSON (not a typed []inviteBody — that type
+		// no longer exists; InviteHandler's invite body shape is run-scoped
+		// now, {handle}|{email}, and was never a fit for a plan-level array
+		// anyway) since the value itself is never read past the decode.
 		Type           *string             `json:"type"`
 		Visibility     *string             `json:"visibility"`
 		Runs           []createPlanRunBody `json:"runs"`
-		Invites        []inviteBody        `json:"invites"`
+		Invites        json.RawMessage     `json:"invites"`
 		LookingForCrew *bool               `json:"looking_for_crew"`
 		MaxCrew        *int                `json:"max_crew"`
 	}
@@ -495,8 +506,8 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, eventID
 	// event owner's own calendar_runs whose run_date falls within
 	// [start_date,end_date] — pure date containment, no FK/membership. Since
 	// the viewer here is always the host (asserted above), per-run crew/RSVP
-	// LATERALs read plan_members (unchanged in A1) keyed off the run's own
-	// id via plan_members.plan_run_id.
+	// LATERALs read run_invites (re-keyed web#354 A2, was plan_members)
+	// keyed off the run's own id via run_invites.run_id.
 	rows, err := h.db.Query(ctx, `
 		SELECT cr.id, cr.slug, cr.user_reach_id::text, ur.name, cr.run_date::text, cr.run_time::text,
 		       cr.sort_order, cr.gauge_cfs, cr.flow_band, cr.flow_color, cr.paddled, cr.paddled_at,
@@ -507,12 +518,12 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, eventID
 		FROM calendar_runs cr
 		LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
 		LEFT JOIN LATERAL (
-			SELECT COUNT(*) AS filled FROM plan_members pm
-			WHERE pm.plan_run_id = cr.id AND pm.status = 'accepted'
+			SELECT COUNT(*) AS filled FROM run_invites ri
+			WHERE ri.run_id = cr.id AND ri.status = 'accepted'
 		) cm ON true
 		LEFT JOIN LATERAL (
-			SELECT pm.id::text, pm.status::text FROM plan_members pm
-			WHERE pm.plan_run_id = cr.id AND pm.member_owner_id = $1
+			SELECT ri.id::text, ri.status::text FROM run_invites ri
+			WHERE ri.run_id = cr.id AND ri.member_owner_id = $1
 		) me ON true
 		WHERE cr.owner_id = $1 AND cr.run_date BETWEEN $2::date AND $3::date AND cr.deleted_at IS NULL
 		ORDER BY cr.run_date, cr.sort_order
@@ -547,6 +558,10 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, eventID
 		}
 		run.CreatedAt = createdAtRaw.Format(time.RFC3339)
 		run.MeetupFeatureType, run.MeetupFeatureID = meetupFeatureTypeID(meetupRapidID, meetupAccessID)
+		// The itinerary viewer is always the event's host (asserted above,
+		// callerID == ed.HostOwnerID) — every run listed here is the
+		// caller's own.
+		run.IsOwner = true
 
 		if _, seen := runsByDate[run.RunDate]; !seen {
 			dateOrder = append(dateOrder, run.RunDate)
