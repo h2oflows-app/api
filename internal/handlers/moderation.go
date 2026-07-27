@@ -166,8 +166,9 @@ func (h *ModerationHandler) FlagPlanRun(w http.ResponseWriter, r *http.Request) 
 	// join on either) — mirror renderPlanRun's new gate instead: 404 unless
 	// the run is paddled (any authed user may see/flag a logged run), the
 	// reporter is the run's own owner, or an accepted/invited crew member
-	// (plan_members, unchanged in A1, keyed by plan_run_id) — same
-	// no-existence-oracle shape as FlagRun's public gate above.
+	// (run_invites, re-keyed web#354 A2, was plan_members, keyed by
+	// plan_run_id) — same no-existence-oracle shape as FlagRun's public gate
+	// above.
 	var exists bool
 	if err := h.db.QueryRow(ctx, `
 		SELECT EXISTS(
@@ -177,9 +178,9 @@ func (h *ModerationHandler) FlagPlanRun(w http.ResponseWriter, r *http.Request) 
 			    cr.paddled
 			    OR cr.owner_id = $2
 			    OR EXISTS(
-			      SELECT 1 FROM plan_members pm
-			      WHERE pm.plan_run_id = cr.id AND pm.member_owner_id = $2
-			        AND pm.status IN ('invited','accepted')
+			      SELECT 1 FROM run_invites ri
+			      WHERE ri.run_id = cr.id AND ri.member_owner_id = $2
+			        AND ri.status IN ('invited','accepted')
 			    )
 			  )
 		)
