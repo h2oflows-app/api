@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/h2oflow/h2oflow/apps/api/internal/ai"
+	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -886,6 +887,14 @@ func (h *ReachHandler) GlobalAsk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// web#354 A1 major fix (findings[1]): POST /ask is registered under
+	// auth.Optional (main.go) — fully anon-reachable, no ownerID gate. authed
+	// is threaded down through asker.Answer -> loadReachReports so an
+	// anonymous caller never receives the calendar_runs notes corpus (§1:
+	// "Anon: sees no calendar items"); the curated reach/gauge context this
+	// handler loads below is unaffected either way.
+	_, authed := auth.UserIDFromContext(r.Context())
+
 	var body struct {
 		Question string `json:"question"`
 	}
@@ -970,7 +979,7 @@ func (h *ReachHandler) GlobalAsk(w http.ResponseWriter, r *http.Request) {
 				log.Printf("global ask: reach not found for slug %q: %v", slug, err)
 				return
 			}
-			answer, err := h.asker.Answer(askCtx, reachID, reachName, identified.Question)
+			answer, err := h.asker.Answer(askCtx, reachID, reachName, identified.Question, authed)
 			if err != nil {
 				log.Printf("global ask answer [%s]: %v", slug, err)
 				return
@@ -1002,11 +1011,19 @@ func (h *ReachHandler) GlobalAsk(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, map[string]any{"results": finalResults})
 }
 
-// Stats handles GET /api/v1/stats — cached 60 s.
+// Stats handles GET /api/v1/stats — cached 60 s. The underlying counts are
+// cached process-wide regardless of caller (cheap, non-sensitive aggregates
+// on their own), but the "reports" figure — derived from calendar_runs, the
+// calendar domain — is only ever included in the RESPONSE for an
+// authenticated caller (web#354 A1 major fix, findings[2]/§1: "Anon: sees no
+// calendar items"). This route is registered under auth.Optional
+// (main.go), so anon reaches it directly.
 func (h *ReachHandler) Stats(w http.ResponseWriter, r *http.Request) {
+	_, authed := auth.UserIDFromContext(r.Context())
+
 	const ttl = 60 * time.Second
 	if reaches, rivers, reports, ok := h.sc.get(ttl); ok {
-		jsonResponse(w, http.StatusOK, buildStatsResponse(reaches, rivers, reports))
+		jsonResponse(w, http.StatusOK, buildStatsResponse(reaches, rivers, reports, authed))
 		return
 	}
 
@@ -1014,25 +1031,28 @@ func (h *ReachHandler) Stats(w http.ResponseWriter, r *http.Request) {
 	// runs-unify 5a: count sentinel-owned twins in user_reaches (the curated runs).
 	h.db.QueryRow(r.Context(), `SELECT COUNT(*) FROM user_reaches WHERE owner_id = '00000000-0000-0000-0000-000000000001' AND deleted_at IS NULL`).Scan(&reaches)
 	h.db.QueryRow(r.Context(), `SELECT COUNT(*) FROM rivers`).Scan(&rivers)
-	// #246 A6 repoint (PART 2 item 4): plan_runs is the superset of `reports`
-	// post-000143 backfill — count live rows with a live parent plan, same
-	// tombstone + live-parent join discipline every other plan_runs read in
-	// this codebase follows.
+	// #246 A6 repoint (PART 2 item 4): calendar_runs (was plan_runs) is the
+	// superset of `reports` post-000143 backfill — count live rows. web#354
+	// A1 dropped calendar_runs.plan_id (decoupled from events) entirely, so
+	// the old "live parent plan" join is gone too — deleted_at IS NULL alone
+	// now determines liveness.
 	h.db.QueryRow(r.Context(), `
-		SELECT COUNT(*) FROM plan_runs pr
-		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
-		WHERE pr.deleted_at IS NULL
+		SELECT COUNT(*) FROM calendar_runs cr
+		WHERE cr.deleted_at IS NULL
 	`).Scan(&reports)
 	h.sc.set(reaches, rivers, reports)
-	jsonResponse(w, http.StatusOK, buildStatsResponse(reaches, rivers, reports))
+	jsonResponse(w, http.StatusOK, buildStatsResponse(reaches, rivers, reports, authed))
 }
 
-func buildStatsResponse(reaches, rivers, reports int) map[string]any {
+// buildStatsResponse omits "reports" entirely for an anonymous caller
+// (authed=false) — web#354 A1 major fix (findings[2]): calendar_runs-derived
+// numbers are auth-only, matching every other paddled-run reader post-A1.
+func buildStatsResponse(reaches, rivers, reports int, authed bool) map[string]any {
 	m := map[string]any{
 		"reaches": reaches,
 		"rivers":  rivers,
 	}
-	if reports > 0 {
+	if authed && reports > 0 {
 		m["reports"] = reports
 	}
 	return m

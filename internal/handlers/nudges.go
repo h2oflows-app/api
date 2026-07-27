@@ -17,12 +17,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// NudgeHandler handles /me/nudge/*, /me/season, and /me/calendar-prefs
-// (#246 A5 — Trip Calendar nudge/season/prefs). Split into its own file/
-// handler type from PlanHandler for the same reason InviteHandler is
-// (invites.go comment): a distinct concern, sharing only the package-level
-// helpers (dbQueryer, userToday, localNoonUTC, parseDate, ensureHandle,
-// findOrCreatePaddledLog) defined in plans.go/plan_runs.go.
+// NudgeHandler handles /me/nudge/*, /me/season, and /me/calendar-prefs.
+// Split into its own file/handler type from PlanHandler for the same reason
+// InviteHandler is (invites.go comment): a distinct concern, sharing only
+// the package-level helpers (dbQueryer, userToday, localNoonUTC, parseDate,
+// ensureHandle, findOrCreatePaddledLog) defined in plans.go/plan_runs.go.
 type NudgeHandler struct {
 	db            *pgxpool.Pool
 	devFallbackID string
@@ -46,25 +45,28 @@ func (h *NudgeHandler) ownerID(r *http.Request) (string, bool) {
 // ── Tier-A/Tier-B candidate scan (shared by Candidate, calendar.go's
 //    needs_confirm, and calendar.go's nudge_dot_dates) ──────────────────────
 
-// tierCandidate is one unpaddled, live plan_run in the scan window, with
+// tierCandidate is one unpaddled, live calendar_run in the scan window, with
 // just enough joined to resolve its flow band.
 type tierCandidate struct {
-	PlanRunID   string
+	RunID       string
 	UserReachID string
 	ReachName   string
 	BaseLabel   string
 	RunDate     string // YYYY-MM-DD
 }
 
-// scanCandidates returns ownerID's unpaddled, live plan_runs with
+// scanCandidates returns ownerID's unpaddled, live calendar_runs with
 // run_date ∈ [from,to], excluding (owner,user_reach_id,run_date) rows in
 // nudge_dismissals (never re-ask) and days that already have a *separate*
-// live paddled plan_run logged for that same reach (contract §5: "Exclude
-// dismissed ... and any date already logged"). Both exclusions are pushed
-// into the query so this stays one set-based read regardless of how wide
-// [from,to] is — the per-row flow lookup is the only unavoidable per-row
-// work (band derivation depends on internal/flow, not SQL) and callers keep
-// that loop bounded by only ever asking for a narrow window.
+// live paddled calendar_run logged for that same reach (contract §5:
+// "Exclude dismissed ... and any date already logged"). Both exclusions are
+// pushed into the query so this stays one set-based read regardless of how
+// wide [from,to] is — the per-row flow lookup is the only unavoidable
+// per-row work (band derivation depends on internal/flow, not SQL) and
+// callers keep that loop bounded by only ever asking for a narrow window.
+//
+// web#354 A1: no more JOIN plans/events — runs are decoupled, so this reads
+// calendar_runs directly by owner_id.
 //
 // requirePriorPaddle, when true, restricts to reaches the caller has paddled
 // at least once (any date) — the Tier-B "quiet dot" rule (contract §5:
@@ -74,31 +76,28 @@ func scanCandidates(ctx context.Context, db dbQueryer, ownerID, from, to string,
 	if requirePriorPaddle {
 		priorPaddleClause = `
 		  AND EXISTS (
-		    SELECT 1 FROM plan_runs pr3
-		    JOIN plans p3 ON p3.id = pr3.plan_id AND p3.deleted_at IS NULL
-		    WHERE pr3.owner_id = pr.owner_id AND pr3.user_reach_id = pr.user_reach_id
-		      AND pr3.paddled AND pr3.deleted_at IS NULL
+		    SELECT 1 FROM calendar_runs cr3
+		    WHERE cr3.owner_id = cr.owner_id AND cr3.user_reach_id = cr.user_reach_id
+		      AND cr3.paddled AND cr3.deleted_at IS NULL
 		  )`
 	}
 
 	rows, err := db.Query(ctx, fmt.Sprintf(`
-		SELECT pr.id, pr.user_reach_id::text, COALESCE(ur.long_name, ur.name), ur.base_label, pr.run_date::text
-		FROM plan_runs pr
-		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
-		JOIN user_reaches ur ON ur.id = pr.user_reach_id AND ur.deleted_at IS NULL
-		WHERE pr.owner_id = $1 AND pr.paddled = false AND pr.deleted_at IS NULL
-		  AND pr.run_date BETWEEN $2::date AND $3::date
+		SELECT cr.id, cr.user_reach_id::text, COALESCE(ur.long_name, ur.name), ur.base_label, cr.run_date::text
+		FROM calendar_runs cr
+		JOIN user_reaches ur ON ur.id = cr.user_reach_id AND ur.deleted_at IS NULL
+		WHERE cr.owner_id = $1 AND cr.paddled = false AND cr.deleted_at IS NULL
+		  AND cr.run_date BETWEEN $2::date AND $3::date
 		  AND NOT EXISTS (
 		    SELECT 1 FROM nudge_dismissals nd
-		    WHERE nd.owner_id = pr.owner_id AND nd.user_reach_id = pr.user_reach_id AND nd.nudge_date = pr.run_date
+		    WHERE nd.owner_id = cr.owner_id AND nd.user_reach_id = cr.user_reach_id AND nd.nudge_date = cr.run_date
 		  )
 		  AND NOT EXISTS (
-		    SELECT 1 FROM plan_runs pr2
-		    JOIN plans p2 ON p2.id = pr2.plan_id AND p2.deleted_at IS NULL
-		    WHERE pr2.owner_id = pr.owner_id AND pr2.user_reach_id = pr.user_reach_id
-		      AND pr2.run_date = pr.run_date AND pr2.paddled AND pr2.deleted_at IS NULL
+		    SELECT 1 FROM calendar_runs cr2
+		    WHERE cr2.owner_id = cr.owner_id AND cr2.user_reach_id = cr.user_reach_id
+		      AND cr2.run_date = cr.run_date AND cr2.paddled AND cr2.deleted_at IS NULL
 		  )%s
-		ORDER BY pr.run_date DESC
+		ORDER BY cr.run_date DESC
 		LIMIT 90
 	`, priorPaddleClause), ownerID, from, to)
 	if err != nil {
@@ -109,7 +108,7 @@ func scanCandidates(ctx context.Context, db dbQueryer, ownerID, from, to string,
 	var out []tierCandidate
 	for rows.Next() {
 		var c tierCandidate
-		if err := rows.Scan(&c.PlanRunID, &c.UserReachID, &c.ReachName, &c.BaseLabel, &c.RunDate); err != nil {
+		if err := rows.Scan(&c.RunID, &c.UserReachID, &c.ReachName, &c.BaseLabel, &c.RunDate); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -361,7 +360,7 @@ func (h *NudgeHandler) Confirm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	planID, runID, existed, ferr := findOrCreatePaddledLog(ctx, h.db, ownerID, body.UserReachID, reachSlug, body.RunDate, body.Notes)
+	runID, existed, ferr := findOrCreatePaddledLog(ctx, h.db, ownerID, body.UserReachID, reachSlug, body.RunDate, body.Notes)
 	if ferr != nil {
 		errorResponse(w, http.StatusInternalServerError, ferr.Error())
 		return
@@ -370,7 +369,7 @@ func (h *NudgeHandler) Confirm(w http.ResponseWriter, r *http.Request) {
 	if existed {
 		status = http.StatusOK
 	}
-	jsonResponse(w, status, map[string]string{"plan_id": planID, "plan_run_id": runID})
+	jsonResponse(w, status, map[string]string{"plan_run_id": runID})
 }
 
 // ── GET /me/calendar-prefs · PATCH /me/calendar-prefs ────────────────────
@@ -506,7 +505,6 @@ type seasonRecentRun struct {
 	FlowColor *string  `json:"flow_color,omitempty"`
 	GaugeCFS  *float64 `json:"gauge_cfs,omitempty"`
 	Notes     *string  `json:"notes,omitempty"`
-	PlanID    string   `json:"plan_id"`
 }
 
 type seasonResponse struct {
@@ -586,35 +584,37 @@ func (h *NudgeHandler) Season(w http.ResponseWriter, r *http.Request) {
 	resp.NewRuns = []seasonNewRun{}
 	resp.Recent = []seasonRecentRun{}
 
+	// web#354 A1: every query below drops JOIN plans/events entirely — runs
+	// are decoupled, so paddled calendar_runs are read directly by
+	// owner+date. Semantics unchanged (paddled runs only).
 	if err := h.db.QueryRow(ctx, `
-		SELECT COUNT(DISTINCT pr.run_date), COUNT(*),
+		SELECT COUNT(DISTINCT cr.run_date), COUNT(*),
 		       COUNT(DISTINCT COALESCE(ur.river_name, ur.id::text))
-		FROM plan_runs pr
-		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
-		LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
-		WHERE pr.owner_id = $1 AND pr.paddled AND pr.deleted_at IS NULL
-		  AND pr.run_date BETWEEN $2::date AND $3::date
+		FROM calendar_runs cr
+		LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
+		WHERE cr.owner_id = $1 AND cr.paddled AND cr.deleted_at IS NULL
+		  AND cr.run_date BETWEEN $2::date AND $3::date
 	`, ownerID, yearStart, yearEnd).Scan(&resp.DaysOnWater, &resp.Runs, &resp.Rivers); err != nil {
 		errorResponse(w, http.StatusInternalServerError, "season stats query failed")
 		return
 	}
 
-	// highest_flow must carry the specific paddled plan_run's own id (routable
-	// via GET /plan-runs/{param}, id-first resolution) plus the reach's slug
-	// (routable via GET /me/reaches/{slug}) — NOT the user_reach UUID, which
-	// resolves via neither route. pr.id/pr.slug are NOT NULL; ur.slug can be
-	// NULL when user_reach_id was cleared (ON DELETE SET NULL).
+	// highest_flow must carry the specific paddled calendar_run's own id
+	// (routable via GET /plan-runs/{param}, id-first resolution) plus the
+	// reach's slug (routable via GET /me/reaches/{slug}) — NOT the
+	// user_reach UUID, which resolves via neither route. cr.id/cr.slug are
+	// NOT NULL; ur.slug can be NULL when user_reach_id was cleared (ON
+	// DELETE SET NULL).
 	var hfCFS *float64
 	var hfRunID string
 	var hfSlug, hfName, hfDate *string
 	if err := h.db.QueryRow(ctx, `
-		SELECT pr.gauge_cfs, pr.id::text, ur.slug, ur.name, pr.run_date::text
-		FROM plan_runs pr
-		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
-		LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
-		WHERE pr.owner_id = $1 AND pr.paddled AND pr.deleted_at IS NULL AND pr.gauge_cfs IS NOT NULL
-		  AND pr.run_date BETWEEN $2::date AND $3::date
-		ORDER BY pr.gauge_cfs DESC
+		SELECT cr.gauge_cfs, cr.id::text, ur.slug, ur.name, cr.run_date::text
+		FROM calendar_runs cr
+		LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
+		WHERE cr.owner_id = $1 AND cr.paddled AND cr.deleted_at IS NULL AND cr.gauge_cfs IS NOT NULL
+		  AND cr.run_date BETWEEN $2::date AND $3::date
+		ORDER BY cr.gauge_cfs DESC
 		LIMIT 1
 	`, ownerID, yearStart, yearEnd).Scan(&hfCFS, &hfRunID, &hfSlug, &hfName, &hfDate); err == nil && hfCFS != nil {
 		resp.HighestFlow = &seasonHighestFlow{CFS: *hfCFS, PlanRunID: hfRunID}
@@ -636,17 +636,16 @@ func (h *NudgeHandler) Season(w http.ResponseWriter, r *http.Request) {
 	// this year) falls within the selected year — scans all paddled history
 	// to find the true first date, filters the group on the year via HAVING.
 	// Grouped/keyed by the user_reach itself (a reach, not a single dated
-	// plan_run), so the routable identifier is ur.slug — reach pages resolve
-	// on GET /me/reaches/{slug}, never by user_reach id.
+	// calendar_run), so the routable identifier is ur.slug — reach pages
+	// resolve on GET /me/reaches/{slug}, never by user_reach id.
 	newRows, err := h.db.Query(ctx, `
-		SELECT ur.slug, ur.name, MIN(pr.run_date)::text AS first_date
-		FROM plan_runs pr
-		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
-		JOIN user_reaches ur ON ur.id = pr.user_reach_id
-		WHERE pr.owner_id = $1 AND pr.paddled AND pr.deleted_at IS NULL
+		SELECT ur.slug, ur.name, MIN(cr.run_date)::text AS first_date
+		FROM calendar_runs cr
+		JOIN user_reaches ur ON ur.id = cr.user_reach_id
+		WHERE cr.owner_id = $1 AND cr.paddled AND cr.deleted_at IS NULL
 		GROUP BY ur.id, ur.slug, ur.name
-		HAVING MIN(pr.run_date) BETWEEN $2::date AND $3::date
-		ORDER BY MIN(pr.run_date)
+		HAVING MIN(cr.run_date) BETWEEN $2::date AND $3::date
+		ORDER BY MIN(cr.run_date)
 	`, ownerID, yearStart, yearEnd)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "new-runs query failed")
@@ -668,12 +667,18 @@ func (h *NudgeHandler) Season(w http.ResponseWriter, r *http.Request) {
 	// Dec 31 -> Jan 1 must not reset just because /me/season?year= is
 	// viewing one calendar year; it's a "right now" number regardless of
 	// which year's stats page is open.
+	// ORDER BY must repeat the exact `::text` cast from the SELECT DISTINCT
+	// list (Postgres rule: "SELECT DISTINCT, ORDER BY expressions must
+	// appear in select list") — pre-existing bug (same shape existed
+	// pre-rename against plan_runs/plans too, caught here via this task's
+	// migration smoke test), fixed opportunistically. Safe: ISO-8601 date
+	// strings sort identically as text or as date (same reasoning as this
+	// package's minDateStr/maxDateStr helpers).
 	dateRows, err := h.db.Query(ctx, `
-		SELECT DISTINCT pr.run_date::text
-		FROM plan_runs pr
-		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
-		WHERE pr.owner_id = $1 AND pr.paddled AND pr.deleted_at IS NULL AND pr.run_date <= $2::date
-		ORDER BY pr.run_date DESC
+		SELECT DISTINCT cr.run_date::text
+		FROM calendar_runs cr
+		WHERE cr.owner_id = $1 AND cr.paddled AND cr.deleted_at IS NULL AND cr.run_date <= $2::date
+		ORDER BY cr.run_date::text DESC
 	`, ownerID, today.Format("2006-01-02"))
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "streak query failed")
@@ -704,18 +709,17 @@ func (h *NudgeHandler) Season(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.GoalDays = goalDays
 
-	// recent: latest 10 paddled plan_runs WITHIN the selected year — a
+	// recent: latest 10 paddled calendar_runs WITHIN the selected year — a
 	// /me/season?year=2024 browsing a past season should show that season's
 	// recent activity, not literally-today's runs.
 	recentRows, err := h.db.Query(ctx, `
-		SELECT pr.id, pr.slug, ur.name, pr.run_date::text, pr.flow_band, pr.flow_color,
-		       pr.gauge_cfs, pr.notes, pr.plan_id::text
-		FROM plan_runs pr
-		JOIN plans p ON p.id = pr.plan_id AND p.deleted_at IS NULL
-		LEFT JOIN user_reaches ur ON ur.id = pr.user_reach_id
-		WHERE pr.owner_id = $1 AND pr.paddled AND pr.deleted_at IS NULL
-		  AND pr.run_date BETWEEN $2::date AND $3::date
-		ORDER BY pr.run_date DESC, pr.paddled_at DESC NULLS LAST
+		SELECT cr.id, cr.slug, ur.name, cr.run_date::text, cr.flow_band, cr.flow_color,
+		       cr.gauge_cfs, cr.notes
+		FROM calendar_runs cr
+		LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
+		WHERE cr.owner_id = $1 AND cr.paddled AND cr.deleted_at IS NULL
+		  AND cr.run_date BETWEEN $2::date AND $3::date
+		ORDER BY cr.run_date DESC, cr.paddled_at DESC NULLS LAST
 		LIMIT 10
 	`, ownerID, yearStart, yearEnd)
 	if err != nil {
@@ -725,7 +729,7 @@ func (h *NudgeHandler) Season(w http.ResponseWriter, r *http.Request) {
 	for recentRows.Next() {
 		var rr seasonRecentRun
 		if err := recentRows.Scan(&rr.ID, &rr.Slug, &rr.Name, &rr.RunDate, &rr.FlowBand, &rr.FlowColor,
-			&rr.GaugeCFS, &rr.Notes, &rr.PlanID); err != nil {
+			&rr.GaugeCFS, &rr.Notes); err != nil {
 			recentRows.Close()
 			errorResponse(w, http.StatusInternalServerError, "recent scan failed")
 			return
