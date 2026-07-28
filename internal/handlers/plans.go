@@ -262,22 +262,30 @@ type runCrewMeter struct {
 // only the Event-wrapper keys (`plan`→`event`, `plans`→`events`) were
 // renamed.
 type planRunSummary struct {
-	ID          string       `json:"id"`
-	Slug        string       `json:"slug"`
-	UserReachID *string      `json:"user_reach_id,omitempty"`
-	Name        *string      `json:"name,omitempty"`
-	RunDate     string       `json:"run_date"`
-	RunTime     *string      `json:"run_time,omitempty"`
-	SortOrder   int16        `json:"sort_order"`
-	GaugeCFS    *float64     `json:"gauge_cfs,omitempty"`
-	FlowBand    *string      `json:"flow_band,omitempty"`
-	FlowColor   *string      `json:"flow_color,omitempty"`
-	Paddled     bool         `json:"paddled"`
-	PaddledAt   *string      `json:"paddled_at,omitempty"`
-	Notes       *string      `json:"notes,omitempty"`
-	Companions  *string      `json:"companions,omitempty"`
-	CreatedAt   string       `json:"created_at,omitempty"`
-	Crew        runCrewMeter `json:"crew"`
+	ID          string  `json:"id"`
+	Slug        string  `json:"slug"`
+	UserReachID *string `json:"user_reach_id,omitempty"`
+	// Name (web#354 A4) is the calendar run's OWN name — calendar_runs.name,
+	// REQUIRED (NOT NULL, mig 000147), so always populated (not omitempty)
+	// unlike the *string fields around it. ReachName is the attached library
+	// run's own name (user_reaches.name — separate from `river_name`
+	// elsewhere in this package, which is the actual named river, e.g.
+	// "Blue River", not the user's own saved-run name, e.g. "Lower Blue");
+	// nil for an orphaned run (user_reach_id cleared, ON DELETE SET NULL).
+	Name       string       `json:"name"`
+	ReachName  *string      `json:"reach_name,omitempty"`
+	RunDate    string       `json:"run_date"`
+	RunTime    *string      `json:"run_time,omitempty"`
+	SortOrder  int16        `json:"sort_order"`
+	GaugeCFS   *float64     `json:"gauge_cfs,omitempty"`
+	FlowBand   *string      `json:"flow_band,omitempty"`
+	FlowColor  *string      `json:"flow_color,omitempty"`
+	Paddled    bool         `json:"paddled"`
+	PaddledAt  *string      `json:"paddled_at,omitempty"`
+	Notes      *string      `json:"notes,omitempty"`
+	Companions *string      `json:"companions,omitempty"`
+	CreatedAt  string       `json:"created_at,omitempty"`
+	Crew       runCrewMeter `json:"crew"`
 	// MeetupSpot/MeetupFeatureType/MeetupFeatureID: "meet up at" — MeetupSpot
 	// is the always-present display text (typed or feature-name snapshot);
 	// the FeatureType/ID pair (present only when a #312 rapid/access feature
@@ -509,7 +517,7 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, eventID
 	// LATERALs read run_invites (re-keyed web#354 A2, was plan_members)
 	// keyed off the run's own id via run_invites.run_id.
 	rows, err := h.db.Query(ctx, `
-		SELECT cr.id, cr.slug, cr.user_reach_id::text, ur.name, cr.run_date::text, cr.run_time::text,
+		SELECT cr.id, cr.slug, cr.name, cr.user_reach_id::text, ur.name, cr.run_date::text, cr.run_time::text,
 		       cr.sort_order, cr.gauge_cfs, cr.flow_band, cr.flow_color, cr.paddled, cr.paddled_at,
 		       cr.notes, cr.companions, cr.created_at,
 		       cr.looking_for_crew, cr.max_crew, COALESCE(cm.filled, 0),
@@ -542,7 +550,7 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, eventID
 		var createdAtRaw time.Time
 		var meetupRapidID, meetupAccessID *string
 		if err := rows.Scan(
-			&run.ID, &run.Slug, &run.UserReachID, &run.Name, &run.RunDate, &run.RunTime,
+			&run.ID, &run.Slug, &run.Name, &run.UserReachID, &run.ReachName, &run.RunDate, &run.RunTime,
 			&run.SortOrder, &run.GaugeCFS, &run.FlowBand, &run.FlowColor, &run.Paddled, &paddledAtRaw,
 			&run.Notes, &run.Companions, &createdAtRaw,
 			&run.Crew.LookingForCrew, &run.Crew.Max, &run.Crew.Filled,

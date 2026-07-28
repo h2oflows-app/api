@@ -224,6 +224,11 @@ func (h *OGHandler) Report(w http.ResponseWriter, r *http.Request) {
 // unauthorized shape as before. The eyebrow line (ReachName) used to show
 // the parent event's name; standalone runs have none, so it now shows the
 // river name instead.
+//
+// web#354 A4: Title's source flips from the library run's own name
+// (COALESCE(ur.long_name, ur.name, 'Paddle')) to the calendar run's own name
+// (cr.name, NOT NULL) — item name primary, river name secondary (the
+// ReachName/eyebrow line, unchanged: still ur.river_name).
 func (h *OGHandler) PlanRun(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.ownerID(r); !ok {
 		http.Error(w, "plan run not found", http.StatusNotFound)
@@ -248,7 +253,7 @@ func (h *OGHandler) PlanRun(w http.ResponseWriter, r *http.Request) {
 	)
 	err := h.db.QueryRow(r.Context(), `
 		SELECT
-			COALESCE(ur.long_name, ur.name, 'Paddle'),
+			cr.name,
 			ur.river_name,
 			up.handle,
 			cr.run_date::text,

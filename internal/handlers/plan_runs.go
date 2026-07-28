@@ -60,6 +60,25 @@ func accessTypeMeetupLabel(accessType string) string {
 	}
 }
 
+// validateRunName trims a caller-supplied calendar-run name and rejects an
+// empty/whitespace-only result. Unlike validateMeetupSpot's "empty string
+// clears the field" convention, name has no clear state — it's REQUIRED
+// (calendar_runs.name is NOT NULL, mig 000147), so an explicit empty string
+// is always a 422, never a silent no-op. nil (key omitted) passes through
+// untouched — PATCH's ordinary "didn't touch this field" case; POST
+// (creation) doesn't call this at all, since there Name is a plain required
+// string, not a *string.
+func validateRunName(name *string) (*string, *apiError) {
+	if name == nil {
+		return nil, nil
+	}
+	trimmed := strings.TrimSpace(*name)
+	if trimmed == "" {
+		return nil, &apiError{http.StatusUnprocessableEntity, "name cannot be empty"}
+	}
+	return &trimmed, nil
+}
+
 // validateMeetupSpot trims and length-caps a caller-supplied meetup_spot.
 // nil (key omitted) passes through untouched — callers use nil to mean
 // "don't touch this field" per this package's COALESCE-patch convention.
@@ -140,7 +159,11 @@ func meetupFeatureTypeID(rapidID, accessID *string) (featureType, featureID *str
 // (POST /plan-runs, web#354 A1 — runs are no longer created inline under an
 // event; the old "add a run to this plan" endpoint is removed).
 // LookingForCrew/MaxCrew/MeetupSpot/MeetupFeature are per-run (unchanged).
+// Name (web#354 A4) is the calendar run's OWN name — REQUIRED, independent
+// of the attached library run's name (user_reaches.name, exposed separately
+// as reach_name in every response, see planRunSummary).
 type createPlanRunBody struct {
+	Name           string             `json:"name"`
 	UserReachID    *string            `json:"user_reach_id"`
 	ReachSlug      *string            `json:"reach_slug"`
 	RunDate        string             `json:"run_date"`
@@ -176,6 +199,10 @@ func (h *PlanHandler) insertPlanRun(
 	hostOwnerID string,
 	body createPlanRunBody,
 ) (id, slug string, err error) {
+	name := strings.TrimSpace(body.Name)
+	if name == "" {
+		return "", "", &apiError{http.StatusUnprocessableEntity, "name required"}
+	}
 	if body.RunDate == "" {
 		return "", "", &apiError{http.StatusBadRequest, "run_date is required"}
 	}
@@ -268,14 +295,14 @@ func (h *PlanHandler) insertPlanRun(
 
 	err = q.QueryRow(ctx, `
 		INSERT INTO calendar_runs
-			(owner_id, user_reach_id, slug, run_date, run_time,
+			(owner_id, name, user_reach_id, slug, run_date, run_time,
 			 gauge_cfs, flow_band, flow_color, gauge_id, stamped_at,
 			 paddled, paddled_at, notes, companions, looking_for_crew, max_crew,
 			 meetup_spot, meetup_rapid_id, meetup_access_id)
-		VALUES ($1,$2::uuid,$3,$4::date,$5,$6,$7,$8,$9::uuid,$10,$11,$12,$13,$14,$15,$16,$17,$18::uuid,$19::uuid)
+		VALUES ($1,$2,$3::uuid,$4,$5::date,$6,$7,$8,$9,$10::uuid,$11,$12,$13,$14,$15,$16,$17,$18,$19::uuid,$20::uuid)
 		RETURNING id
 	`,
-		hostOwnerID, userReachID, slug, body.RunDate, runTimeVal,
+		hostOwnerID, name, userReachID, slug, body.RunDate, runTimeVal,
 		stamp.CFS, stamp.Band, stamp.Color, stamp.GaugeID, stampedAt,
 		paddled, paddledAt, body.Notes, body.Companions, lookingForCrew, body.MaxCrew,
 		meetupSpot, rapidID, accessID,
@@ -399,7 +426,7 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 	var userReachOwnerID, userReachOwnerHandle *string
 
 	err := h.db.QueryRow(ctx, `
-		SELECT cr.id, cr.slug, cr.user_reach_id::text, ur.name, cr.run_date::text, cr.run_time::text,
+		SELECT cr.id, cr.slug, cr.name, cr.user_reach_id::text, ur.name, cr.run_date::text, cr.run_time::text,
 		       cr.sort_order, cr.gauge_cfs, cr.flow_band, cr.flow_color, cr.paddled, cr.paddled_at,
 		       cr.notes, cr.companions, cr.created_at,
 		       cr.looking_for_crew, cr.max_crew, COALESCE(cm.filled, 0),
@@ -421,7 +448,7 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 		) me ON true
 		WHERE cr.id = $1 AND cr.deleted_at IS NULL
 	`, runID, callerID, callerEmail).Scan(
-		&run.ID, &run.Slug, &run.UserReachID, &run.Name, &run.RunDate, &runTime,
+		&run.ID, &run.Slug, &run.Name, &run.UserReachID, &run.ReachName, &run.RunDate, &runTime,
 		&run.SortOrder, &run.GaugeCFS, &run.FlowBand, &run.FlowColor, &run.Paddled, &paddledAtRaw,
 		&run.Notes, &run.Companions, &createdAtRaw,
 		&run.Crew.LookingForCrew, &run.Crew.Max, &run.Crew.Filled,
@@ -512,7 +539,14 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 //     An omitted meetup_feature key (the ordinary "didn't touch this field"
 //     case) leaves any existing ref untouched, same as every other field
 //     here.
+//
+// updatePlanRunBody.Name (web#354 A4) follows the same "key omitted = don't
+// touch" convention as every other field here, with ONE difference from
+// MeetupSpot: name has no "clear" state (calendar_runs.name is NOT NULL,
+// mig 000147), so an explicit empty/whitespace-only string is always a 422
+// (validateRunName), never a valid patch.
 type updatePlanRunBody struct {
+	Name           *string            `json:"name"`
 	RunDate        *string            `json:"run_date"`
 	RunTime        *string            `json:"run_time"`
 	Notes          *string            `json:"notes"`
@@ -577,16 +611,24 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if curPaddled {
-		// Locked state (contract): ONLY notes editable, and only within 24h
-		// of paddled_at — mirrors reports.go's 24h edit-lock message.
+		// Locked state (contract): ONLY name+notes editable, and only within
+		// 24h of paddled_at — mirrors reports.go's 24h edit-lock message. Name
+		// (web#354 A4) is grouped with Notes here, not with the structural
+		// fields blocked below: it's the same kind of user-descriptive text
+		// (what you called the trip), not trip logistics.
 		if body.RunDate != nil || body.RunTime != nil || body.Companions != nil ||
 			body.SortOrder != nil || body.Paddled != nil ||
 			body.LookingForCrew != nil || body.MaxCrew != nil ||
 			body.MeetupSpot != nil || body.MeetupFeature != nil || meetupFeatureKeyPresent {
-			errorResponse(w, http.StatusBadRequest, "run is locked after paddling — only notes can be edited")
+			errorResponse(w, http.StatusBadRequest, "run is locked after paddling — only name and notes can be edited")
 			return
 		}
-		if body.Notes == nil {
+		name, nerr := validateRunName(body.Name)
+		if nerr != nil {
+			h.respondAPIError(w, nerr)
+			return
+		}
+		if name == nil && body.Notes == nil {
 			jsonResponse(w, http.StatusOK, map[string]string{"status": "ok"})
 			return
 		}
@@ -595,8 +637,8 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if _, err := h.db.Exec(ctx,
-			`UPDATE calendar_runs SET notes = $1, updated_at = NOW() WHERE id = $2 AND owner_id = $3`,
-			body.Notes, runID, ownerID,
+			`UPDATE calendar_runs SET name = COALESCE($1, name), notes = COALESCE($2, notes), updated_at = NOW() WHERE id = $3 AND owner_id = $4`,
+			name, body.Notes, runID, ownerID,
 		); err != nil {
 			errorResponse(w, http.StatusInternalServerError, "update failed")
 			return
@@ -605,9 +647,15 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Planned (unpaddled): run_date/run_time/notes/companions/sort_order are
-	// freely editable. paddled:true is the mark-paddled transition. No
+	// Planned (unpaddled): run_date/run_time/notes/companions/sort_order/name
+	// are freely editable. paddled:true is the mark-paddled transition. No
 	// parent event date-range to validate against (decoupled, web#354 A1).
+	name, nerr := validateRunName(body.Name)
+	if nerr != nil {
+		h.respondAPIError(w, nerr)
+		return
+	}
+
 	newRunDate := curRunDate
 	if body.RunDate != nil {
 		newRunDate = *body.RunDate
@@ -730,6 +778,7 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 			meetup_spot      = CASE WHEN $18 THEN $19 ELSE meetup_spot END,
 			meetup_rapid_id  = CASE WHEN $20 THEN $21::uuid ELSE meetup_rapid_id END,
 			meetup_access_id = CASE WHEN $20 THEN $22::uuid ELSE meetup_access_id END,
+			name             = COALESCE($23, name),
 			updated_at       = NOW()
 		WHERE id = $14 AND owner_id = $15
 	`,
@@ -740,6 +789,7 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 		newLookingForCrew, newMaxCrew,
 		meetupSpotProvided, meetupSpot,
 		featureTouched, meetupRapidID, meetupAccessID,
+		name,
 	)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "update failed")
@@ -790,13 +840,13 @@ func (h *PlanHandler) LogMine(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 
-	var hostOwnerID, userReachID, runDate, reachSlug string
+	var hostOwnerID, userReachID, runDate, reachSlug, reachName string
 	err := h.db.QueryRow(ctx, `
-		SELECT cr.owner_id, COALESCE(cr.user_reach_id::text, ''), cr.run_date::text, COALESCE(ur.slug, '')
+		SELECT cr.owner_id, COALESCE(cr.user_reach_id::text, ''), cr.run_date::text, COALESCE(ur.slug, ''), COALESCE(ur.name, '')
 		FROM calendar_runs cr
 		LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
 		WHERE cr.id = $1::uuid AND cr.deleted_at IS NULL
-	`, sourceRunID).Scan(&hostOwnerID, &userReachID, &runDate, &reachSlug)
+	`, sourceRunID).Scan(&hostOwnerID, &userReachID, &runDate, &reachSlug, &reachName)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "run not found")
 		return
@@ -833,7 +883,7 @@ func (h *PlanHandler) LogMine(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	myRunID, existed, ferr := findOrCreatePaddledLog(ctx, h.db, ownerID, userReachID, reachSlug, runDate, nil)
+	myRunID, existed, ferr := findOrCreatePaddledLog(ctx, h.db, ownerID, userReachID, reachSlug, reachName, runDate, nil)
 	if ferr != nil {
 		errorResponse(w, http.StatusInternalServerError, ferr.Error())
 		return
@@ -860,9 +910,19 @@ func (h *PlanHandler) LogMine(w http.ResponseWriter, r *http.Request) {
 // Idempotent: if the caller already has a live paddled calendar_run for this
 // exact reach+date, returns that existing row instead of creating a
 // duplicate (existed=true — callers use this to pick 200 vs 201).
+//
+// reachName (web#354 A4) seeds the new row's REQUIRED name column — these
+// two callers have no user-supplied name to fall back on (log-mine/
+// nudge-confirm are one-tap auto-create flows, unlike POST /plan-runs'
+// explicit body.Name), so it defaults to the library run's own name
+// (user_reaches.name), same field every other calendar-domain display
+// already reads. "Paddle" is the last-resort fallback for the
+// theoretically-empty case (user_reaches.name is NOT NULL, so this only
+// guards a caller passing "" outright), matching the COALESCE(ur.name,
+// 'Paddle') convention already used elsewhere in this package.
 func findOrCreatePaddledLog(
 	ctx context.Context, db *pgxpool.Pool,
-	ownerID, userReachID, reachSlug, runDate string, notes *string,
+	ownerID, userReachID, reachSlug, reachName, runDate string, notes *string,
 ) (runID string, existed bool, err error) {
 	var existingRunID string
 	if qerr := db.QueryRow(ctx, `
@@ -896,15 +956,20 @@ func findOrCreatePaddledLog(
 	}
 	mySlug := uniqueRunSlug(ctx, db, ownerID, slugBase+"-"+runDate)
 
+	name := reachName
+	if name == "" {
+		name = "Paddle"
+	}
+
 	var myRunID string
 	if ierr := db.QueryRow(ctx, `
 		INSERT INTO calendar_runs
-			(owner_id, user_reach_id, slug, run_date,
+			(owner_id, name, user_reach_id, slug, run_date,
 			 gauge_cfs, flow_band, flow_color, gauge_id, stamped_at,
 			 paddled, paddled_at, notes)
-		VALUES ($1,$2::uuid,$3,$4::date,$5,$6,$7,$8::uuid,$9,TRUE,$10,$11)
+		VALUES ($1,$2,$3::uuid,$4,$5::date,$6,$7,$8,$9::uuid,$10,TRUE,$11,$12)
 		RETURNING id
-	`, ownerID, userReachID, mySlug, runDate,
+	`, ownerID, name, userReachID, mySlug, runDate,
 		stamp.CFS, stamp.Band, stamp.Color, stamp.GaugeID, stampedAt, paddledAt, notes,
 	).Scan(&myRunID); ierr != nil {
 		return "", false, fmt.Errorf("create logged run failed: %w", ierr)

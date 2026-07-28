@@ -351,16 +351,16 @@ func (h *NudgeHandler) Confirm(w http.ResponseWriter, r *http.Request) {
 	// "I paddled this" is a deliberate, user-initiated action and should
 	// still log the paddle. Dismissal only ever suppresses the *prompt*,
 	// never a caller's own confirm.
-	var reachSlug string
+	var reachSlug, reachName string
 	if err := h.db.QueryRow(ctx,
-		`SELECT slug FROM user_reaches WHERE id = $1::uuid AND deleted_at IS NULL`,
+		`SELECT slug, name FROM user_reaches WHERE id = $1::uuid AND deleted_at IS NULL`,
 		body.UserReachID,
-	).Scan(&reachSlug); err != nil {
+	).Scan(&reachSlug, &reachName); err != nil {
 		errorResponse(w, http.StatusNotFound, "river run not found")
 		return
 	}
 
-	runID, existed, ferr := findOrCreatePaddledLog(ctx, h.db, ownerID, body.UserReachID, reachSlug, body.RunDate, body.Notes)
+	runID, existed, ferr := findOrCreatePaddledLog(ctx, h.db, ownerID, body.UserReachID, reachSlug, reachName, body.RunDate, body.Notes)
 	if ferr != nil {
 		errorResponse(w, http.StatusInternalServerError, ferr.Error())
 		return
@@ -482,24 +482,39 @@ func (c *seasonCache) set(key string, data seasonResponse) {
 	c.entries[key] = seasonCacheEntry{cachedAt: time.Now(), data: data}
 }
 
+// RunName (web#354 A4) is the paddled calendar_run's own name
+// (calendar_runs.name); ReachName is the attached library run's own name
+// (user_reaches.name, nil when the reach was later hard-deleted) — kept
+// alongside RunName so the season-highlights card can still show reach
+// context as a subtitle, same convention as every other calendar-domain
+// summary in this package.
 type seasonHighestFlow struct {
 	CFS       float64 `json:"cfs"`
 	PlanRunID string  `json:"plan_run_id"`
 	Slug      string  `json:"slug"`
 	RunName   string  `json:"run_name"`
+	ReachName *string `json:"reach_name,omitempty"`
 	Date      string  `json:"date"`
 }
 
+// seasonNewRun is keyed by the REACH itself (GROUP BY ur.id — "first time
+// paddling this library run this year"), not by any one calendar_run, so its
+// Name intentionally stays user_reaches.name (there is no single calendar
+// run whose own name would make sense here) — untouched by web#354 A4.
 type seasonNewRun struct {
 	Slug string `json:"slug"`
 	Name string `json:"name"`
 	Date string `json:"date"`
 }
 
+// seasonRecentRun.Name (web#354 A4) is the calendar_run's own name;
+// ReachName is the attached library run's own name (nil for an orphaned
+// run), same RunName/ReachName split as seasonHighestFlow above.
 type seasonRecentRun struct {
 	ID        string   `json:"id"`
 	Slug      string   `json:"slug"`
 	Name      *string  `json:"name,omitempty"`
+	ReachName *string  `json:"reach_name,omitempty"`
 	RunDate   string   `json:"run_date"`
 	FlowBand  *string  `json:"flow_band,omitempty"`
 	FlowColor *string  `json:"flow_color,omitempty"`
@@ -607,16 +622,16 @@ func (h *NudgeHandler) Season(w http.ResponseWriter, r *http.Request) {
 	// DELETE SET NULL).
 	var hfCFS *float64
 	var hfRunID string
-	var hfSlug, hfName, hfDate *string
+	var hfSlug, hfName, hfReachName, hfDate *string
 	if err := h.db.QueryRow(ctx, `
-		SELECT cr.gauge_cfs, cr.id::text, ur.slug, ur.name, cr.run_date::text
+		SELECT cr.gauge_cfs, cr.id::text, ur.slug, cr.name, ur.name, cr.run_date::text
 		FROM calendar_runs cr
 		LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
 		WHERE cr.owner_id = $1 AND cr.paddled AND cr.deleted_at IS NULL AND cr.gauge_cfs IS NOT NULL
 		  AND cr.run_date BETWEEN $2::date AND $3::date
 		ORDER BY cr.gauge_cfs DESC
 		LIMIT 1
-	`, ownerID, yearStart, yearEnd).Scan(&hfCFS, &hfRunID, &hfSlug, &hfName, &hfDate); err == nil && hfCFS != nil {
+	`, ownerID, yearStart, yearEnd).Scan(&hfCFS, &hfRunID, &hfSlug, &hfName, &hfReachName, &hfDate); err == nil && hfCFS != nil {
 		resp.HighestFlow = &seasonHighestFlow{CFS: *hfCFS, PlanRunID: hfRunID}
 		if hfSlug != nil {
 			resp.HighestFlow.Slug = *hfSlug
@@ -624,6 +639,7 @@ func (h *NudgeHandler) Season(w http.ResponseWriter, r *http.Request) {
 		if hfName != nil {
 			resp.HighestFlow.RunName = *hfName
 		}
+		resp.HighestFlow.ReachName = hfReachName
 		if hfDate != nil {
 			resp.HighestFlow.Date = *hfDate
 		}
@@ -713,7 +729,7 @@ func (h *NudgeHandler) Season(w http.ResponseWriter, r *http.Request) {
 	// /me/season?year=2024 browsing a past season should show that season's
 	// recent activity, not literally-today's runs.
 	recentRows, err := h.db.Query(ctx, `
-		SELECT cr.id, cr.slug, ur.name, cr.run_date::text, cr.flow_band, cr.flow_color,
+		SELECT cr.id, cr.slug, cr.name, ur.name, cr.run_date::text, cr.flow_band, cr.flow_color,
 		       cr.gauge_cfs, cr.notes
 		FROM calendar_runs cr
 		LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
@@ -728,7 +744,7 @@ func (h *NudgeHandler) Season(w http.ResponseWriter, r *http.Request) {
 	}
 	for recentRows.Next() {
 		var rr seasonRecentRun
-		if err := recentRows.Scan(&rr.ID, &rr.Slug, &rr.Name, &rr.RunDate, &rr.FlowBand, &rr.FlowColor,
+		if err := recentRows.Scan(&rr.ID, &rr.Slug, &rr.Name, &rr.ReachName, &rr.RunDate, &rr.FlowBand, &rr.FlowColor,
 			&rr.GaugeCFS, &rr.Notes); err != nil {
 			recentRows.Close()
 			errorResponse(w, http.StatusInternalServerError, "recent scan failed")
