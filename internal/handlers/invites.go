@@ -369,7 +369,7 @@ func (h *InviteHandler) InviteToRun(w http.ResponseWriter, r *http.Request) {
 		var inviteID, status string
 		resurrectErr := h.db.QueryRow(ctx, `
 			UPDATE run_invites
-			SET status = 'invited', invite_handle = $1, invited_by = $2,
+			SET status = 'invited', origin = 'invite', invite_handle = $1, invited_by = $2,
 			    responded_at = NULL, dismissed_at = NULL, updated_at = NOW()
 			WHERE run_id = $3::uuid AND member_owner_id = $4 AND status = 'declined'
 			RETURNING id, status::text
@@ -431,7 +431,7 @@ func (h *InviteHandler) InviteToRun(w http.ResponseWriter, r *http.Request) {
 		var inviteID, status string
 		resurrectErr := h.db.QueryRow(ctx, `
 			UPDATE run_invites
-			SET status = 'invited', invite_token_hash = $1, invited_by = $2, message = $3,
+			SET status = 'invited', origin = 'invite', invite_token_hash = $1, invited_by = $2, message = $3,
 			    responded_at = NULL, dismissed_at = NULL, updated_at = NOW()
 			WHERE run_id = $4::uuid AND member_owner_id IS NULL AND LOWER(invite_email) = $5 AND status = 'declined'
 			RETURNING id, status::text
@@ -741,6 +741,17 @@ func (h *InviteHandler) AcceptInvite(w http.ResponseWriter, r *http.Request) {
 		`SELECT max_crew, slug FROM calendar_runs WHERE id = $1::uuid AND deleted_at IS NULL FOR UPDATE`, runID,
 	).Scan(&maxCrew, &slug); err != nil {
 		errorResponse(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	// Re-read the invite inside the run-serialized tx: the pre-lock read is
+	// stale under concurrent accepts (double-click / client retry), and the
+	// stale 'invited' value let the losing request skip this idempotent
+	// return, re-run the UPDATE, and fire a second organizer notification.
+	if err := tx.QueryRow(ctx,
+		`SELECT status::text, member_owner_id FROM run_invites WHERE id = $1::uuid`, inviteID,
+	).Scan(&status, &curMemberOwnerID); err != nil {
+		errorResponse(w, http.StatusNotFound, "invite not found")
 		return
 	}
 
