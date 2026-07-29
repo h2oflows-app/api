@@ -2,23 +2,89 @@
 // reworked #246 A7 for per-run crew, reworked AGAIN web#354 A2: invites are
 // Run-scoped only now — BuildRunInvite emits ONE VCALENDAR with a SINGLE
 // VEVENT for exactly one run, replacing the old multi-VEVENT whole-plan
-// BuildPlanInvite (one plan-spanning all-day VEVENT + one VEVENT per
-// invited run). Pure string templating, no third-party library —
-// hand-rolling keeps the escaping/folding exactly matched to what
-// Apple/Google Calendar import needs (verified against both, see
-// ics_test.go).
+// BuildPlanInvite. Reworked a THIRD time for API-1 Invite Sync
+// (web/design_handoff_calendar_explore/INVITE_SYNC_PLAN.md): the calendar
+// now emits proper RFC 5546 scheduling messages (METHOD:REQUEST /
+// METHOD:CANCEL with SEQUENCE/ORGANIZER/ATTENDEE) instead of a
+// disconnected METHOD:PUBLISH snapshot, so Outlook/Google/Apple can
+// reconcile an update or cancellation against the SAME imported event
+// (matched by UID) instead of importing a duplicate copy every time. Pure
+// string templating, no third-party library — hand-rolling keeps the
+// escaping/folding/quoting exactly matched to what Apple/Google/Outlook
+// import needs (verified against all three, see ics_test.go).
 package ics
 
 import (
+	"errors"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// RunInviteInput is the data BuildRunInvite needs to render one run invite
-// as a single-VEVENT VCALENDAR.
+// Method values BuildRunInvite accepts. RunInviteInput.Method's zero value
+// ("") defaults to MethodRequest — PUBLISH is retired entirely for run
+// invites as of API-1 (D2: PUBLISH copies don't reconcile later updates,
+// see INVITE_SYNC_PLAN.md).
+const (
+	MethodRequest = "REQUEST"
+	MethodCancel  = "CANCEL"
+)
+
+// Validation errors BuildRunInvite returns for a malformed RunInviteInput —
+// RFC 5546 §3.2.5 (REQUEST) / §3.2.6 (CANCEL) both require ORGANIZER and at
+// least one ATTENDEE on a scheduling message; a .ics missing either isn't
+// valid iTIP and real clients (Outlook especially) silently reject or
+// mishandle it, so BuildRunInvite enforces this at build time rather than
+// emitting a malformed calendar.
+var (
+	ErrInvalidMethod    = errors.New("ics: Method must be \"\" (defaults to REQUEST), REQUEST, or CANCEL")
+	ErrMissingOrganizer = errors.New("ics: REQUEST/CANCEL requires OrganizerEmail")
+	ErrMissingAttendee  = errors.New("ics: REQUEST/CANCEL requires AttendeeEmail")
+)
+
+// RunInviteInput is the data BuildRunInvite needs to render one run invite/
+// update/cancellation as a single-VEVENT, single-ATTENDEE VCALENDAR.
 type RunInviteInput struct {
-	// RunID becomes UID={RunID}@h2oflows.app.
+	// RunID becomes UID={RunID}@h2oflows.app. Stays fixed across every
+	// REQUEST/CANCEL ever sent for this run — the reconciliation key
+	// external calendars use to recognize "this is an update to that
+	// event", not a new one.
 	RunID string
+	// Method is "REQUEST" (an invite or an update to one already sent) or
+	// "CANCEL" (the run/invite went away). Empty defaults to "REQUEST".
+	// Any other value is a caller bug -> ErrInvalidMethod.
+	Method string
+	// Sequence is RFC 5546's SEQUENCE: 0 on the very first REQUEST for this
+	// UID, incremented by 1 on every subsequent REQUEST/CANCEL sent for it.
+	// Required for Outlook/Google to accept an update as newer than what
+	// they already have instead of ignoring it as a stale duplicate.
+	Sequence int
+	// OrganizerName/OrganizerEmail render
+	// ORGANIZER;CN=<name>:mailto:<email> (CN omitted entirely when
+	// OrganizerName is ""). OrganizerEmail MUST be the exact address the
+	// containing email is sent From (config.MailFrom, parsed by
+	// mail.ParseFromAddress) — Outlook in particular silently drops a
+	// scheduling update whose ORGANIZER doesn't match the message's From
+	// header. Required (non-empty OrganizerEmail) for REQUEST/CANCEL.
+	OrganizerName  string
+	OrganizerEmail string
+	// AttendeeName/AttendeeEmail render the single per-recipient
+	// ATTENDEE;CN=<name>;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:<email>
+	// line (CN omitted when AttendeeName is ""). ATTENDEE is per-recipient
+	// by RFC 5546 convention — BuildRunInvite renders exactly one .ics per
+	// call for exactly one attendee; callers fan out one call per recipient
+	// rather than listing everyone on a shared .ics (see
+	// internal/handlers/notifications.go). Required (non-empty
+	// AttendeeEmail) for REQUEST/CANCEL.
+	AttendeeName  string
+	AttendeeEmail string
+	// Cancelled emits STATUS:CANCELLED on the VEVENT. Set together with
+	// Method=MethodCancel by every caller in this codebase — kept as its
+	// own field rather than inferred from Method so a CANCEL .ics's two
+	// "this is cancelled" signals (the calendar-level METHOD:CANCEL and the
+	// VEVENT-level STATUS:CANCELLED) stay visibly intentional at each call
+	// site instead of one being an implicit side effect of the other.
+	Cancelled bool
 	// Name is user/reach-derived -> SUMMARY, TEXT-escaped.
 	Name string
 	// RunDate is YYYY-MM-DD.
@@ -55,14 +121,32 @@ const (
 	maxFoldOctets = 75
 )
 
-// BuildRunInvite renders a single-VEVENT VCALENDAR for a run invite email
-// attachment (web#354 A2 — replaces the multi-VEVENT whole-plan
-// BuildPlanInvite). Strictly RFC 5545: VERSION:2.0, PRODID, METHOD:PUBLISH,
-// one DTSTAMP (UTC, required), TEXT-escaped SUMMARY/LOCATION (run/reach
-// names are user/reach-derived input), CRLF line endings, 75-octet line
-// folding. Shaped for, and manually verified against, Apple Calendar and
-// Google Calendar .ics import.
-func BuildRunInvite(in RunInviteInput) string {
+// BuildRunInvite renders a single-VEVENT, single-ATTENDEE VCALENDAR for a
+// run invite/update/cancellation email attachment. RFC 5545 base shape:
+// VERSION:2.0, PRODID, one DTSTAMP (UTC, required), TEXT-escaped
+// SUMMARY/LOCATION (run/reach names are user/reach-derived input), CRLF
+// line endings, 75-octet line folding — plus RFC 5546 scheduling
+// properties (METHOD, SEQUENCE, ORGANIZER, ATTENDEE, and STATUS:CANCELLED
+// for a cancellation) as of API-1. Returns an error (never panics) when
+// Method/OrganizerEmail/AttendeeEmail don't satisfy RFC 5546's REQUEST/
+// CANCEL requirements — see the Err* vars. Shaped for, and manually
+// verified against, Apple Calendar, Google Calendar, and Outlook .ics
+// import.
+func BuildRunInvite(in RunInviteInput) (string, error) {
+	method := in.Method
+	if method == "" {
+		method = MethodRequest
+	}
+	if method != MethodRequest && method != MethodCancel {
+		return "", ErrInvalidMethod
+	}
+	if strings.TrimSpace(in.OrganizerEmail) == "" {
+		return "", ErrMissingOrganizer
+	}
+	if strings.TrimSpace(in.AttendeeEmail) == "" {
+		return "", ErrMissingAttendee
+	}
+
 	now := in.Now
 	if now.IsZero() {
 		now = time.Now()
@@ -78,10 +162,13 @@ func BuildRunInvite(in RunInviteInput) string {
 		"BEGIN:VCALENDAR",
 		"VERSION:2.0",
 		"PRODID:-//h2oflows//Trip Calendar//EN",
-		"METHOD:PUBLISH",
+		"METHOD:" + method,
 		"BEGIN:VEVENT",
 		"UID:" + in.RunID + "@h2oflows.app",
+		"SEQUENCE:" + strconv.Itoa(in.Sequence),
 		"DTSTAMP:" + now.Format(icsDateTimeLayout),
+		organizerLine(in.OrganizerName, in.OrganizerEmail),
+		attendeeLine(in.AttendeeName, in.AttendeeEmail),
 	}
 
 	if rt, ok := parseRunTime(in.RunTime); ok {
@@ -101,6 +188,9 @@ func BuildRunInvite(in RunInviteInput) string {
 	if in.MeetupSpot != "" {
 		lines = append(lines, "LOCATION:"+escapeText(in.MeetupSpot))
 	}
+	if in.Cancelled {
+		lines = append(lines, "STATUS:CANCELLED")
+	}
 	if in.URL != "" {
 		lines = append(lines, "URL:"+in.URL)
 	}
@@ -110,7 +200,48 @@ func BuildRunInvite(in RunInviteInput) string {
 	for i, l := range lines {
 		folded[i] = foldLine(l)
 	}
-	return strings.Join(folded, "\r\n") + "\r\n"
+	return strings.Join(folded, "\r\n") + "\r\n", nil
+}
+
+// organizerLine renders ORGANIZER;CN=<name>:mailto:<email>, omitting the CN
+// parameter entirely when name is "" (a bare ORGANIZER:mailto:... is valid
+// RFC 5545 — CN is optional on every CAL-ADDRESS parameter).
+func organizerLine(name, email string) string {
+	if name == "" {
+		return "ORGANIZER:mailto:" + email
+	}
+	return "ORGANIZER;CN=" + quoteParamValue(name) + ":mailto:" + email
+}
+
+// attendeeLine renders ATTENDEE;CN=<name>;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:
+// mailto:<email>, omitting CN when name is "" (a handle-less email invitee
+// has no known display name yet).
+func attendeeLine(name, email string) string {
+	if name == "" {
+		return "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:" + email
+	}
+	return "ATTENDEE;CN=" + quoteParamValue(name) + ";PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:" + email
+}
+
+// quoteParamValue renders an RFC 5545 §3.2 property-parameter value (CN in
+// particular). Neither of RFC 5545's two param-value forms can carry a
+// literal DQUOTE: bare PTEXT's alphabet (SAFE-CHAR) excludes it same as
+// COLON/SEMICOLON/COMMA, and the QUOTED-STRING alphabet (QSAFE-CHAR)
+// excludes it too with no backslash-escape defined for either form (unlike
+// TEXT property VALUES — see escapeText, a completely different mechanism
+// for a completely different RFC 5545 rule) — so any embedded double quote
+// is stripped outright first, the only RFC-legal way to keep the result
+// well-formed without inventing non-standard escaping that Apple/Google/
+// Outlook wouldn't understand. What's left is then wrapped in DQUOTE
+// (QUOTED-STRING) only if it still contains a COLON, SEMICOLON, or COMMA —
+// otherwise it's returned bare (PTEXT), since those are the only three
+// characters that would otherwise be misread as param/property delimiters.
+func quoteParamValue(s string) string {
+	s = strings.ReplaceAll(s, `"`, "")
+	if strings.ContainsAny(s, ":;,") {
+		return `"` + s + `"`
+	}
+	return s
 }
 
 // parseRunTime accepts "HH:MM:SS" or "HH:MM" (both shapes calendar_runs.
@@ -134,7 +265,9 @@ func parseRunTime(s string) (time.Time, bool) {
 // sequence "\n" (a backslash followed by the letter n — NOT an actual line
 // break, which would corrupt the content-line structure of the .ics file).
 // Required because run names/meetup spots are free-form user input that can
-// contain any of these.
+// contain any of these. NOT used for property-PARAMETER values (CN in
+// particular) — see quoteParamValue, which follows entirely different RFC
+// 5545 rules (quoting, not escaping).
 func escapeText(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
