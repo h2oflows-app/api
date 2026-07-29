@@ -105,8 +105,14 @@ type invitedRunInfo struct {
 // not-found-over-forbidden convention for owner-scoped lookups.
 func (h *InviteHandler) loadInvitedRunInfo(ctx context.Context, runID, hostOwnerID string) (invitedRunInfo, error) {
 	var ri invitedRunInfo
+	// web#354 A4: Name's source flips from the library run's own name
+	// (COALESCE(ur.name, 'Paddle')) to the calendar run's own name (cr.name,
+	// NOT NULL) — runInviteSubject/buildRunInviteEmailBody/BuildRunInvite
+	// (SUMMARY/subject) all key off ri.Name, so this alone repoints the
+	// invite email + .ics subject; RiverName (body/LOCATION context) is
+	// untouched.
 	err := h.db.QueryRow(ctx, `
-		SELECT cr.id, cr.slug, COALESCE(ur.name, 'Paddle'), ur.river_name, cr.run_date::text,
+		SELECT cr.id, cr.slug, cr.name, ur.river_name, cr.run_date::text,
 		       COALESCE(cr.run_time::text, ''), COALESCE(cr.meetup_spot, ''),
 		       cr.gauge_cfs, cr.flow_band, COALESCE(up.handle, '')
 		FROM calendar_runs cr
@@ -515,10 +521,17 @@ func (h *InviteHandler) ResendInvite(w http.ResponseWriter, r *http.Request) {
 // inviteRunSummary is the run projection embedded in each /me/invites item —
 // contract: {run_id, slug, name/river/state, run_date, run_time, meetup_spot,
 // flow fields, crew {filled,max}, host_handle}.
+// Name (web#354 A4) is the calendar run's OWN name (calendar_runs.name, NOT
+// NULL) — was sourced from the library run's join (COALESCE(ur.name,
+// 'Paddle')) prior to A4; that's now ReachName, kept as a separate field
+// (nil for an orphaned run) alongside the pre-existing RiverName (the
+// actual named river, e.g. "Blue River" — NOT the same thing as a reach's
+// own saved-run name) so the web can still render both as subtitles.
 type inviteRunSummary struct {
 	RunID      string            `json:"run_id"`
 	Slug       string            `json:"slug"`
 	Name       string            `json:"name"`
+	ReachName  *string           `json:"reach_name,omitempty"`
 	RiverName  *string           `json:"river_name,omitempty"`
 	StateAbbr  *string           `json:"state_abbr,omitempty"`
 	RunDate    string            `json:"run_date"`
@@ -555,7 +568,7 @@ func (h *InviteHandler) MyInvites(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := h.db.Query(ctx, `
 		SELECT ri.id, ri.status::text, ri.dismissed_at, (ri.invite_handle IS NOT NULL) AS via_handle, ri.created_at,
-		       cr.id::text, cr.slug, COALESCE(ur.name, 'Paddle'), ur.river_name, rv.state_abbr,
+		       cr.id::text, cr.slug, cr.name, ur.name, ur.river_name, rv.state_abbr,
 		       cr.run_date::text, cr.run_time::text, cr.meetup_spot,
 		       cr.gauge_cfs, cr.flow_band, cr.flow_color,
 		       cr.max_crew, COALESCE(cm.filled, 0),
@@ -588,7 +601,7 @@ func (h *InviteHandler) MyInvites(w http.ResponseWriter, r *http.Request) {
 		var runTime *string
 		if err := rows.Scan(
 			&item.ID, &item.Status, &dismissedAtRaw, &viaHandle, &createdAtRaw,
-			&item.Run.RunID, &item.Run.Slug, &item.Run.Name, &item.Run.RiverName, &item.Run.StateAbbr,
+			&item.Run.RunID, &item.Run.Slug, &item.Run.Name, &item.Run.ReachName, &item.Run.RiverName, &item.Run.StateAbbr,
 			&item.Run.RunDate, &runTime, &item.Run.MeetupSpot,
 			&item.Run.GaugeCFS, &item.Run.FlowBand, &item.Run.FlowColor,
 			&item.Run.Crew.Max, &item.Run.Crew.Filled,

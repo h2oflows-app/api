@@ -65,10 +65,14 @@ func (h *PlanHandler) Calendar(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Name (web#354 A4) is the calendar run's OWN name (calendar_runs.name,
+	// NOT NULL) — always populated, unlike ReachName (the attached library
+	// run's own name, user_reaches.name, nil for an orphaned run).
 	type calRun struct {
 		ID          string   `json:"id"`
 		UserReachID *string  `json:"user_reach_id,omitempty"`
-		Name        *string  `json:"name,omitempty"`
+		Name        string   `json:"name"`
+		ReachName   *string  `json:"reach_name,omitempty"`
 		FlowBand    *string  `json:"flow_band,omitempty"`
 		FlowColor   *string  `json:"flow_color,omitempty"`
 		GaugeCFS    *float64 `json:"gauge_cfs,omitempty"`
@@ -90,9 +94,9 @@ func (h *PlanHandler) Calendar(w http.ResponseWriter, r *http.Request) {
 	// a guaranteed one: DISTINCT keeps this query correct even if it's ever
 	// violated).
 	rows, err := h.db.Query(ctx, `
-		SELECT id, user_reach_id, name, run_date, flow_band, flow_color, gauge_cfs, paddled, run_time, role
+		SELECT id, user_reach_id, name, reach_name, run_date, flow_band, flow_color, gauge_cfs, paddled, run_time, role
 		FROM (
-			SELECT DISTINCT cr.id, cr.user_reach_id::text AS user_reach_id, ur.name,
+			SELECT DISTINCT cr.id, cr.user_reach_id::text AS user_reach_id, cr.name, ur.name AS reach_name,
 			       cr.run_date::text AS run_date, cr.flow_band, cr.flow_color, cr.gauge_cfs, cr.paddled,
 			       cr.run_time::text AS run_time, cr.sort_order,
 			       CASE WHEN cr.owner_id = $1 THEN 'owner' ELSE 'crew' END AS role
@@ -117,7 +121,7 @@ func (h *PlanHandler) Calendar(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var cr calRun
 		var runDate string
-		if err := rows.Scan(&cr.ID, &cr.UserReachID, &cr.Name, &runDate,
+		if err := rows.Scan(&cr.ID, &cr.UserReachID, &cr.Name, &cr.ReachName, &runDate,
 			&cr.FlowBand, &cr.FlowColor, &cr.GaugeCFS, &cr.Paddled, &cr.RunTime, &cr.Role); err != nil {
 			errorResponse(w, http.StatusInternalServerError, "scan failed")
 			return
@@ -276,10 +280,10 @@ func (h *PlanHandler) CalendarDay(w http.ResponseWriter, r *http.Request) {
 	// caller has an ACCEPTED run_invites row on (crew) — same union + role
 	// shape as Calendar above.
 	rows, err := h.db.Query(ctx, `
-		SELECT id, slug, user_reach_id, name, flow_band, flow_color, gauge_cfs, paddled, run_time, notes,
+		SELECT id, slug, user_reach_id, name, reach_name, flow_band, flow_color, gauge_cfs, paddled, run_time, notes,
 		       meetup_spot, meetup_rapid_id, meetup_access_id, role
 		FROM (
-			SELECT DISTINCT cr.id, cr.slug, cr.user_reach_id::text AS user_reach_id, ur.name,
+			SELECT DISTINCT cr.id, cr.slug, cr.user_reach_id::text AS user_reach_id, cr.name, ur.name AS reach_name,
 			       cr.flow_band, cr.flow_color, cr.gauge_cfs, cr.paddled, cr.run_time::text AS run_time, cr.notes,
 			       cr.meetup_spot, cr.meetup_rapid_id::text AS meetup_rapid_id, cr.meetup_access_id::text AS meetup_access_id,
 			       cr.sort_order,
@@ -300,11 +304,15 @@ func (h *PlanHandler) CalendarDay(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
+	// Name (web#354 A4) is the calendar run's OWN name (calendar_runs.name,
+	// NOT NULL) — always populated, unlike ReachName (the attached library
+	// run's own name, nil for an orphaned run).
 	type dayRun struct {
 		ID                string   `json:"id"`
 		Slug              string   `json:"slug"`
 		UserReachID       *string  `json:"user_reach_id,omitempty"`
-		Name              *string  `json:"name,omitempty"`
+		Name              string   `json:"name"`
+		ReachName         *string  `json:"reach_name,omitempty"`
 		FlowBand          *string  `json:"flow_band,omitempty"`
 		FlowColor         *string  `json:"flow_color,omitempty"`
 		GaugeCFS          *float64 `json:"gauge_cfs,omitempty"`
@@ -322,7 +330,7 @@ func (h *PlanHandler) CalendarDay(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var dr dayRun
 		var meetupRapidID, meetupAccessID *string
-		if err := rows.Scan(&dr.ID, &dr.Slug, &dr.UserReachID, &dr.Name,
+		if err := rows.Scan(&dr.ID, &dr.Slug, &dr.UserReachID, &dr.Name, &dr.ReachName,
 			&dr.FlowBand, &dr.FlowColor, &dr.GaugeCFS, &dr.Paddled, &dr.RunTime, &dr.Notes,
 			&dr.MeetupSpot, &meetupRapidID, &meetupAccessID, &dr.Role); err != nil {
 			errorResponse(w, http.StatusInternalServerError, "scan failed")

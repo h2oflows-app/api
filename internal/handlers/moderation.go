@@ -231,8 +231,11 @@ func (h *ModerationHandler) Queue(w http.ResponseWriter, r *http.Request) {
 				WHEN af.target_type = 'report'
 					THEN (SELECT rp.name FROM reports rp WHERE rp.id = af.target_id)
 				WHEN af.target_type = 'plan_run'
-					THEN (SELECT COALESCE(ur.name, 'Paddle') || ' — ' || cr.run_date::text
-					      FROM calendar_runs cr LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
+					-- web#354 A4: cr.name is the calendar run's own name (NOT
+					-- NULL, mig 000147) — no longer needs the library-run
+					-- fallback join this used before A4 added the column.
+					THEN (SELECT cr.name || ' — ' || cr.run_date::text
+					      FROM calendar_runs cr
 					      WHERE cr.id = af.target_id)
 			END AS target_name,
 			CASE

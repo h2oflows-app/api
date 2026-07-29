@@ -195,9 +195,14 @@ type discoverCrewMeter struct {
 // looking_for_crew + future/today is the only qualifying signal. Crew count
 // reads run_invites (re-keyed web#354 A2, was plan_members, keyed by
 // plan_run_id).
+// Name (web#354 A4) is the calendar run's OWN name (calendar_runs.name, NOT
+// NULL); ReachName is the attached library run's own name (user_reaches.name,
+// nil for an orphaned run) — kept as a separate field for a subtitle, same
+// split every other calendar-domain summary in this package uses.
 type discoverCrewRun struct {
 	RunID      string            `json:"plan_run_id"`
 	Name       string            `json:"name"`
+	ReachName  *string           `json:"reach_name,omitempty"`
 	HostHandle string            `json:"host_handle"`
 	RunDate    string            `json:"run_date"`
 	RunTime    *string           `json:"run_time,omitempty"`
@@ -267,8 +272,12 @@ func (h *DiscoverHandler) ListPlans(w http.ResponseWriter, r *http.Request) {
 	// AND NOT cr.paddled (web#354 A2 review follow-up): a run someone already
 	// logged is no longer a live crew-call — exclude it from the public
 	// browse even if looking_for_crew was never explicitly turned off.
+	// $1 (q) now also matches cr.name (web#354 A4 — the run's own name is the
+	// primary display text now, so it's the most natural thing to search by;
+	// additive alongside the existing reach-name/meetup_spot match, never
+	// narrows a previously-matching result).
 	rows, err := h.db.Query(ctx, `
-		SELECT cr.id::text, COALESCE(ur.name, 'Paddle'), COALESCE(up.handle, 'h2oflows'),
+		SELECT cr.id::text, cr.name, ur.name, COALESCE(up.handle, 'h2oflows'),
 		       cr.run_date::text, cr.run_time::text,
 		       ur.class_min, ur.class_max, cr.flow_band, cr.flow_color, cr.gauge_cfs,
 		       cr.meetup_spot, cr.max_crew, COALESCE(cm.filled, 0)
@@ -280,7 +289,7 @@ func (h *DiscoverHandler) ListPlans(w http.ResponseWriter, r *http.Request) {
 			WHERE ri.run_id = cr.id AND ri.status = 'accepted'
 		) cm ON true
 		WHERE cr.looking_for_crew AND NOT cr.paddled AND cr.run_date >= $5::date AND cr.deleted_at IS NULL
-		  AND ($1 = '' OR COALESCE(ur.name, '') ILIKE '%' || $1 || '%' OR COALESCE(cr.meetup_spot, '') ILIKE '%' || $1 || '%')
+		  AND ($1 = '' OR cr.name ILIKE '%' || $1 || '%' OR COALESCE(ur.name, '') ILIKE '%' || $1 || '%' OR COALESCE(cr.meetup_spot, '') ILIKE '%' || $1 || '%')
 		  AND ($2::float8 IS NULL OR ur.class_max >= $2)
 		  AND ($3::float8 IS NULL OR ur.class_min <= $3)
 		  AND ($4 = '' OR COALESCE(cr.meetup_spot, '') ILIKE '%' || $4 || '%')
@@ -297,7 +306,7 @@ func (h *DiscoverHandler) ListPlans(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var dr discoverCrewRun
 		if err := rows.Scan(
-			&dr.RunID, &dr.Name, &dr.HostHandle, &dr.RunDate, &dr.RunTime,
+			&dr.RunID, &dr.Name, &dr.ReachName, &dr.HostHandle, &dr.RunDate, &dr.RunTime,
 			&dr.ClassMin, &dr.ClassMax, &dr.FlowBand, &dr.FlowColor, &dr.GaugeCFS,
 			&dr.MeetupSpot, &dr.Crew.Max, &dr.Crew.Filled,
 		); err != nil {
