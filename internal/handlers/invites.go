@@ -87,16 +87,17 @@ func (h *InviteHandler) respondAPIError(w http.ResponseWriter, err error) {
 // loadPlanRuns/loadInvitedPlanInfo, all removed — a single-run invite has no
 // fan-out to resolve or authorize beyond the run itself).
 type invitedRunInfo struct {
-	ID         string
-	Slug       string
-	Name       string
-	RiverName  *string
-	RunDate    string
-	RunTime    string // "" for an untimed run
-	MeetupSpot string // "" when unset
-	GaugeCFS   *float64
-	FlowBand   *string
-	HostHandle string
+	ID          string
+	Slug        string
+	Name        string
+	RiverName   *string
+	RunDate     string
+	RunTime     string // "" for an untimed run
+	MeetupSpot  string // "" when unset
+	GaugeCFS    *float64
+	FlowBand    *string
+	HostHandle  string
+	ICSSequence int // API-1: calendar_runs.ics_sequence — RFC 5546 SEQUENCE for this run's .ics UID
 }
 
 // loadInvitedRunInfo fetches runID's invite-relevant fields, gated on
@@ -114,13 +115,13 @@ func (h *InviteHandler) loadInvitedRunInfo(ctx context.Context, runID, hostOwner
 	err := h.db.QueryRow(ctx, `
 		SELECT cr.id, cr.slug, cr.name, ur.river_name, cr.run_date::text,
 		       COALESCE(cr.run_time::text, ''), COALESCE(cr.meetup_spot, ''),
-		       cr.gauge_cfs, cr.flow_band, COALESCE(up.handle, '')
+		       cr.gauge_cfs, cr.flow_band, COALESCE(up.handle, ''), cr.ics_sequence
 		FROM calendar_runs cr
 		LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
 		LEFT JOIN user_profiles up ON up.owner_id = cr.owner_id
 		WHERE cr.id = $1::uuid AND cr.owner_id = $2 AND cr.deleted_at IS NULL
 	`, runID, hostOwnerID).Scan(&ri.ID, &ri.Slug, &ri.Name, &ri.RiverName, &ri.RunDate,
-		&ri.RunTime, &ri.MeetupSpot, &ri.GaugeCFS, &ri.FlowBand, &ri.HostHandle)
+		&ri.RunTime, &ri.MeetupSpot, &ri.GaugeCFS, &ri.FlowBand, &ri.HostHandle, &ri.ICSSequence)
 	if err != nil {
 		return invitedRunInfo{}, &apiError{http.StatusNotFound, "run not found"}
 	}
@@ -202,38 +203,18 @@ func runInviteSubject(host string, run invitedRunInfo) string {
 func buildRunInviteEmailBody(run invitedRunInfo, runURL, rawToken string) (htmlBody, textBody string) {
 	acceptURL := fmt.Sprintf("%s?invite=%s", runURL, rawToken)
 
-	dateLine := formatUSDate(run.RunDate)
-	if t := formatUSTime(run.RunTime); t != "" {
-		dateLine += " at " + t
-	}
-
-	var htmlDetails, textDetails strings.Builder
-	if run.RiverName != nil && strings.TrimSpace(*run.RiverName) != "" {
-		htmlDetails.WriteString(fmt.Sprintf("<li>River: %s</li>", html.EscapeString(*run.RiverName)))
-		textDetails.WriteString(fmt.Sprintf("River: %s\n", *run.RiverName))
-	}
-	htmlDetails.WriteString(fmt.Sprintf("<li>Date: %s</li>", html.EscapeString(dateLine)))
-	textDetails.WriteString(fmt.Sprintf("Date: %s\n", dateLine))
-	if run.MeetupSpot != "" {
-		htmlDetails.WriteString(fmt.Sprintf("<li>Meet at: %s</li>", html.EscapeString(run.MeetupSpot)))
-		textDetails.WriteString(fmt.Sprintf("Meet at: %s\n", run.MeetupSpot))
-	}
-	if run.GaugeCFS != nil {
-		flowLine := fmt.Sprintf("%.0f CFS", *run.GaugeCFS)
-		if run.FlowBand != nil && *run.FlowBand != "" {
-			flowLine += " (" + *run.FlowBand + ")"
-		}
-		htmlDetails.WriteString(fmt.Sprintf("<li>Flow: %s</li>", html.EscapeString(flowLine)))
-		textDetails.WriteString(fmt.Sprintf("Flow: %s\n", flowLine))
-	}
+	// runDetailLines (notifications.go) — shared with every notify* sender
+	// in this package so the river/date/meetup/flow block isn't duplicated
+	// per email type.
+	htmlDetails, textDetails := runDetailLines(run.RiverName, run.RunDate, run.RunTime, run.MeetupSpot, run.GaugeCFS, run.FlowBand)
 
 	htmlBody = fmt.Sprintf(
 		`<p>@%s invited you on H2OFlows.</p><h2>%s</h2><ul>%s</ul><p><a href="%s">Accept</a></p>`,
-		html.EscapeString(run.HostHandle), html.EscapeString(run.Name), htmlDetails.String(), acceptURL,
+		html.EscapeString(run.HostHandle), html.EscapeString(run.Name), htmlDetails, acceptURL,
 	)
 	textBody = fmt.Sprintf(
 		"@%s invited you on H2OFlows.\n%s\n%s\nAccept: %s\n",
-		run.HostHandle, run.Name, textDetails.String(), acceptURL,
+		run.HostHandle, run.Name, textDetails, acceptURL,
 	)
 	return htmlBody, textBody
 }
@@ -256,7 +237,15 @@ type pendingRunInviteMail struct {
 // from a detached goroutine with its own context.Background()+timeout — the
 // triggering HTTP request's context dies at response. web#354 A2: one
 // VEVENT per invite (ics.BuildRunInvite), not the multi-VEVENT whole-plan
-// attachment.
+// attachment. API-1 (Invite Sync, D2): the attachment is now
+// METHOD:REQUEST — not PUBLISH — with SEQUENCE=p.run.ICSSequence (0 for a
+// fresh invite; the run's actual current sequence for a ResendInvite call,
+// which reuses this same function), ORGANIZER = the configured MAIL_FROM
+// identity (organizerName/organizerEmail, notifications.go —
+// SetMailFrom'd at startup), and ATTENDEE = the invitee (p.to; no display
+// name known yet for an email-only invitee, so AttendeeName is left "").
+// PUBLISH copies don't reconcile later updates in Outlook/Google/Apple — a
+// REQUEST does, via the fixed UID + this SEQUENCE.
 func sendRunInviteMail(mailer mail.Mailer, p pendingRunInviteMail) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -272,19 +261,33 @@ func sendRunInviteMail(mailer mail.Mailer, p pendingRunInviteMail) {
 
 	msg := mail.Message{To: p.to, Subject: subject, HTML: htmlBody, Text: textBody}
 	if p.attachICS {
-		icsBody := ics.BuildRunInvite(ics.RunInviteInput{
-			RunID:      p.run.ID,
-			Name:       p.run.Name,
-			RunDate:    p.run.RunDate,
-			RunTime:    p.run.RunTime,
-			MeetupSpot: p.run.MeetupSpot,
-			URL:        runURL,
+		icsBody, err := ics.BuildRunInvite(ics.RunInviteInput{
+			RunID:          p.run.ID,
+			Method:         ics.MethodRequest,
+			Sequence:       p.run.ICSSequence,
+			OrganizerName:  organizerName,
+			OrganizerEmail: organizerEmail,
+			AttendeeEmail:  p.to,
+			Name:           p.run.Name,
+			RunDate:        p.run.RunDate,
+			RunTime:        p.run.RunTime,
+			MeetupSpot:     p.run.MeetupSpot,
+			URL:            runURL,
 		})
-		msg.Attachments = append(msg.Attachments, mail.Attachment{
-			Filename:    "invite.ics",
-			ContentType: "text/calendar; charset=utf-8; method=PUBLISH",
-			Content:     []byte(icsBody),
-		})
+		if err != nil {
+			// Degrade to sending the email WITHOUT the .ics rather than not
+			// sending at all (e.g. MAIL_FROM unset locally -> empty
+			// organizerEmail -> ics.ErrMissingOrganizer) — the accept link
+			// in the body still works even if the calendar attachment can't
+			// be built.
+			log.Printf("invite mail: build ics failed (to=%s run=%s): %v", p.to, p.run.ID, err)
+		} else {
+			msg.Attachments = append(msg.Attachments, mail.Attachment{
+				Filename:    "invite.ics",
+				ContentType: "text/calendar; charset=utf-8; method=REQUEST",
+				Content:     []byte(icsBody),
+			})
+		}
 	}
 
 	if err := mailer.Send(ctx, msg); err != nil {
@@ -354,20 +357,42 @@ func (h *InviteHandler) InviteToRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// R4 (INVITE_SYNC_PLAN.md risks): run_invites_owner_uk is unique on
+		// (run_id, member_owner_id) with NO status filter — a previously
+		// DECLINED handle-invite row still occupies that slot forever, so a
+		// plain re-INSERT here would always 23505 on it, permanently
+		// blocking re-inviting anyone who once declined. Resurrect that row
+		// instead (flip back to invited, clear the response) when it
+		// exists; only fall through to INSERT when there's nothing to
+		// resurrect — which keeps 409 for the genuinely-still-pending case
+		// (invited/accepted) unchanged below.
 		var inviteID, status string
-		err := h.db.QueryRow(ctx, `
-			INSERT INTO run_invites (run_id, member_owner_id, invite_handle, invited_by, origin, status)
-			VALUES ($1::uuid, $2, $3, $4, 'invite', 'invited')
+		resurrectErr := h.db.QueryRow(ctx, `
+			UPDATE run_invites
+			SET status = 'invited', origin = 'invite', invite_handle = $1, invited_by = $2,
+			    responded_at = NULL, dismissed_at = NULL, updated_at = NOW()
+			WHERE run_id = $3::uuid AND member_owner_id = $4 AND status = 'declined'
 			RETURNING id, status::text
-		`, runID, targetOwnerID, handle, ownerID).Scan(&inviteID, &status)
-		if err != nil {
-			var pgErr *pgconn.PgError
-			if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "run_invites_owner_uk" {
-				errorResponse(w, http.StatusConflict, "already invited to this run")
+		`, handle, ownerID, runID, targetOwnerID).Scan(&inviteID, &status)
+		if resurrectErr != nil {
+			if !errors.Is(resurrectErr, pgx.ErrNoRows) {
+				errorResponse(w, http.StatusInternalServerError, "invite failed")
 				return
 			}
-			errorResponse(w, http.StatusInternalServerError, "invite failed")
-			return
+			err := h.db.QueryRow(ctx, `
+				INSERT INTO run_invites (run_id, member_owner_id, invite_handle, invited_by, origin, status)
+				VALUES ($1::uuid, $2, $3, $4, 'invite', 'invited')
+				RETURNING id, status::text
+			`, runID, targetOwnerID, handle, ownerID).Scan(&inviteID, &status)
+			if err != nil {
+				var pgErr *pgconn.PgError
+				if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "run_invites_owner_uk" {
+					errorResponse(w, http.StatusConflict, "already invited to this run")
+					return
+				}
+				errorResponse(w, http.StatusInternalServerError, "invite failed")
+				return
+			}
 		}
 		jsonResponse(w, http.StatusCreated, map[string]any{"id": inviteID, "status": status, "sent": false})
 		return
@@ -396,20 +421,40 @@ func (h *InviteHandler) InviteToRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// R4 (INVITE_SYNC_PLAN.md risks): run_invites_email_uk is unique on
+		// (run_id, LOWER(invite_email)) WHERE member_owner_id IS NULL — with
+		// no status filter either, and decline never binds member_owner_id
+		// (only accept does), so a DECLINED email invite occupies that slot
+		// forever too. Same resurrect-before-insert fix as the handle
+		// branch above: flip the declined row back to invited with a fresh
+		// token instead of INSERTing a duplicate.
 		var inviteID, status string
-		err := h.db.QueryRow(ctx, `
-			INSERT INTO run_invites (run_id, invite_email, invited_by, origin, status, invite_token_hash, message)
-			VALUES ($1::uuid, $2, $3, 'invite', 'invited', $4, $5)
+		resurrectErr := h.db.QueryRow(ctx, `
+			UPDATE run_invites
+			SET status = 'invited', origin = 'invite', invite_token_hash = $1, invited_by = $2, message = $3,
+			    responded_at = NULL, dismissed_at = NULL, updated_at = NOW()
+			WHERE run_id = $4::uuid AND member_owner_id IS NULL AND LOWER(invite_email) = $5 AND status = 'declined'
 			RETURNING id, status::text
-		`, runID, email, ownerID, tokenHash, body.Message).Scan(&inviteID, &status)
-		if err != nil {
-			var pgErr *pgconn.PgError
-			if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "run_invites_email_uk" {
-				errorResponse(w, http.StatusConflict, "already invited to this run")
+		`, tokenHash, ownerID, body.Message, runID, email).Scan(&inviteID, &status)
+		if resurrectErr != nil {
+			if !errors.Is(resurrectErr, pgx.ErrNoRows) {
+				errorResponse(w, http.StatusInternalServerError, "invite failed")
 				return
 			}
-			errorResponse(w, http.StatusInternalServerError, "invite failed")
-			return
+			err := h.db.QueryRow(ctx, `
+				INSERT INTO run_invites (run_id, invite_email, invited_by, origin, status, invite_token_hash, message)
+				VALUES ($1::uuid, $2, $3, 'invite', 'invited', $4, $5)
+				RETURNING id, status::text
+			`, runID, email, ownerID, tokenHash, body.Message).Scan(&inviteID, &status)
+			if err != nil {
+				var pgErr *pgconn.PgError
+				if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "run_invites_email_uk" {
+					errorResponse(w, http.StatusConflict, "already invited to this run")
+					return
+				}
+				errorResponse(w, http.StatusInternalServerError, "invite failed")
+				return
+			}
 		}
 
 		go sendRunInviteMail(h.mailer, pendingRunInviteMail{to: email, rawToken: rawToken, attachICS: attachICS, run: run})
@@ -699,6 +744,17 @@ func (h *InviteHandler) AcceptInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Re-read the invite inside the run-serialized tx: the pre-lock read is
+	// stale under concurrent accepts (double-click / client retry), and the
+	// stale 'invited' value let the losing request skip this idempotent
+	// return, re-run the UPDATE, and fire a second organizer notification.
+	if err := tx.QueryRow(ctx,
+		`SELECT status::text, member_owner_id FROM run_invites WHERE id = $1::uuid`, inviteID,
+	).Scan(&status, &curMemberOwnerID); err != nil {
+		errorResponse(w, http.StatusNotFound, "invite not found")
+		return
+	}
+
 	if status == "accepted" && curMemberOwnerID != nil && *curMemberOwnerID == ownerID {
 		jsonResponse(w, http.StatusOK, map[string]string{"status": "accepted", "run_id": runID, "slug": slug})
 		return
@@ -752,6 +808,23 @@ func (h *InviteHandler) AcceptInvite(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusInternalServerError, "commit failed")
 		return
 	}
+
+	// API-1 Invite Sync, post-commit only (both below are best-effort side
+	// effects of a successful accept — neither should roll back or delay
+	// the accept itself, so they run after Commit, not inside the tx):
+	//   - upsertUserEmail: capture the accepter's email (see its doc
+	//     comment, plans.go) — one of the plan's three named call sites.
+	//   - notifyOrganizerAccepted (item 6, notifications.go): tell the
+	//     organizer "@accepter accepted" — in scope for THIS PR since
+	//     AcceptInvite is already being touched here. Fired async (`go`);
+	//     silently no-ops if the organizer has no user_emails row yet (R2).
+	if email != "" {
+		upsertUserEmail(ctx, h.db, ownerID, email)
+	}
+	var accepterHandle string
+	h.db.QueryRow(ctx, `SELECT COALESCE(handle, '') FROM user_profiles WHERE owner_id = $1`, ownerID).Scan(&accepterHandle)
+	go notifyOrganizerAccepted(h.mailer, h.db, runID, accepterHandle)
+
 	jsonResponse(w, http.StatusOK, map[string]string{"status": "accepted", "run_id": runID, "slug": slug})
 }
 

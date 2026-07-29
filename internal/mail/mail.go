@@ -18,6 +18,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	netmail "net/mail"
+	"strings"
 	"time"
 )
 
@@ -109,6 +111,27 @@ func buildResendPayload(from string, msg Message) resendPayload {
 		})
 	}
 	return payload
+}
+
+// ParseFromAddress parses the RFC 5322 MAIL_FROM config value (e.g.
+// "H2OFlows <trips@h2oflows.app>", config.Config.MailFrom's documented
+// shape) into its display name and bare email address — API-1 (Invite
+// Sync) uses this to build the ICS ORGANIZER identity
+// (internal/ics.RunInviteInput.OrganizerName/OrganizerEmail), which MUST
+// carry the exact address this package's ResendMailer sends From (see
+// NewResendMailer's doc comment) or Outlook/Google/Apple silently ignore
+// the scheduling update. Falls back to treating the whole trimmed string as
+// a bare address (empty name) if it doesn't parse as an RFC 5322 mailbox —
+// never panics, never returns an error; an unparseable/unset MAIL_FROM
+// degrades to "no organizer name" (and, if empty, an empty OrganizerEmail
+// that ics.BuildRunInvite itself then rejects — see its ErrMissingOrganizer)
+// rather than blocking startup.
+func ParseFromAddress(from string) (name, email string) {
+	addr, err := netmail.ParseAddress(from)
+	if err != nil {
+		return "", strings.TrimSpace(from)
+	}
+	return addr.Name, addr.Address
 }
 
 // Send implements Mailer.

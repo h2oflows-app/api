@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -137,6 +138,39 @@ func localNoonUTC(ctx context.Context, q dbQueryer, ownerID, runDate string) (ti
 		)
 	`, runDate, ownerID).Scan(&t)
 	return t, err
+}
+
+// upsertUserEmail is API-1 Invite Sync's email-capture helper
+// (INVITE_SYNC_PLAN.md §API): user_profiles has no email column (emails
+// otherwise ride the JWT per request, auth.EmailFromContext) — user_emails
+// (migration 000148) is the ONE stored-address table, and this is the ONLY
+// writer of it. Called from every authed write path that already has a
+// fresh email in hand: PlanHandler.CreateRun (plan_runs.go), the shared
+// findOrCreatePaddledLog (plan_runs.go, same call site as ensureHandle
+// above), and InviteHandler.AcceptInvite (invites.go, post-commit) — so
+// organizer/attendee notifications (notifications.go) have an address to
+// resolve later. Package-level (not a method) for the same reason
+// ensureHandle is: reusable across handler types. Takes dbQueryer (not
+// *pgxpool.Pool) so a caller inside a tx can pass it through too, though no
+// current caller does.
+//
+// Best-effort by design: skips silently on an empty email (dev-fallback/
+// API-key auth carries none — h.ownerID's devFallbackID path, or a caller
+// that simply has no auth.EmailFromContext hit) and only LOGS a DB error
+// rather than returning one — capturing an address must never fail the
+// write it's piggybacking on.
+func upsertUserEmail(ctx context.Context, q dbQueryer, ownerID, email string) {
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return
+	}
+	if _, err := q.Exec(ctx, `
+		INSERT INTO user_emails (owner_id, email, updated_at)
+		VALUES ($1, $2, NOW())
+		ON CONFLICT (owner_id) DO UPDATE SET email = EXCLUDED.email, updated_at = NOW()
+	`, ownerID, email); err != nil {
+		log.Printf("upsertUserEmail: best-effort capture failed (owner=%s): %v", ownerID, err)
+	}
 }
 
 // ensureHandle mirrors ReportHandler.ensureProfile (reports.go) — an event's

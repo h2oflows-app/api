@@ -136,6 +136,13 @@ func main() {
 	userProfiles := handlers.NewUserProfileHandler(pool)
 	moderation := handlers.NewModerationHandler(pool, devFallbackID)
 	handlers.SetWebBaseURL(cfg.WebBaseURL)
+	// API-1 Invite Sync: parse MAIL_FROM into the ORGANIZER identity every
+	// invite/notification .ics carries — MUST be the exact address the
+	// mailer above sends From (Outlook requirement, see
+	// handlers.SetMailFrom's doc comment). Call regardless of whether
+	// RESEND_API_KEY is set so ORGANIZER still renders sensibly under
+	// NoopMailer (local dev / CI) when MAIL_FROM is configured on its own.
+	handlers.SetMailFrom(cfg.MailFrom)
 	plans := handlers.NewPlanHandler(pool, devFallbackID)
 	invites := handlers.NewInviteHandler(pool, devFallbackID, mailer)
 	nudges := handlers.NewNudgeHandler(pool, devFallbackID)

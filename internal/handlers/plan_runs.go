@@ -338,6 +338,15 @@ func (h *PlanHandler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// API-1 Invite Sync: best-effort capture the caller's current login
+	// email (user_emails, migration 000148) so organizer-facing
+	// notifications (notifyOrganizerAccepted etc., notifications.go) have
+	// an address to resolve later — see upsertUserEmail's doc comment
+	// (plans.go).
+	if email, ok := auth.EmailFromContext(ctx); ok {
+		upsertUserEmail(ctx, h.db, ownerID, email)
+	}
+
 	jsonResponse(w, http.StatusCreated, map[string]string{"id": id, "slug": slug})
 }
 
@@ -939,6 +948,11 @@ func findOrCreatePaddledLog(
 	if _, herr := ensureHandle(ctx, db, ownerID, email); herr != nil {
 		return "", false, fmt.Errorf("could not assign user profile: %w", herr)
 	}
+	// API-1 Invite Sync: best-effort capture (see upsertUserEmail's doc
+	// comment, plans.go) — this is one of the three call sites the plan
+	// names explicitly (POST /plan-runs, findOrCreatePaddledLog,
+	// AcceptInvite).
+	upsertUserEmail(ctx, db, ownerID, email)
 
 	noon, nerr := localNoonUTC(ctx, db, ownerID, runDate)
 	if nerr != nil {
