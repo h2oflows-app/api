@@ -611,11 +611,13 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if curPaddled {
-		// Locked state (contract): ONLY name+notes editable, and only within
-		// 24h of paddled_at — mirrors reports.go's 24h edit-lock message. Name
-		// (web#354 A4) is grouped with Notes here, not with the structural
-		// fields blocked below: it's the same kind of user-descriptive text
-		// (what you called the trip), not trip logistics.
+		// Locked state: ONLY name+notes editable on a paddled run — the
+		// structural fields (date/meetup/crew/…) describe a trip that already
+		// happened. The reports-era 24h clock on name+notes was removed
+		// (user, 2026-07-29): descriptive text stays editable indefinitely.
+		// Name (web#354 A4) is grouped with Notes here, not with the
+		// structural fields blocked below: it's the same kind of
+		// user-descriptive text (what you called the trip), not logistics.
 		if body.RunDate != nil || body.RunTime != nil || body.Companions != nil ||
 			body.SortOrder != nil || body.Paddled != nil ||
 			body.LookingForCrew != nil || body.MaxCrew != nil ||
@@ -630,10 +632,6 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 		}
 		if name == nil && body.Notes == nil {
 			jsonResponse(w, http.StatusOK, map[string]string{"status": "ok"})
-			return
-		}
-		if curPaddledAt == nil || time.Since(*curPaddledAt) > 24*time.Hour {
-			errorResponse(w, http.StatusForbidden, "runs are locked for editing 24 hours after being marked paddled")
 			return
 		}
 		if _, err := h.db.Exec(ctx,
