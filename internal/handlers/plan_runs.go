@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -427,6 +428,7 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 	callerEmail, _ := auth.EmailFromContext(ctx)
 
 	var run planRunSummary
+	run.CrewMembers = []crewMemberHandle{} // never null — see planRunSummary.CrewMembers doc comment
 	var runTime *string
 	var paddledAtRaw *time.Time
 	var createdAtRaw time.Time
@@ -526,6 +528,29 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 		return
 	}
 
+	// API-2 crew_members (INVITE_SYNC_PLAN.md Amendments): ACCEPTED crew
+	// handles only, run AFTER the visibility gate above so a caller who
+	// can't see the run at all never triggers this query. INNER JOIN
+	// user_profiles is deliberate, not defensive: an accepted row always has
+	// a real member_owner_id (accept requires an account, AcceptInvite binds
+	// it), so this can never silently drop a real crew member — it just
+	// keeps the query from needing a COALESCE fallback a LEFT JOIN would
+	// otherwise require.
+	if crewRows, cerr := h.db.Query(ctx, `
+		SELECT up.handle FROM run_invites ri
+		JOIN user_profiles up ON up.owner_id = ri.member_owner_id
+		WHERE ri.run_id = $1::uuid AND ri.status = 'accepted'
+		ORDER BY up.handle
+	`, run.ID); cerr == nil {
+		for crewRows.Next() {
+			var cm crewMemberHandle
+			if crewRows.Scan(&cm.Handle) == nil {
+				run.CrewMembers = append(run.CrewMembers, cm)
+			}
+		}
+		crewRows.Close()
+	}
+
 	// web#354 A1: drop the `plan` wrapper — the run is standalone now, its
 	// fields stay flat under `run`.
 	jsonResponse(w, http.StatusOK, map[string]any{"run": run})
@@ -602,18 +627,34 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	var curUserReachID, curRunDate string
+	// curRunTime/curMeetupSpot/curName (API-2, INVITE_SYNC_PLAN.md item 2):
+	// the pre-update snapshot of the material-field set {run_date, run_time,
+	// meetup_spot, name} — diffed against the post-update RETURNING values
+	// below to decide whether this PATCH touched anything an
+	// accepted/pending invitee's external calendar cares about (ics_sequence
+	// itself is bumped via its own UPDATE below, then re-read fresh by
+	// notifyRunMaterialChange — no need to carry it through here).
+	// curRunTime/curMeetupSpot are normalized the SAME way the
+	// post-update RETURNING clauses are (COALESCE(...::text, '')) so the
+	// comparison is apples-to-apples — in particular, run_time is a TIME
+	// column that Postgres reformats on write (e.g. a client-sent "14:30"
+	// reads back as "14:30:00"), so comparing against the caller's raw JSON
+	// input instead of a DB-normalized value would false-positive on every
+	// save that merely resends the same time in a different but equivalent
+	// format.
+	var curUserReachID, curRunDate, curRunTime, curMeetupSpot, curName string
 	var curPaddled, curLookingForCrew bool
 	var curPaddledAt *time.Time
 	var curMaxCrew *int
 	err := h.db.QueryRow(ctx, `
 		SELECT COALESCE(cr.user_reach_id::text, ''), cr.run_date::text,
+		       COALESCE(cr.run_time::text, ''), COALESCE(cr.meetup_spot, ''), cr.name,
 		       cr.paddled, cr.paddled_at,
 		       cr.looking_for_crew, cr.max_crew
 		FROM calendar_runs cr
 		WHERE cr.id = $1 AND cr.owner_id = $2 AND cr.deleted_at IS NULL
-	`, runID, ownerID).Scan(&curUserReachID, &curRunDate, &curPaddled, &curPaddledAt,
-		&curLookingForCrew, &curMaxCrew)
+	`, runID, ownerID).Scan(&curUserReachID, &curRunDate, &curRunTime, &curMeetupSpot, &curName,
+		&curPaddled, &curPaddledAt, &curLookingForCrew, &curMaxCrew)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "run not found")
 		return
@@ -649,6 +690,15 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 		); err != nil {
 			errorResponse(w, http.StatusInternalServerError, "update failed")
 			return
+		}
+		// API-2 material-change fan-out (item 2): name is in the material set
+		// {run_date, run_time, meetup_spot, name} even on a paddled/locked
+		// run — the guard above already rejects every OTHER material field on
+		// a locked run, so name is the only one that can have actually
+		// changed here; no need for a post-update RETURNING round trip like
+		// the planned branch below uses.
+		if name != nil && *name != curName {
+			h.bumpSequenceAndNotifyMaterialChange(ctx, runID)
 		}
 		jsonResponse(w, http.StatusOK, map[string]string{"status": "ok"})
 		return
@@ -766,7 +816,14 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 		stampedAt = &now
 	}
 
-	_, err = h.db.Exec(ctx, `
+	// newRunDateOut/newRunTimeOut/newMeetupSpotOut/newNameOut (API-2, item 2):
+	// RETURNING the material set's POST-update, DB-normalized values in the
+	// same statement — rather than recomputing "what did COALESCE/CASE just
+	// resolve to" in Go — is the only way to diff against curRunTime/
+	// curMeetupSpot below without re-deriving Postgres's own TIME
+	// normalization/NULL-coalescing by hand.
+	var newRunDateOut, newRunTimeOut, newMeetupSpotOut, newNameOut string
+	err = h.db.QueryRow(ctx, `
 		UPDATE calendar_runs SET
 			run_date         = COALESCE($1::date, run_date),
 			run_time         = COALESCE($2, run_time),
@@ -788,6 +845,7 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 			name             = COALESCE($23, name),
 			updated_at       = NOW()
 		WHERE id = $14 AND owner_id = $15
+		RETURNING run_date::text, COALESCE(run_time::text, ''), COALESCE(meetup_spot, ''), name
 	`,
 		body.RunDate, body.RunTime, body.Notes, body.Companions, body.SortOrder,
 		restampFlow, stamp.CFS, stamp.Band, stamp.Color, stamp.GaugeID, stampedAt,
@@ -797,13 +855,41 @@ func (h *PlanHandler) UpdateRun(w http.ResponseWriter, r *http.Request) {
 		meetupSpotProvided, meetupSpot,
 		featureTouched, meetupRapidID, meetupAccessID,
 		name,
-	)
+	).Scan(&newRunDateOut, &newRunTimeOut, &newMeetupSpotOut, &newNameOut)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "update failed")
 		return
 	}
 
+	// API-2 material-change fan-out (item 2, diff-gating D3): strict value
+	// comparison against the pre-update snapshot — a PATCH touching only
+	// notes/companions/sort_order/crew/paddled leaves all four of these
+	// identical and sends nothing.
+	if newRunDateOut != curRunDate || newRunTimeOut != curRunTime ||
+		newMeetupSpotOut != curMeetupSpot || newNameOut != curName {
+		h.bumpSequenceAndNotifyMaterialChange(ctx, runID)
+	}
+
 	jsonResponse(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// bumpSequenceAndNotifyMaterialChange is UpdateRun's shared "a material
+// field actually changed" tail (API-2, item 2): persist calendar_runs.
+// ics_sequence += 1 SYNCHRONOUSLY (must land before notifyRunMaterialChange
+// re-reads it — that fires in its own goroutine immediately after this
+// returns, so the increment can't be async itself without a race against
+// that read) and only THEN fire the async fan-out. A failed bump logs and
+// skips the notify entirely rather than sending a REQUEST with a stale
+// SEQUENCE — most calendar clients (Outlook especially) silently ignore an
+// update whose SEQUENCE didn't increase, so sending one anyway would be
+// worse than not sending at all (a no-op that looks like nothing happened,
+// vs. a REQUEST recipients' calendars actively discard).
+func (h *PlanHandler) bumpSequenceAndNotifyMaterialChange(ctx context.Context, runID string) {
+	if _, err := h.db.Exec(ctx, `UPDATE calendar_runs SET ics_sequence = ics_sequence + 1 WHERE id = $1::uuid`, runID); err != nil {
+		log.Printf("UpdateRun: bump ics_sequence failed run=%s: %v", runID, err)
+		return
+	}
+	go notifyRunMaterialChange(h.mailer, h.db, runID)
 }
 
 // ── DELETE /plan-runs/{id} ───────────────────────────────────────────────
@@ -830,6 +916,19 @@ func (h *PlanHandler) DeleteRun(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusNotFound, "run not found")
 		return
 	}
+
+	// API-2 CANCEL fan-out (item 3): SEQUENCE bump must land synchronously
+	// before the async notify (same reasoning as
+	// bumpSequenceAndNotifyMaterialChange above) — loadRunForNotify inside
+	// notifyRunCancelled has no deleted_at filter by design (runNotifyInfo's
+	// doc comment, notifications.go), so it still resolves this run's data
+	// even though the tombstone above already committed.
+	if _, serr := h.db.Exec(r.Context(), `UPDATE calendar_runs SET ics_sequence = ics_sequence + 1 WHERE id = $1::uuid`, runID); serr != nil {
+		log.Printf("DeleteRun: bump ics_sequence failed run=%s: %v", runID, serr)
+	} else {
+		go notifyRunCancelled(h.mailer, h.db, runID)
+	}
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
