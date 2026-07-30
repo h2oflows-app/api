@@ -143,7 +143,7 @@ func main() {
 	// RESEND_API_KEY is set so ORGANIZER still renders sensibly under
 	// NoopMailer (local dev / CI) when MAIL_FROM is configured on its own.
 	handlers.SetMailFrom(cfg.MailFrom)
-	plans := handlers.NewPlanHandler(pool, devFallbackID)
+	plans := handlers.NewPlanHandler(pool, devFallbackID, mailer)
 	invites := handlers.NewInviteHandler(pool, devFallbackID, mailer)
 	nudges := handlers.NewNudgeHandler(pool, devFallbackID)
 	discover := handlers.NewDiscoverHandler(pool, devFallbackID)
@@ -348,6 +348,9 @@ func main() {
 		r.Get("/me/invites", invites.MyInvites)
 		r.Post("/invites/{id}/accept", invites.AcceptInvite)
 		r.Post("/invites/{id}/dismiss", invites.DismissInvite)
+		// API-2 (item 4, D6): attendee decline/remove-from-calendar — grouped
+		// with the other /plan-runs/{id}/* invite routes per the plan.
+		r.Post("/plan-runs/{id}/leave", invites.LeaveRun)
 		r.Post("/plan-runs/{id}/join", invites.JoinRun)
 		r.Get("/plan-runs/{id}/crew", invites.RunCrewList)
 		r.Post("/plan-runs/{id}/crew/{inviteId}/accept", invites.RunCrewAccept)
