@@ -143,7 +143,7 @@ func main() {
 	// RESEND_API_KEY is set so ORGANIZER still renders sensibly under
 	// NoopMailer (local dev / CI) when MAIL_FROM is configured on its own.
 	handlers.SetMailFrom(cfg.MailFrom)
-	plans := handlers.NewPlanHandler(pool, devFallbackID)
+	plans := handlers.NewPlanHandler(pool, devFallbackID, mailer)
 	invites := handlers.NewInviteHandler(pool, devFallbackID, mailer)
 	nudges := handlers.NewNudgeHandler(pool, devFallbackID)
 	discover := handlers.NewDiscoverHandler(pool, devFallbackID)

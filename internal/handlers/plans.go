@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
 	"github.com/h2oflow/h2oflow/apps/api/internal/kmlimport"
+	"github.com/h2oflow/h2oflow/apps/api/internal/mail"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -41,11 +42,20 @@ import (
 type PlanHandler struct {
 	db            *pgxpool.Pool
 	devFallbackID string
+	mailer        mail.Mailer
 	rl            *reportRateLimiter // reused: generic (owner,limit,window) limiter — see reports.go
 }
 
-func NewPlanHandler(db *pgxpool.Pool, devFallbackID string) *PlanHandler {
-	return &PlanHandler{db: db, devFallbackID: devFallbackID, rl: newReportRateLimiter()}
+// NewPlanHandler's mailer param is API-2 Invite Sync: UpdateRun/DeleteRun
+// (plan_runs.go) fire notifyRunMaterialChange/notifyRunCancelled
+// (notifications.go), which need a mail.Mailer the same way InviteHandler
+// already does — nil degrades to mail.NoopMailer{}, same shape as
+// NewInviteHandler (invites.go).
+func NewPlanHandler(db *pgxpool.Pool, devFallbackID string, mailer mail.Mailer) *PlanHandler {
+	if mailer == nil {
+		mailer = mail.NoopMailer{}
+	}
+	return &PlanHandler{db: db, devFallbackID: devFallbackID, mailer: mailer, rl: newReportRateLimiter()}
 }
 
 func (h *PlanHandler) ownerID(r *http.Request) (string, bool) {
@@ -347,6 +357,23 @@ type planRunSummary struct {
 	// /me/runs/{slug} instead of the public /users/{handle}/runs/{slug}).
 	UserReachSlug        *string `json:"user_reach_slug,omitempty"`
 	UserReachOwnerHandle *string `json:"user_reach_owner_handle,omitempty"`
+	// CrewMembers (API-2, INVITE_SYNC_PLAN.md Amendments — "Crew who ran it
+	// belongs in the log"): ACCEPTED crew handles only (never emails — an
+	// email-only accepted row can't exist, accept requires an account),
+	// visible to ANYONE who can see the run at all (planned = who's coming;
+	// logged = who ran it) — no extra gate beyond the run's own visibility
+	// check. Always a non-nil, possibly-empty slice (never omitted/null) so
+	// the web can render "Crew: …" without a nil check. Populated by
+	// renderPlanRun (plan_runs.go); left as its zero value ([]crewMemberHandle{},
+	// set at construction) everywhere else planRunSummary is built (e.g.
+	// renderPlan's event itinerary) — those callers weren't in API-2's scope.
+	CrewMembers []crewMemberHandle `json:"crew_members"`
+}
+
+// crewMemberHandle is one row of planRunSummary.CrewMembers — handle only,
+// by design (see that field's doc comment).
+type crewMemberHandle struct {
+	Handle string `json:"handle"`
 }
 
 type itineraryDay struct {
@@ -580,6 +607,7 @@ func (h *PlanHandler) renderPlan(w http.ResponseWriter, r *http.Request, eventID
 	runsByDate := map[string][]planRunSummary{}
 	for rows.Next() {
 		var run planRunSummary
+		run.CrewMembers = []crewMemberHandle{} // never null — see field doc comment
 		var paddledAtRaw *time.Time
 		var createdAtRaw time.Time
 		var meetupRapidID, meetupAccessID *string
