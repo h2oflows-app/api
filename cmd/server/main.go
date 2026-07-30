@@ -348,6 +348,9 @@ func main() {
 		r.Get("/me/invites", invites.MyInvites)
 		r.Post("/invites/{id}/accept", invites.AcceptInvite)
 		r.Post("/invites/{id}/dismiss", invites.DismissInvite)
+		// API-2 (item 4, D6): attendee decline/remove-from-calendar — grouped
+		// with the other /plan-runs/{id}/* invite routes per the plan.
+		r.Post("/plan-runs/{id}/leave", invites.LeaveRun)
 		r.Post("/plan-runs/{id}/join", invites.JoinRun)
 		r.Get("/plan-runs/{id}/crew", invites.RunCrewList)
 		r.Post("/plan-runs/{id}/crew/{inviteId}/accept", invites.RunCrewAccept)
