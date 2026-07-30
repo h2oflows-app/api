@@ -197,12 +197,14 @@ func runInviteSubject(host string, run invitedRunInfo) string {
 // buildRunInviteEmailBody renders the invite (contract §6: "a non-user gets
 // full trip context without ever signing in") — river, date/time, meetup,
 // flow, then a single Accept link. web#354 A2: replaces the whole-plan
-// itinerary layout (buildInviteEmailBody) — one run, one link
-// ({WEB_BASE_URL}/plan-runs/{id}?invite={token}, lands on the run page, not
-// the event page). Returns HTML + a plain-text mirror.
-func buildRunInviteEmailBody(run invitedRunInfo, runURL, rawToken string) (htmlBody, textBody string) {
-	acceptURL := fmt.Sprintf("%s?invite=%s", runURL, rawToken)
-
+// itinerary layout (buildInviteEmailBody) — one run, one link. acceptURL is
+// caller-supplied (sendRunInviteMail): {WEB_BASE_URL}/plan-runs/{id}?invite=
+// {token} for an email invitee (lands on the run page, claims via token —
+// they have no account yet), or the bare {WEB_BASE_URL}/plan-runs/{id} for a
+// handle invitee (API-1.x follow-up: they already have an account and
+// accept IN-APP — the feed + their member row surface the invite — so there
+// is no token to mint or embed). Returns HTML + a plain-text mirror.
+func buildRunInviteEmailBody(run invitedRunInfo, acceptURL string) (htmlBody, textBody string) {
 	// runDetailLines (notifications.go) — shared with every notify* sender
 	// in this package so the river/date/meetup/flow block isn't duplicated
 	// per email type.
@@ -226,10 +228,19 @@ func buildRunInviteEmailBody(run invitedRunInfo, runURL, rawToken string) (htmlB
 // kept for ResendInvite's UPDATE too, and to keep this codepath consistent
 // with sendInviteMail's original contract).
 type pendingRunInviteMail struct {
-	to        string
+	to string
+	// rawToken is "" for a handle invite (API-1.x follow-up): a handle
+	// invitee already has an account and accepts IN-APP, so there is no
+	// claim token to mint/embed — sendRunInviteMail links plainly to the run
+	// instead of {runURL}?invite={rawToken}.
 	rawToken  string
 	attachICS bool
-	run       invitedRunInfo
+	// attendeeName feeds the ICS ATTENDEE;CN= for this recipient — "" for an
+	// email invitee (no display name known before they have an account,
+	// same as before this field existed), the invitee's own handle for a
+	// handle invite.
+	attendeeName string
+	run          invitedRunInfo
 }
 
 // sendRunInviteMail builds the invite email (+ .ics attachment when
@@ -242,10 +253,14 @@ type pendingRunInviteMail struct {
 // fresh invite; the run's actual current sequence for a ResendInvite call,
 // which reuses this same function), ORGANIZER = the configured MAIL_FROM
 // identity (organizerName/organizerEmail, notifications.go —
-// SetMailFrom'd at startup), and ATTENDEE = the invitee (p.to; no display
-// name known yet for an email-only invitee, so AttendeeName is left "").
-// PUBLISH copies don't reconcile later updates in Outlook/Google/Apple — a
-// REQUEST does, via the fixed UID + this SEQUENCE.
+// SetMailFrom'd at startup), and ATTENDEE = the invitee (p.to, CN=
+// p.attendeeName — "" for an email-only invitee with no display name known
+// yet). PUBLISH copies don't reconcile later updates in Outlook/Google/
+// Apple — a REQUEST does, via the fixed UID + this SEQUENCE.
+//
+// API-1.x follow-up: also reused (with rawToken=="") from InviteToRun's
+// handle branch — see pendingRunInviteMail's field docs above for how the
+// accept link and ATTENDEE CN differ for that path.
 func sendRunInviteMail(mailer mail.Mailer, p pendingRunInviteMail) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -256,8 +271,17 @@ func sendRunInviteMail(mailer mail.Mailer, p pendingRunInviteMail) {
 	}
 	runURL := fmt.Sprintf("%s/plan-runs/%s", webBaseURL, p.run.ID)
 
+	// acceptURL: an email invitee has no account yet, so the link carries
+	// their ?invite= claim token; a handle invitee (p.rawToken == "") already
+	// has one and accepts in-app, so the link is just the plain run page —
+	// see pendingRunInviteMail.rawToken's doc comment.
+	acceptURL := runURL
+	if p.rawToken != "" {
+		acceptURL = fmt.Sprintf("%s?invite=%s", runURL, p.rawToken)
+	}
+
 	subject := runInviteSubject(host, p.run)
-	htmlBody, textBody := buildRunInviteEmailBody(p.run, runURL, p.rawToken)
+	htmlBody, textBody := buildRunInviteEmailBody(p.run, acceptURL)
 
 	msg := mail.Message{To: p.to, Subject: subject, HTML: htmlBody, Text: textBody}
 	if p.attachICS {
@@ -267,6 +291,7 @@ func sendRunInviteMail(mailer mail.Mailer, p pendingRunInviteMail) {
 			Sequence:       p.run.ICSSequence,
 			OrganizerName:  organizerName,
 			OrganizerEmail: organizerEmail,
+			AttendeeName:   p.attendeeName,
 			AttendeeEmail:  p.to,
 			Name:           p.run.Name,
 			RunDate:        p.run.RunDate,
@@ -343,10 +368,10 @@ func (h *InviteHandler) InviteToRun(w http.ResponseWriter, r *http.Request) {
 	case body.Handle != nil && strings.TrimSpace(*body.Handle) != "":
 		handle := strings.TrimPrefix(strings.TrimSpace(*body.Handle), "@")
 
-		var targetOwnerID string
+		var targetOwnerID, targetHandle string
 		if err := h.db.QueryRow(ctx,
-			`SELECT owner_id FROM user_profiles WHERE LOWER(handle) = LOWER($1)`, handle,
-		).Scan(&targetOwnerID); err != nil {
+			`SELECT owner_id, handle FROM user_profiles WHERE LOWER(handle) = LOWER($1)`, handle,
+		).Scan(&targetOwnerID, &targetHandle); err != nil {
 			errorResponse(w, http.StatusNotFound, "user not found")
 			return
 		}
@@ -394,6 +419,22 @@ func (h *InviteHandler) InviteToRun(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+
+		// API-1.x follow-up: a handle invitee already has an account and
+		// accepts IN-APP (their run_invites member row + the feed surface
+		// the invite) — but if we already know their address (user_emails,
+		// resolveNotifyEmail below), send them the same invite email an
+		// email-invitee gets too, minus the claim token (sendRunInviteMail
+		// with rawToken=="" links plainly to the run instead of
+		// ?invite={token} — see its + pendingRunInviteMail's doc comments).
+		// Absent address -> silent skip, matching this branch's prior
+		// (email-free) behavior. Async, own goroutine, never blocks this
+		// response; response shape is unchanged either way ("sent" stays
+		// false — that field reflects the token-based email flow only).
+		if toEmail, ok := resolveNotifyEmail(ctx, h.db, &targetOwnerID, nil); ok {
+			go sendRunInviteMail(h.mailer, pendingRunInviteMail{to: toEmail, attachICS: true, attendeeName: targetHandle, run: run})
+		}
+
 		jsonResponse(w, http.StatusCreated, map[string]any{"id": inviteID, "status": status, "sent": false})
 		return
 

@@ -3,6 +3,8 @@ package handlers
 import (
 	"net/http"
 	"time"
+
+	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
 )
 
 // ── GET /me/calendar?from=&to=&tz= ────────────────────────────────────────
@@ -45,6 +47,18 @@ func (h *PlanHandler) Calendar(w http.ResponseWriter, r *http.Request) {
 	if _, err := parseDate(to); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid to")
 		return
+	}
+
+	// Broader email capture (API-1.x follow-up): this endpoint already
+	// upserts the caller's tz on every visit below — piggyback a best-effort
+	// upsertUserEmail (plans.go) the same way, so an active user's address
+	// gets captured on their next calendar load instead of waiting for one
+	// of the three narrower write paths (CreateRun/findOrCreatePaddledLog/
+	// AcceptInvite) to fire. upsertUserEmail already no-ops silently on an
+	// empty email (dev-fallback/API-key auth) and only log.Printf's a DB
+	// failure — never blocks or fails this request.
+	if email, ok := auth.EmailFromContext(ctx); ok {
+		upsertUserEmail(ctx, h.db, ownerID, email)
 	}
 
 	if tz != "" {
