@@ -936,19 +936,42 @@ func (h *InviteHandler) DismissInvite(w http.ResponseWriter, r *http.Request) {
 // Targets the caller's OWN row on runID — member match OR the same
 // email-fallback every other invite endpoint in this file uses (MyInvites/
 // AcceptInvite/DismissInvite) for a still-pending email invite that hasn't
-// bound member_owner_id yet — and only from a LIVE state (invited or
-// accepted; a request/declined row has nothing to leave).
+// bound member_owner_id yet.
 //
-// Idempotent by design: RowsAffected==0 doesn't distinguish "already
-// declined" from "never a member of this run" on its own, so a follow-up
-// EXISTS check (any status, not just invited/accepted) decides between a
-// 200 no-op (already left) and a 404 (no membership at all) — "keep it
-// simple + safe" per the plan, rather than threading the pre-flip status
-// through an extra SELECT-before-UPDATE like RunCrewDecline does below (that
-// extra round trip exists there to decide WHICH email to send, a distinction
-// this endpoint doesn't need — every actual flip here fires the same
-// notifyOrganizerDeclined regardless of whether the caller was invited or
-// already accepted).
+// Flips from invited/accepted/requested (review fix — a lingering
+// 'requested' join-request row used to survive "leave" untouched: the flip
+// only targeted invited/accepted, so a requester who called leave got a
+// false 200 "ok" while their request stayed live for the host to later
+// accept, seating them on a run they believed they'd left. There's no
+// separate withdraw-a-join-request endpoint, so leave is the only
+// attendee-facing "remove me" path and needs to cover all three live
+// states.
+//
+// deleted_at gate (review fix — leaving a cancelled run used to email the
+// organizer): the UPDATE now requires the run itself to still be live
+// (EXISTS ... deleted_at IS NULL), matching RunCrewDecline's cr.deleted_at
+// IS NULL gate and renderPlanRun. DeleteRun tombstones calendar_runs but
+// never touches run_invites, so without this a leave call racing (or
+// arriving after) a delete would still flip a live invite row and fire
+// notifyOrganizerDeclined for a run the organizer already deleted.
+//
+// origin-gated notify (review fix, same finding as the requested-row fix
+// above): flipping a 'requested' row is a genuine withdrawal, but it must
+// NOT trigger notifyOrganizerDeclined — that email's copy ("X declined —
+// invite someone else") assumes X was actually invited/seated, which is
+// wrong for someone withdrawing their own unactioned join request (the
+// plan's D5 deliberately keeps join-request churn silent, same reasoning as
+// RunCrewDecline's origin='request' skip). RETURNING origin decides.
+//
+// Idempotent by design: ErrNoRows doesn't distinguish "run is gone" /
+// "already declined" / "never a member of this run" on its own, so the
+// fallback below layers those checks in order — "keep it simple + safe" per
+// the plan, rather than threading the pre-flip status through an extra
+// SELECT-before-UPDATE like RunCrewDecline does above (that extra work
+// exists there to decide WHICH email to send AND to close a double-decline
+// race; this endpoint's only two notify branches are "origin='invite'" vs
+// "nothing", decided by the same RETURNING that performs the flip, so no
+// separate locking read is needed here).
 func (h *InviteHandler) LeaveRun(w http.ResponseWriter, r *http.Request) {
 	runID := chi.URLParam(r, "id")
 	ownerID, ok := h.ownerID(r)
@@ -959,28 +982,45 @@ func (h *InviteHandler) LeaveRun(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	email, _ := auth.EmailFromContext(ctx)
 
-	tag, err := h.db.Exec(ctx, `
+	var origin string
+	err := h.db.QueryRow(ctx, `
 		UPDATE run_invites
 		SET status = 'declined', responded_at = NOW(), updated_at = NOW()
-		WHERE run_id = $1::uuid AND status IN ('invited', 'accepted')
+		WHERE run_id = $1::uuid AND status IN ('invited', 'accepted', 'requested')
 		  AND (member_owner_id = $2 OR (member_owner_id IS NULL AND LOWER(invite_email) = LOWER($3)))
-	`, runID, ownerID, email)
-	if err != nil {
+		  AND EXISTS (SELECT 1 FROM calendar_runs cr WHERE cr.id = $1::uuid AND cr.deleted_at IS NULL)
+		RETURNING origin::text
+	`, runID, ownerID, email).Scan(&origin)
+	if err == nil {
+		// D5 ("notify organizer on accept AND on decline/leave") — fired
+		// ONLY for an actual invite/accept flip, never for a withdrawn join
+		// request (origin='request', see doc comment above) and never on
+		// the idempotent no-op path below. No .ics (see
+		// notifyOrganizerDeclined's own doc comment) and no ics_sequence
+		// bump — nothing material about the RUN itself changed, only this
+		// one attendee's own status, so other recipients' calendars have
+		// nothing to reconcile.
+		if origin == "invite" {
+			var declinerHandle string
+			h.db.QueryRow(ctx, `SELECT COALESCE(handle, '') FROM user_profiles WHERE owner_id = $1`, ownerID).Scan(&declinerHandle)
+			go notifyOrganizerDeclined(h.mailer, h.db, runID, declinerHandle)
+		}
+		jsonResponse(w, http.StatusOK, map[string]string{"status": "ok"})
+		return
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
 		errorResponse(w, http.StatusInternalServerError, "leave failed")
 		return
 	}
 
-	if tag.RowsAffected() > 0 {
-		// D5 ("notify organizer on accept AND on decline/leave") — fired
-		// ONLY on an actual flip, never on the idempotent no-op path below.
-		// No .ics (see notifyOrganizerDeclined's own doc comment) and no
-		// ics_sequence bump — nothing material about the RUN itself changed,
-		// only this one attendee's own status, so other recipients'
-		// calendars have nothing to reconcile.
-		var declinerHandle string
-		h.db.QueryRow(ctx, `SELECT COALESCE(handle, '') FROM user_profiles WHERE owner_id = $1`, ownerID).Scan(&declinerHandle)
-		go notifyOrganizerDeclined(h.mailer, h.db, runID, declinerHandle)
-		jsonResponse(w, http.StatusOK, map[string]string{"status": "ok"})
+	// No flip. Could be: the run is gone (404, consistent with
+	// renderPlanRun's own deleted_at gate), the caller was never a member
+	// (404), or they'd already left/declined (idempotent 200) — check in
+	// that order.
+	var runLive bool
+	h.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM calendar_runs WHERE id = $1::uuid AND deleted_at IS NULL)`, runID).Scan(&runLive)
+	if !runLive {
+		errorResponse(w, http.StatusNotFound, "run not found")
 		return
 	}
 
@@ -1283,13 +1323,23 @@ func (h *InviteHandler) RunCrewAccept(w http.ResponseWriter, r *http.Request) {
 //
 // API-2 uninvite email (item 5): this is the host-driven "uninvite" —
 // distinct from the attendee-driven LeaveRun above. The pre-flip
-// status/origin (read below, BEFORE the UPDATE — the flip always lands on
-// 'declined' regardless of where it came from, destroying that signal)
-// decides whether this is a real uninvite (an already-accepted crew member,
-// or a still-pending invite) vs. a join-request decline (origin='request',
-// "Host declines a join request | — | — | nobody (v1)", D5) — the latter
-// sends nothing, matching the plan's semantics map exactly.
-
+// status/origin decides whether this is a real uninvite (an already-accepted
+// crew member, or a still-pending invite) vs. a join-request decline
+// (origin='request', "Host declines a join request | — | — | nobody (v1)",
+// D5) — the latter sends nothing, matching the plan's semantics map exactly.
+//
+// Concurrency (review fix, double-decline finding): the pre-flip read and
+// the flip itself are ONE atomic statement — `old` is a locking CTE
+// (SELECT ... FOR UPDATE) feeding an UPDATE that only flips a row NOT
+// already 'declined', RETURNING the pre-flip status/origin it just read.
+// Two concurrent decline calls on the same accepted row serialize on the
+// FOR UPDATE lock: the first to commit flips and returns old.status=
+// 'accepted'; the second, once unblocked, re-evaluates `old` against the
+// now-'declined' row, the UPDATE's `status <> 'declined'` predicate excludes
+// it, and it gets ErrNoRows — same as LeaveRun's status-guarded UPDATE
+// above, which this endpoint previously lacked. Only the winner emails/
+// bumps; the loser falls into the idempotent "already declined" 200 path
+// below (same response shape a repeat call always got).
 func (h *InviteHandler) RunCrewDecline(w http.ResponseWriter, r *http.Request) {
 	runID := chi.URLParam(r, "id")
 	inviteID := chi.URLParam(r, "inviteId")
@@ -1316,34 +1366,46 @@ func (h *InviteHandler) RunCrewDecline(w http.ResponseWriter, r *http.Request) {
 
 	var preStatus, preOrigin string
 	var memberOwnerID, inviteEmail *string
-	var handle string
-	if err := h.db.QueryRow(ctx, `
-		SELECT ri.status::text, ri.origin::text, ri.member_owner_id, ri.invite_email,
-		       COALESCE(up.handle, ri.invite_handle, '')
-		FROM run_invites ri
-		LEFT JOIN user_profiles up ON up.owner_id = ri.member_owner_id
-		WHERE ri.id = $1::uuid AND ri.run_id = $2::uuid
-	`, inviteID, runID).Scan(&preStatus, &preOrigin, &memberOwnerID, &inviteEmail, &handle); err != nil {
-		errorResponse(w, http.StatusNotFound, "crew request not found")
-		return
-	}
-
-	tag, err := h.db.Exec(ctx, `
+	err := h.db.QueryRow(ctx, `
+		WITH old AS (
+			SELECT status::text, origin::text, member_owner_id, invite_email
+			FROM run_invites WHERE id = $1::uuid AND run_id = $2::uuid FOR UPDATE
+		)
 		UPDATE run_invites SET status = 'declined', responded_at = NOW(), updated_at = NOW()
-		WHERE id = $1::uuid AND run_id = $2::uuid
-	`, inviteID, runID)
+		FROM old
+		WHERE run_invites.id = $1::uuid AND run_invites.status <> 'declined'
+		RETURNING old.status, old.origin, old.member_owner_id, old.invite_email
+	`, inviteID, runID).Scan(&preStatus, &preOrigin, &memberOwnerID, &inviteEmail)
 	if err != nil {
-		errorResponse(w, http.StatusInternalServerError, "decline failed")
-		return
-	}
-	if tag.RowsAffected() == 0 {
-		errorResponse(w, http.StatusNotFound, "crew request not found")
+		if !errors.Is(err, pgx.ErrNoRows) {
+			errorResponse(w, http.StatusInternalServerError, "decline failed")
+			return
+		}
+		// No flip: either the row never existed, or it lost the race above
+		// (already 'declined' — by this same caller's retry, a concurrent
+		// decline, or a prior call). Distinguish the same way LeaveRun does:
+		// existence (any status) decides 404 vs. the idempotent 200 every
+		// repeat/losing decline call gets.
+		var exists bool
+		h.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM run_invites WHERE id = $1::uuid AND run_id = $2::uuid)`, inviteID, runID).Scan(&exists)
+		if !exists {
+			errorResponse(w, http.StatusNotFound, "crew request not found")
+			return
+		}
+		jsonResponse(w, http.StatusOK, map[string]string{"status": "declined"})
 		return
 	}
 
 	isUninvite := preStatus == "accepted" || (preOrigin == "invite" && preStatus == "invited")
 	if isUninvite {
 		if notifyEmail, ok := resolveNotifyEmail(ctx, h.db, memberOwnerID, inviteEmail); ok {
+			var handle string
+			h.db.QueryRow(ctx, `
+				SELECT COALESCE(up.handle, ri.invite_handle, '')
+				FROM run_invites ri
+				LEFT JOIN user_profiles up ON up.owner_id = ri.member_owner_id
+				WHERE ri.id = $1::uuid
+			`, inviteID).Scan(&handle)
 			// ics_sequence bumps ONLY when a CANCEL actually goes out (item
 			// 5) — an unresolvable address (R2 gap) means notifyUninvited
 			// has nothing to send, so there's no scheduling message whose
