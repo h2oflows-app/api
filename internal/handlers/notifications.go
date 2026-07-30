@@ -224,6 +224,35 @@ func runDetailLines(riverName *string, runDate, runTime, meetupSpot string, gaug
 	return hb.String(), tb.String()
 }
 
+// rsvpButtonHTML renders OUR Accept/View-run link as the visually primary
+// element of a METHOD:REQUEST-bearing email (API-2, INVITE_SYNC_PLAN.md
+// Amendments — "RSVP copy-steer"). Every REQUEST .ics carries ORGANIZER +
+// ATTENDEE lines (RFC 5546), which makes mail clients render their OWN
+// native Accept/Decline UI — a one-way iTIP REPLY nothing on our side reads
+// yet (inbound RSVP processing is a FUTURE, post-pilot wave). That native
+// UI would otherwise out-compete a plain text link, so this renders a
+// button-styled anchor (inline styles only — email clients strip external
+// CSS/JS) instead of buildRunInviteEmailBody/notifyRunMaterialChange's
+// previous bare `<a>`. Used by both initial-invite paths (handle and email —
+// they share buildRunInviteEmailBody, invites.go) and
+// notifyRunMaterialChange below; CANCEL emails (notifyRunCancelled,
+// notifyUninvited) don't call this — the Amendments explicitly exempt them.
+func rsvpButtonHTML(url, label string) string {
+	return fmt.Sprintf(
+		`<a href="%s" style="display:inline-block;padding:12px 24px;background:#0ea5e9;color:#ffffff;text-decoration:none;border-radius:6px;font-weight:bold;font-size:16px;">%s</a>`,
+		url, html.EscapeString(label),
+	)
+}
+
+// rsvpSteerLine wraps the Amendments' mandated copy in a de-emphasized
+// (small, gray) paragraph placed right under rsvpButtonHTML's button —
+// de-emphasized because the button above it, not this sentence, is the
+// primary call to action; the sentence only exists to explain why tapping
+// the mail client's own native RSVP UI wouldn't do what the reader expects.
+func rsvpSteerLine(sentence string) string {
+	return fmt.Sprintf(`<p style="color:#666666;font-size:13px;">%s</p>`, html.EscapeString(sentence))
+}
+
 // buildAndSendRunICSMail builds one email (with a per-recipient .ics
 // attachment) and sends it — the shared plumbing behind every sender in
 // this file that emits a REQUEST/CANCEL (notifyRunMaterialChange,
@@ -297,11 +326,21 @@ func notifyRunMaterialChange(mailer mail.Mailer, db *pgxpool.Pool, runID string)
 	subject := fmt.Sprintf("Trip updated: %s", run.Name)
 	runURL := fmt.Sprintf("%s/plan-runs/%s", webBaseURL, run.ID)
 	htmlDetails, textDetails := runDetailLines(run.RiverName, run.RunDate, run.RunTime, run.MeetupSpot, run.GaugeCFS, run.FlowBand)
+	// API-2 RSVP copy-steer (Amendments): this is also a METHOD:REQUEST
+	// .ics (buildAndSendRunICSMail below, ics.MethodRequest) — recipients
+	// include still-pending invitees as well as already-accepted crew
+	// (loadRunNotifyRecipients), so the steer line is adapted from
+	// buildRunInviteEmailBody's "tap Accept to join the crew" (that
+	// wouldn't read right for someone already on the crew) to name THIS
+	// email's own button, "View run", and point at managing an RSVP rather
+	// than joining one.
+	const steer = "RSVP in your mail app only updates your calendar — tap View run to update your RSVP on H2OFlows."
 	htmlBody := fmt.Sprintf(
-		`<p>%s updated <strong>%s</strong> on H2OFlows.</p><ul>%s</ul><p><a href="%s">View run</a></p>`,
-		html.EscapeString(host), html.EscapeString(run.Name), htmlDetails, runURL,
+		`<p>%s updated <strong>%s</strong> on H2OFlows.</p><ul>%s</ul><p>%s</p>%s`,
+		html.EscapeString(host), html.EscapeString(run.Name), htmlDetails,
+		rsvpButtonHTML(runURL, "View run"), rsvpSteerLine(steer),
 	)
-	textBody := fmt.Sprintf("%s updated %s.\n%s\nView run: %s\n", host, run.Name, textDetails, runURL)
+	textBody := fmt.Sprintf("%s updated %s.\n%s\nView run: %s\n\n%s\n", host, run.Name, textDetails, runURL, steer)
 
 	for _, rcpt := range recipients {
 		buildAndSendRunICSMail(ctx, mailer, run, rcpt, ics.MethodRequest, subject, htmlBody, textBody)
