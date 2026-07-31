@@ -368,6 +368,15 @@ type planRunSummary struct {
 	// set at construction) everywhere else planRunSummary is built (e.g.
 	// renderPlan's event itinerary) — those callers weren't in API-2's scope.
 	CrewMembers []crewMemberHandle `json:"crew_members"`
+	// HostHandle (prod-testing follow-up to API-1/2 Invite Sync): this run's
+	// OWNER's user_profiles.handle, so crew/viewers can render "Organizer @x"
+	// without a second lookup — naming reused from inviteRunSummary.HostHandle
+	// (invites.go), the equivalent field on the /me/invites run projection.
+	// Always present (not omitempty, '' fallback), same "always populated"
+	// contract as IsOwner above. Populated by renderPlanRun (plan_runs.go)
+	// only; left at its "" zero value everywhere else planRunSummary is built
+	// (e.g. renderPlan's event itinerary) — those callers weren't in scope.
+	HostHandle string `json:"host_handle"`
 }
 
 // crewMemberHandle is one row of planRunSummary.CrewMembers — handle only,

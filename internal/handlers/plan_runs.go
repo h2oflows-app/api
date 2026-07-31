@@ -446,10 +446,11 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 		       cr.meetup_spot, cr.meetup_rapid_id::text, cr.meetup_access_id::text,
 		       cr.owner_id,
 		       ur.slug, ur.owner_id::text, urp.handle,
-		       me.status, me.id
+		       me.status, me.id, COALESCE(hostp.handle, '')
 		FROM calendar_runs cr
 		LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
 		LEFT JOIN user_profiles urp ON urp.owner_id = ur.owner_id
+		LEFT JOIN user_profiles hostp ON hostp.owner_id = cr.owner_id
 		LEFT JOIN LATERAL (
 			SELECT COUNT(*) AS filled FROM run_invites ri
 			WHERE ri.run_id = cr.id AND ri.status = 'accepted'
@@ -468,7 +469,7 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 		&run.MeetupSpot, &meetupRapidID, &meetupAccessID,
 		&hostOwnerID,
 		&run.UserReachSlug, &userReachOwnerID, &userReachOwnerHandle,
-		&run.MyRSVP, &run.MyMemberID,
+		&run.MyRSVP, &run.MyMemberID, &run.HostHandle,
 	)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "run not found")
