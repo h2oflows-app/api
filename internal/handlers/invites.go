@@ -87,17 +87,21 @@ func (h *InviteHandler) respondAPIError(w http.ResponseWriter, err error) {
 // loadPlanRuns/loadInvitedPlanInfo, all removed — a single-run invite has no
 // fan-out to resolve or authorize beyond the run itself).
 type invitedRunInfo struct {
-	ID          string
-	Slug        string
-	Name        string
-	RiverName   *string
-	RunDate     string
-	RunTime     string // "" for an untimed run
-	MeetupSpot  string // "" when unset
-	GaugeCFS    *float64
-	FlowBand    *string
-	HostHandle  string
-	ICSSequence int // API-1: calendar_runs.ics_sequence — RFC 5546 SEQUENCE for this run's .ics UID
+	ID         string
+	Slug       string
+	Name       string
+	RiverName  *string
+	RunDate    string
+	RunTime    string // "" for an untimed run
+	MeetupSpot string // "" when unset
+	GaugeCFS   *float64
+	FlowBand   *string
+	HostHandle string
+	// HostDisplayName (display-names feature, mig 000130): additive
+	// alongside HostHandle, feeds sendRunInviteMail's hostLabel (displayLabel)
+	// — nil when the host has no display_name typed in.
+	HostDisplayName *string
+	ICSSequence     int // API-1: calendar_runs.ics_sequence — RFC 5546 SEQUENCE for this run's .ics UID
 	// Paddled (API-2, INVITE_SYNC_PLAN.md Amendments — "No inviting to
 	// logged runs"): InviteToRun/ResendInvite both reject with 422 when this
 	// is true, mirroring the UI gate already shipped (web#362, Invite button
@@ -121,13 +125,13 @@ func (h *InviteHandler) loadInvitedRunInfo(ctx context.Context, runID, hostOwner
 	err := h.db.QueryRow(ctx, `
 		SELECT cr.id, cr.slug, cr.name, ur.river_name, cr.run_date::text,
 		       COALESCE(cr.run_time::text, ''), COALESCE(cr.meetup_spot, ''),
-		       cr.gauge_cfs, cr.flow_band, COALESCE(up.handle, ''), cr.ics_sequence, cr.paddled
+		       cr.gauge_cfs, cr.flow_band, COALESCE(up.handle, ''), up.display_name, cr.ics_sequence, cr.paddled
 		FROM calendar_runs cr
 		LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
 		LEFT JOIN user_profiles up ON up.owner_id = cr.owner_id
 		WHERE cr.id = $1::uuid AND cr.owner_id = $2 AND cr.deleted_at IS NULL
 	`, runID, hostOwnerID).Scan(&ri.ID, &ri.Slug, &ri.Name, &ri.RiverName, &ri.RunDate,
-		&ri.RunTime, &ri.MeetupSpot, &ri.GaugeCFS, &ri.FlowBand, &ri.HostHandle, &ri.ICSSequence, &ri.Paddled)
+		&ri.RunTime, &ri.MeetupSpot, &ri.GaugeCFS, &ri.FlowBand, &ri.HostHandle, &ri.HostDisplayName, &ri.ICSSequence, &ri.Paddled)
 	if err != nil {
 		return invitedRunInfo{}, &apiError{http.StatusNotFound, "run not found"}
 	}
@@ -191,9 +195,13 @@ func formatUSTime(hms string) string {
 
 // runInviteSubject builds the email subject (contract §6, web#354 A2
 // single-run form): "@host invited you to run {RunName} on
-// {M/D/YYYY}[ at {h:MM AM}]".
-func runInviteSubject(host string, run invitedRunInfo) string {
-	line := fmt.Sprintf("@%s invited you to run %s on %s", host, run.Name, formatUSDate(run.RunDate))
+// {M/D/YYYY}[ at {h:MM AM}]". hostLabel is caller-rendered (sendRunInviteMail,
+// via displayLabel/the "a paddler" fallback) — display-names feature
+// (mig 000130): "Ian K (@iankco)" when the host has one set, plain
+// "@iankco" otherwise, so this function no longer bakes the "@" prefix in
+// itself.
+func runInviteSubject(hostLabel string, run invitedRunInfo) string {
+	line := fmt.Sprintf("%s invited you to run %s on %s", hostLabel, run.Name, formatUSDate(run.RunDate))
 	if t := formatUSTime(run.RunTime); t != "" {
 		line += " at " + t
 	}
@@ -218,7 +226,15 @@ func runInviteSubject(host string, run invitedRunInfo) string {
 // processing is a FUTURE wave). rsvpButtonHTML/rsvpSteerLine
 // (notifications.go) make OUR Accept link visually primary and add the
 // mandated steer line so the recipient taps THAT instead.
-func buildRunInviteEmailBody(run invitedRunInfo, acceptURL string) (htmlBody, textBody string) {
+//
+// hostLabel is caller-rendered (sendRunInviteMail — same value passed to
+// runInviteSubject, see its doc comment) rather than read off run.HostHandle
+// directly here — display-names feature (mig 000130), and incidentally
+// fixes this body ever going out bearing a bare "@" when a run's host has
+// no profile row (HostHandle == ""): sendRunInviteMail's "a paddler"
+// fallback now covers this call site too, whereas previously only the
+// subject got it.
+func buildRunInviteEmailBody(hostLabel string, run invitedRunInfo, acceptURL string) (htmlBody, textBody string) {
 	// runDetailLines (notifications.go) — shared with every notify* sender
 	// in this package so the river/date/meetup/flow block isn't duplicated
 	// per email type.
@@ -226,13 +242,13 @@ func buildRunInviteEmailBody(run invitedRunInfo, acceptURL string) (htmlBody, te
 
 	const steer = "RSVP in your mail app only updates your calendar — tap Accept to join the crew."
 	htmlBody = fmt.Sprintf(
-		`<p>@%s invited you on H2OFlows.</p><h2>%s</h2><ul>%s</ul><p>%s</p>%s`,
-		html.EscapeString(run.HostHandle), html.EscapeString(run.Name), htmlDetails,
+		`<p>%s invited you on H2OFlows.</p><h2>%s</h2><ul>%s</ul><p>%s</p>%s`,
+		html.EscapeString(hostLabel), html.EscapeString(run.Name), htmlDetails,
 		rsvpButtonHTML(acceptURL, "Accept"), rsvpSteerLine(steer),
 	)
 	textBody = fmt.Sprintf(
-		"@%s invited you on H2OFlows.\n%s\n%s\nAccept: %s\n\n%s\n",
-		run.HostHandle, run.Name, textDetails, acceptURL, steer,
+		"%s invited you on H2OFlows.\n%s\n%s\nAccept: %s\n\n%s\n",
+		hostLabel, run.Name, textDetails, acceptURL, steer,
 	)
 	return htmlBody, textBody
 }
@@ -253,8 +269,9 @@ type pendingRunInviteMail struct {
 	attachICS bool
 	// attendeeName feeds the ICS ATTENDEE;CN= for this recipient — "" for an
 	// email invitee (no display name known before they have an account,
-	// same as before this field existed), the invitee's own handle for a
-	// handle invite.
+	// same as before this field existed), the invitee's own
+	// user_profiles.display_name when set (display-names feature, mig
+	// 000130) else their handle, for a handle invite.
 	attendeeName string
 	run          invitedRunInfo
 }
@@ -281,9 +298,15 @@ func sendRunInviteMail(mailer mail.Mailer, p pendingRunInviteMail) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	host := p.run.HostHandle
-	if host == "" {
-		host = "a paddler"
+	// hostLabel (display-names feature, mig 000130): "Ian K (@iankco)" when
+	// the host has a display_name set, plain "@iankco" otherwise
+	// (displayLabel), or "a paddler" when there's no handle at all to
+	// render (a profile-less host — rare, pre-existing fallback). Computed
+	// once and threaded into both runInviteSubject and
+	// buildRunInviteEmailBody so subject/body never disagree.
+	hostLabel := "a paddler"
+	if p.run.HostHandle != "" {
+		hostLabel = displayLabel(p.run.HostDisplayName, p.run.HostHandle)
 	}
 	runURL := fmt.Sprintf("%s/plan-runs/%s", webBaseURL, p.run.ID)
 
@@ -301,8 +324,8 @@ func sendRunInviteMail(mailer mail.Mailer, p pendingRunInviteMail) {
 		acceptURL = fmt.Sprintf("%s?invite=%s&accept=1", runURL, p.rawToken)
 	}
 
-	subject := runInviteSubject(host, p.run)
-	htmlBody, textBody := buildRunInviteEmailBody(p.run, acceptURL)
+	subject := runInviteSubject(hostLabel, p.run)
+	htmlBody, textBody := buildRunInviteEmailBody(hostLabel, p.run, acceptURL)
 
 	msg := mail.Message{To: p.to, Subject: subject, HTML: htmlBody, Text: textBody}
 	if p.attachICS {
@@ -396,9 +419,10 @@ func (h *InviteHandler) InviteToRun(w http.ResponseWriter, r *http.Request) {
 		handle := strings.TrimPrefix(strings.TrimSpace(*body.Handle), "@")
 
 		var targetOwnerID, targetHandle string
+		var targetDisplayName *string
 		if err := h.db.QueryRow(ctx,
-			`SELECT owner_id, handle FROM user_profiles WHERE LOWER(handle) = LOWER($1)`, handle,
-		).Scan(&targetOwnerID, &targetHandle); err != nil {
+			`SELECT owner_id, handle, display_name FROM user_profiles WHERE LOWER(handle) = LOWER($1)`, handle,
+		).Scan(&targetOwnerID, &targetHandle, &targetDisplayName); err != nil {
 			errorResponse(w, http.StatusNotFound, "user not found")
 			return
 		}
@@ -459,7 +483,18 @@ func (h *InviteHandler) InviteToRun(w http.ResponseWriter, r *http.Request) {
 		// response; response shape is unchanged either way ("sent" stays
 		// false — that field reflects the token-based email flow only).
 		if toEmail, ok := resolveNotifyEmail(ctx, h.db, &targetOwnerID, nil); ok {
-			go sendRunInviteMail(h.mailer, pendingRunInviteMail{to: toEmail, attachICS: true, attendeeName: targetHandle, run: run})
+			// ATTENDEE;CN= (display-names feature, mig 000130): the
+			// invitee's display_name when they have one set, else their
+			// handle — this is a bound row (member_owner_id is set above at
+			// invite-creation time for a handle invite), so "else ''" never
+			// applies here, unlike the email-invite branch below.
+			attendeeName := targetHandle
+			if targetDisplayName != nil {
+				if dn := strings.TrimSpace(*targetDisplayName); dn != "" {
+					attendeeName = dn
+				}
+			}
+			go sendRunInviteMail(h.mailer, pendingRunInviteMail{to: toEmail, attachICS: true, attendeeName: attendeeName, run: run})
 		}
 
 		jsonResponse(w, http.StatusCreated, map[string]any{"id": inviteID, "status": status, "sent": false})
@@ -639,7 +674,7 @@ func (h *InviteHandler) ResendInvite(w http.ResponseWriter, r *http.Request) {
 
 // inviteRunSummary is the run projection embedded in each /me/invites item —
 // contract: {run_id, slug, name/river/state, run_date, run_time, meetup_spot,
-// flow fields, crew {filled,max}, host_handle}.
+// flow fields, crew {filled,max}, host_handle, host_display_name?}.
 // Name (web#354 A4) is the calendar run's OWN name (calendar_runs.name, NOT
 // NULL) — was sourced from the library run's join (COALESCE(ur.name,
 // 'Paddle')) prior to A4; that's now ReachName, kept as a separate field
@@ -661,6 +696,10 @@ type inviteRunSummary struct {
 	FlowColor  *string           `json:"flow_color,omitempty"`
 	Crew       discoverCrewMeter `json:"crew"`
 	HostHandle string            `json:"host_handle"`
+	// HostDisplayName (display-names feature, mig 000130): additive
+	// alongside HostHandle, same nil-means-fall-back-to-@handle contract as
+	// planRunSummary.HostDisplayName (plans.go).
+	HostDisplayName *string `json:"host_display_name,omitempty"`
 }
 
 type myInviteItem struct {
@@ -691,7 +730,7 @@ func (h *InviteHandler) MyInvites(w http.ResponseWriter, r *http.Request) {
 		       cr.run_date::text, cr.run_time::text, cr.meetup_spot,
 		       cr.gauge_cfs, cr.flow_band, cr.flow_color,
 		       cr.max_crew, COALESCE(cm.filled, 0),
-		       COALESCE(up.handle, '')
+		       COALESCE(up.handle, ''), up.display_name
 		FROM run_invites ri
 		JOIN calendar_runs cr ON cr.id = ri.run_id AND cr.deleted_at IS NULL
 		LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
@@ -724,7 +763,7 @@ func (h *InviteHandler) MyInvites(w http.ResponseWriter, r *http.Request) {
 			&item.Run.RunDate, &runTime, &item.Run.MeetupSpot,
 			&item.Run.GaugeCFS, &item.Run.FlowBand, &item.Run.FlowColor,
 			&item.Run.Crew.Max, &item.Run.Crew.Filled,
-			&item.Run.HostHandle,
+			&item.Run.HostHandle, &item.Run.HostDisplayName,
 		); err != nil {
 			errorResponse(w, http.StatusInternalServerError, "scan failed")
 			return
@@ -896,8 +935,9 @@ func (h *InviteHandler) AcceptInvite(w http.ResponseWriter, r *http.Request) {
 		upsertUserEmail(ctx, h.db, ownerID, email)
 	}
 	var accepterHandle string
-	h.db.QueryRow(ctx, `SELECT COALESCE(handle, '') FROM user_profiles WHERE owner_id = $1`, ownerID).Scan(&accepterHandle)
-	go notifyOrganizerAccepted(h.mailer, h.db, runID, accepterHandle)
+	var accepterDisplayName *string
+	h.db.QueryRow(ctx, `SELECT COALESCE(handle, ''), display_name FROM user_profiles WHERE owner_id = $1`, ownerID).Scan(&accepterHandle, &accepterDisplayName)
+	go notifyOrganizerAccepted(h.mailer, h.db, runID, accepterHandle, accepterDisplayName)
 
 	jsonResponse(w, http.StatusOK, map[string]string{"status": "accepted", "run_id": runID, "slug": slug})
 }
@@ -1007,8 +1047,9 @@ func (h *InviteHandler) LeaveRun(w http.ResponseWriter, r *http.Request) {
 		// nothing to reconcile.
 		if origin == "invite" {
 			var declinerHandle string
-			h.db.QueryRow(ctx, `SELECT COALESCE(handle, '') FROM user_profiles WHERE owner_id = $1`, ownerID).Scan(&declinerHandle)
-			go notifyOrganizerDeclined(h.mailer, h.db, runID, declinerHandle)
+			var declinerDisplayName *string
+			h.db.QueryRow(ctx, `SELECT COALESCE(handle, ''), display_name FROM user_profiles WHERE owner_id = $1`, ownerID).Scan(&declinerHandle, &declinerDisplayName)
+			go notifyOrganizerDeclined(h.mailer, h.db, runID, declinerHandle, declinerDisplayName)
 		}
 		jsonResponse(w, http.StatusOK, map[string]string{"status": "ok"})
 		return
@@ -1186,7 +1227,7 @@ func (h *InviteHandler) RunCrewList(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := h.db.Query(ctx, `
 		SELECT ri.id, ri.status::text, ri.origin::text, ri.message, ri.created_at,
-		       COALESCE(up.handle, ri.invite_handle, ''), ri.invite_email
+		       COALESCE(up.handle, ri.invite_handle, ''), ri.invite_email, up.display_name
 		FROM run_invites ri
 		LEFT JOIN user_profiles up ON up.owner_id = ri.member_owner_id
 		WHERE ri.run_id = $1::uuid
@@ -1215,12 +1256,19 @@ func (h *InviteHandler) RunCrewList(w http.ResponseWriter, r *http.Request) {
 		CreatedAt   string  `json:"created_at"`
 		Handle      string  `json:"handle"`
 		InviteEmail *string `json:"invite_email,omitempty"` // owner-only (see doc comment above); set only for pending email invites
+		// DisplayName (display-names feature, mig 000130): straight from the
+		// user_profiles join, additive alongside Handle — never a
+		// replacement. nil for a still-pending EMAIL invite (member_owner_id
+		// unset, so the LEFT JOIN has nothing to match — no account, no
+		// profile, no display_name) as well as for a bound member who simply
+		// hasn't typed one in.
+		DisplayName *string `json:"display_name,omitempty"`
 	}
 	members := []crewMember{}
 	for rows.Next() {
 		var cm crewMember
 		var createdAtRaw time.Time
-		if err := rows.Scan(&cm.MemberID, &cm.Status, &cm.Origin, &cm.Message, &createdAtRaw, &cm.Handle, &cm.InviteEmail); err != nil {
+		if err := rows.Scan(&cm.MemberID, &cm.Status, &cm.Origin, &cm.Message, &createdAtRaw, &cm.Handle, &cm.InviteEmail, &cm.DisplayName); err != nil {
 			errorResponse(w, http.StatusInternalServerError, "scan failed")
 			return
 		}
@@ -1408,9 +1456,14 @@ func (h *InviteHandler) RunCrewDecline(w http.ResponseWriter, r *http.Request) {
 	isUninvite := preStatus == "accepted" || (preOrigin == "invite" && preStatus == "invited")
 	if isUninvite {
 		if notifyEmail, ok := resolveNotifyEmail(ctx, h.db, memberOwnerID, inviteEmail); ok {
+			// ATTENDEE;CN= resolution (display-names feature, mig 000130):
+			// display_name when known > handle > the invite's captured
+			// invite_handle snapshot > '' — same COALESCE chain as
+			// loadRunNotifyRecipients (notifications.go), which this
+			// mirrors for the single-recipient uninvite case.
 			var handle string
 			h.db.QueryRow(ctx, `
-				SELECT COALESCE(up.handle, ri.invite_handle, '')
+				SELECT COALESCE(up.display_name, up.handle, ri.invite_handle, '')
 				FROM run_invites ri
 				LEFT JOIN user_profiles up ON up.owner_id = ri.member_owner_id
 				WHERE ri.id = $1::uuid

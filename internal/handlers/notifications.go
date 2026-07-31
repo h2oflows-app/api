@@ -83,7 +83,12 @@ type runNotifyInfo struct {
 	FlowBand    *string
 	HostOwnerID string
 	HostHandle  string
-	ICSSequence int
+	// HostDisplayName (display-names feature, mig 000130): nil when the host
+	// has no user_profiles row or hasn't typed a display_name in — feeds
+	// displayHost/displayLabel below, additive alongside HostHandle (never a
+	// replacement).
+	HostDisplayName *string
+	ICSSequence     int
 }
 
 // loadRunForNotify fetches runID's notification-relevant fields. See
@@ -94,14 +99,14 @@ func loadRunForNotify(ctx context.Context, db *pgxpool.Pool, runID string) (runN
 	err := db.QueryRow(ctx, `
 		SELECT cr.id, cr.name, ur.river_name, cr.run_date::text,
 		       COALESCE(cr.run_time::text, ''), COALESCE(cr.meetup_spot, ''),
-		       cr.gauge_cfs, cr.flow_band, cr.owner_id, COALESCE(up.handle, ''),
+		       cr.gauge_cfs, cr.flow_band, cr.owner_id, COALESCE(up.handle, ''), up.display_name,
 		       cr.ics_sequence
 		FROM calendar_runs cr
 		LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
 		LEFT JOIN user_profiles up ON up.owner_id = cr.owner_id
 		WHERE cr.id = $1::uuid
 	`, runID).Scan(&ri.ID, &ri.Name, &ri.RiverName, &ri.RunDate,
-		&ri.RunTime, &ri.MeetupSpot, &ri.GaugeCFS, &ri.FlowBand, &ri.HostOwnerID, &ri.HostHandle,
+		&ri.RunTime, &ri.MeetupSpot, &ri.GaugeCFS, &ri.FlowBand, &ri.HostOwnerID, &ri.HostHandle, &ri.HostDisplayName,
 		&ri.ICSSequence)
 	if err != nil {
 		return runNotifyInfo{}, err
@@ -112,7 +117,10 @@ func loadRunForNotify(ctx context.Context, db *pgxpool.Pool, runID string) (runN
 // notifyRecipient is one row of the run-scoped recipient fan-out (see
 // loadRunNotifyRecipients) — a currently-live invitee with a resolvable
 // email. DisplayName feeds ATTENDEE;CN=; empty is fine (attendeeLine omits
-// CN entirely — see internal/ics).
+// CN entirely — see internal/ics). Display-names feature (mig 000130):
+// resolution order is user_profiles.display_name (when known) > .handle >
+// the invite's captured invite_handle snapshot > "" — see
+// loadRunNotifyRecipients' COALESCE chain.
 type notifyRecipient struct {
 	InviteID      string
 	MemberOwnerID *string
@@ -132,7 +140,7 @@ type notifyRecipient struct {
 // after scanning, so the Go side never has to branch on an empty email.
 func loadRunNotifyRecipients(ctx context.Context, db *pgxpool.Pool, runID string) ([]notifyRecipient, error) {
 	rows, err := db.Query(ctx, `
-		SELECT ri.id, ri.member_owner_id, COALESCE(up.handle, ri.invite_handle, ''),
+		SELECT ri.id, ri.member_owner_id, COALESCE(up.display_name, up.handle, ri.invite_handle, ''),
 		       COALESCE(ue.email, ri.invite_email) AS notify_email
 		FROM run_invites ri
 		LEFT JOIN user_profiles up ON up.owner_id = ri.member_owner_id
@@ -322,7 +330,7 @@ func notifyRunMaterialChange(mailer mail.Mailer, db *pgxpool.Pool, runID string)
 		return
 	}
 
-	host := displayHost(run.HostHandle)
+	host := displayHost(run.HostDisplayName, run.HostHandle)
 	subject := fmt.Sprintf("Trip updated: %s", run.Name)
 	runURL := fmt.Sprintf("%s/plan-runs/%s", webBaseURL, run.ID)
 	htmlDetails, textDetails := runDetailLines(run.RiverName, run.RunDate, run.RunTime, run.MeetupSpot, run.GaugeCFS, run.FlowBand)
@@ -369,7 +377,7 @@ func notifyRunCancelled(mailer mail.Mailer, db *pgxpool.Pool, runID string) {
 		return
 	}
 
-	host := displayHost(run.HostHandle)
+	host := displayHost(run.HostDisplayName, run.HostHandle)
 	subject := fmt.Sprintf("Trip cancelled: %s", run.Name)
 	htmlBody := fmt.Sprintf(`<p>%s cancelled <strong>%s</strong> on H2OFlows.</p>`, html.EscapeString(host), html.EscapeString(run.Name))
 	textBody := fmt.Sprintf("%s cancelled %s.\n", host, run.Name)
@@ -418,8 +426,10 @@ func notifyUninvited(mailer mail.Mailer, db *pgxpool.Pool, runID string, rcpt no
 // organizer-facing response notifications carry no calendar payload (see
 // the plan's semantics map: the Accept/decline-to-organizer rows have no
 // METHOD). Silently no-ops if the host has no user_emails row yet (R2) —
-// resolveOrganizerNotifyEmail's ok=false.
-func notifyOrganizerDeclined(mailer mail.Mailer, db *pgxpool.Pool, runID, declinerHandle string) {
+// resolveOrganizerNotifyEmail's ok=false. declinerDisplayName (display-names
+// feature, mig 000130) is nil-safe (displayHost) and additive — the caller
+// resolves it alongside declinerHandle from the same user_profiles row.
+func notifyOrganizerDeclined(mailer mail.Mailer, db *pgxpool.Pool, runID, declinerHandle string, declinerDisplayName *string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -433,7 +443,7 @@ func notifyOrganizerDeclined(mailer mail.Mailer, db *pgxpool.Pool, runID, declin
 		return
 	}
 
-	who := displayHost(declinerHandle)
+	who := displayHost(declinerDisplayName, declinerHandle)
 	subject := fmt.Sprintf("%s can't make %s — invite someone else", who, run.Name)
 	runURL := fmt.Sprintf("%s/plan-runs/%s", webBaseURL, run.ID)
 	htmlBody := fmt.Sprintf(`<p>%s declined %s. Invite someone else to fill the spot.</p><p><a href="%s">Manage crew</a></p>`,
@@ -451,8 +461,11 @@ func notifyOrganizerDeclined(mailer mail.Mailer, db *pgxpool.Pool, runID, declin
 // the API-1 scope — since AcceptInvite is already being touched for
 // user_emails capture (the two land in the same commit). No .ics attached
 // (see notifyOrganizerDeclined's doc comment — same reasoning). Silently
-// no-ops if the host has no user_emails row yet (R2).
-func notifyOrganizerAccepted(mailer mail.Mailer, db *pgxpool.Pool, runID, accepterHandle string) {
+// no-ops if the host has no user_emails row yet (R2). accepterDisplayName
+// (display-names feature, mig 000130) is nil-safe (displayHost) and
+// additive — the caller resolves it alongside accepterHandle from the same
+// user_profiles row.
+func notifyOrganizerAccepted(mailer mail.Mailer, db *pgxpool.Pool, runID, accepterHandle string, accepterDisplayName *string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -466,7 +479,7 @@ func notifyOrganizerAccepted(mailer mail.Mailer, db *pgxpool.Pool, runID, accept
 		return
 	}
 
-	who := displayHost(accepterHandle)
+	who := displayHost(accepterDisplayName, accepterHandle)
 	subject := fmt.Sprintf("%s accepted your invite to %s", who, run.Name)
 	runURL := fmt.Sprintf("%s/plan-runs/%s", webBaseURL, run.ID)
 	htmlBody := fmt.Sprintf(`<p>%s accepted your invite to <strong>%s</strong>.</p><p><a href="%s">View run</a></p>`,
@@ -478,14 +491,44 @@ func notifyOrganizerAccepted(mailer mail.Mailer, db *pgxpool.Pool, runID, accept
 	}
 }
 
-// displayHost renders a handle for email copy — "@handle", or a generic
-// fallback when it's empty (mirrors invites.go's runInviteSubject/
-// sendRunInviteMail inline "a paddler" fallback, generalized into one
-// helper since this file needs the same shape in five places for two
-// different roles — host and decliner/accepter).
-func displayHost(handle string) string {
+// displayLabel renders a known handle for email subjects/bodies (display-
+// names feature, mig 000130): "Name (@handle)" when displayName is set and
+// non-blank, otherwise plain "@handle". handle must be non-empty — this
+// does NOT handle the "no handle at all" case (a profile-less host/decliner,
+// rare); callers with that possibility wrap it in their own fallback (see
+// displayHost below) rather than baking one generic fallback string in here,
+// since different call sites want different copy for it ("A paddler" vs.
+// invites.go's "a paddler" mid-sentence).
+//
+// Shared between this file (displayHost, four call sites) and invites.go
+// (runInviteSubject/buildRunInviteEmailBody/sendRunInviteMail — the initial-
+// invite path), so every place "@handle" appears in email copy renders the
+// same way. Distinct from the ICS ATTENDEE;CN= resolution
+// (loadRunNotifyRecipients/notifyRecipient.DisplayName, RunCrewDecline's
+// rcpt build): those want a single best-available STRING, falling back
+// through display_name, then handle, then invite_handle, then an empty
+// string (COALESCE) — not this paired "Name (@handle)" rendering. Email
+// subject/body copy always names the @handle explicitly even when a
+// display_name is also shown, per the product contract ("@handle stays the
+// primary identifier... everywhere").
+func displayLabel(displayName *string, handle string) string {
+	if displayName != nil {
+		if dn := strings.TrimSpace(*displayName); dn != "" {
+			return fmt.Sprintf("%s (@%s)", dn, handle)
+		}
+	}
+	return "@" + handle
+}
+
+// displayHost renders a host/decliner/accepter for email copy via
+// displayLabel, or a generic fallback when handle itself is empty (mirrors
+// invites.go's runInviteSubject/sendRunInviteMail inline "a paddler"
+// fallback, generalized into one helper since this file needs the same
+// shape in four places for two different roles — host and
+// decliner/accepter). displayName is nil-safe (see displayLabel).
+func displayHost(displayName *string, handle string) string {
 	if handle == "" {
 		return "A paddler"
 	}
-	return "@" + handle
+	return displayLabel(displayName, handle)
 }

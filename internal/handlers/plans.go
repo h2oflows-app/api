@@ -377,12 +377,25 @@ type planRunSummary struct {
 	// only; left at its "" zero value everywhere else planRunSummary is built
 	// (e.g. renderPlan's event itinerary) — those callers weren't in scope.
 	HostHandle string `json:"host_handle"`
+	// HostDisplayName (display-names feature, mig 000130): the host's
+	// user_profiles.display_name, additive alongside HostHandle — never a
+	// replacement, @handle stays the primary identifier. nil when unset
+	// (no profile row, or a profile row with no display_name typed in) so
+	// the web falls back to rendering "@" + HostHandle. Same
+	// renderPlanRun-only population contract as HostHandle above.
+	HostDisplayName *string `json:"host_display_name,omitempty"`
 }
 
-// crewMemberHandle is one row of planRunSummary.CrewMembers — handle only,
-// by design (see that field's doc comment).
+// crewMemberHandle is one row of planRunSummary.CrewMembers — handle plus an
+// optional display_name (display-names feature, mig 000130), additive
+// alongside Handle (never a replacement — see HostDisplayName's doc
+// comment). Every crew member here has an accepted run_invites row bound to
+// a real account (renderPlanRun's INNER JOIN — see that query's comment), so
+// DisplayName is nil only when that member has no display_name typed in,
+// never because the row is "unbound".
 type crewMemberHandle struct {
-	Handle string `json:"handle"`
+	Handle      string  `json:"handle"`
+	DisplayName *string `json:"display_name,omitempty"`
 }
 
 type itineraryDay struct {
