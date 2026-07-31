@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/h2oflow/h2oflow/apps/api/internal/auth"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -78,6 +80,21 @@ func (h *ProfileHandler) Get(w http.ResponseWriter, r *http.Request) {
 // path, not the pre-existing admin one.
 const maxDisplayNameLen = 60
 
+// stripControlRunes drops Unicode control characters (CR/LF/TAB included)
+// before display_name is stored: the value feeds ICS ATTENDEE;CN= params
+// and mail subjects, and RFC 5545 §3.2 has no escape for CTLs inside a
+// param value — an embedded newline would split the content line and let a
+// user inject arbitrary iCalendar properties into their own invite .ics.
+// Sanitizing at the single write boundary keeps every downstream sink safe.
+func stripControlRunes(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
 // PATCH /me/profile
 func (h *ProfileHandler) Update(w http.ResponseWriter, r *http.Request) {
 	ownerID, ok := h.ownerID(r)
@@ -114,8 +131,8 @@ func (h *ProfileHandler) Update(w http.ResponseWriter, r *http.Request) {
 	var dnValue *string
 	if body.DisplayName != nil {
 		dnProvided = true
-		trimmed := strings.TrimSpace(*body.DisplayName)
-		if len(trimmed) > maxDisplayNameLen {
+		trimmed := strings.TrimSpace(stripControlRunes(*body.DisplayName))
+		if utf8.RuneCountInString(trimmed) > maxDisplayNameLen {
 			errorResponse(w, http.StatusUnprocessableEntity, fmt.Sprintf("display_name must be %d characters or fewer", maxDisplayNameLen))
 			return
 		}

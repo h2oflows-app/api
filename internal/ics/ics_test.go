@@ -239,6 +239,32 @@ func TestBuildRunInvite_CNQuoting(t *testing.T) {
 	}
 }
 
+// TestBuildRunInvite_CNControlChars: a CRLF inside AttendeeName (user-typed
+// display_name is the only CN source that can carry one) must never split
+// the ATTENDEE content line — that would be property injection into the
+// VEVENT. Defense is layered (profile.go strips CTLs at the write boundary
+// too); this pins the ics-side guarantee independently.
+func TestBuildRunInvite_CNControlChars(t *testing.T) {
+	got, err := BuildRunInvite(RunInviteInput{
+		RunID:          "r3",
+		Name:           "Test Run",
+		RunDate:        "2026-08-01",
+		OrganizerEmail: "trips@h2oflows.app",
+		AttendeeName:   "Foo\r\nX-EVIL;CN=x",
+		AttendeeEmail:  "foo@x.io",
+	})
+	if err != nil {
+		t.Fatalf("BuildRunInvite error: %v", err)
+	}
+	// Unfold (RFC 5545 §3.1: CRLF + single space) before matching — the
+	// legitimate 75-octet fold is not the injection under test.
+	unfolded := strings.ReplaceAll(got, "\r\n ", "")
+	want := `ATTENDEE;CN="FooX-EVIL;CN=x";PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:foo@x.io`
+	if !strings.Contains(unfolded, want) {
+		t.Errorf("CRLF in CN split the content line: got %q, want a line containing %q", got, want)
+	}
+}
+
 // TestQuoteParamValue is the direct unit-level check of the RFC 5545 §3.2
 // param-value quoting rules quoteParamValue implements: any embedded DQUOTE
 // is stripped first (neither PTEXT nor QUOTED-STRING can represent one),
@@ -254,6 +280,12 @@ func TestQuoteParamValue(t *testing.T) {
 		"A: B":       `"A: B"`,
 		`Say "hi"`:   `Say hi`,    // DQUOTE stripped; no :;, left -> bare
 		`A, "B", C`:  `"A, B, C"`, // DQUOTE stripped, comma still forces quoting
+		// CTLs dropped — RFC 5545 §3.2 permits no control char in a param
+		// value; an embedded CRLF would otherwise split the content line
+		// (property injection via user-typed display_name).
+		"A\r\nB":                        "AB",
+		"Foo\r\nATTENDEE;CN=x:mailto:x": `"FooATTENDEE;CN=x:mailto:x"`,
+		"Tab\there":                     "Tabhere",
 	}
 	for in, want := range cases {
 		if got := quoteParamValue(in); got != want {
