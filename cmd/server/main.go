@@ -145,6 +145,18 @@ func main() {
 	handlers.SetMailFrom(cfg.MailFrom)
 	plans := handlers.NewPlanHandler(pool, devFallbackID, mailer)
 	invites := handlers.NewInviteHandler(pool, devFallbackID, mailer)
+	// Inbound RSVP webhook (project_invite_sync.md "future wave"): a
+	// Cloudflare Email Worker (infra/cloudflare/rsvp-inbound-worker.js)
+	// relays METHOD:REPLY mail sent to invites@h2oflows.app here. Gated by
+	// its own shared secret (X-RSVP-Secret / RSVP_INBOUND_SECRET), NOT
+	// Supabase JWT — see handlers.RSVPInboundHandler's doc comment. Unset
+	// secret is a valid local-dev/CI state; the handler refuses every
+	// request itself (503) rather than running open, but only logs that
+	// once, here, same as every other optional-integration log line below.
+	rsvpInbound := handlers.NewRSVPInboundHandler(pool, mailer, cfg.RSVPInboundSecret)
+	if cfg.RSVPInboundSecret == "" {
+		log.Println("rsvp-inbound disabled: RSVP_INBOUND_SECRET unset")
+	}
 	nudges := handlers.NewNudgeHandler(pool, devFallbackID)
 	discover := handlers.NewDiscoverHandler(pool, devFallbackID)
 	preferences := handlers.NewPreferencesHandler(pool, devFallbackID)
@@ -355,6 +367,15 @@ func main() {
 		r.Get("/plan-runs/{id}/crew", invites.RunCrewList)
 		r.Post("/plan-runs/{id}/crew/{inviteId}/accept", invites.RunCrewAccept)
 		r.Post("/plan-runs/{id}/crew/{inviteId}/decline", invites.RunCrewDecline)
+
+		// Inbound RSVP webhook — public (this r.Route("/api/v1", ...) block's
+		// only middleware is auth.Optional/loadAppRoles, same as every other
+		// un-grouped route here, e.g. /discover/runs above; NOT inside any
+		// auth.Required/RequireDataAdmin/RequireAdmin r.Group). A Supabase
+		// JWT has no meaning for this endpoint — its identity check is the
+		// email-level From==ATTENDEE compare inside the handler, gated by
+		// the X-RSVP-Secret shared secret, not a bearer token.
+		r.Post("/hooks/rsvp-inbound", rsvpInbound.Inbound)
 
 		// #246 A5: nudge + season + calendar prefs.
 		r.Get("/me/nudge/candidate", nudges.Candidate)
