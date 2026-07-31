@@ -290,10 +290,15 @@ func sendRunInviteMail(mailer mail.Mailer, p pendingRunInviteMail) {
 	// acceptURL: an email invitee has no account yet, so the link carries
 	// their ?invite= claim token; a handle invitee (p.rawToken == "") already
 	// has one and accepts in-app, so the link is just the plain run page —
-	// see pendingRunInviteMail.rawToken's doc comment.
-	acceptURL := runURL
+	// see pendingRunInviteMail.rawToken's doc comment. Both forms also carry
+	// accept=1 (prod-testing follow-up) so the web auto-accepts on landing
+	// when the viewer holds a pending invite for this run, instead of
+	// requiring a second tap once they're already on the page — distinct
+	// from notifyRunMaterialChange's "View run" link (notifications.go),
+	// which deliberately omits it since viewing an update isn't accepting.
+	acceptURL := runURL + "?accept=1"
 	if p.rawToken != "" {
-		acceptURL = fmt.Sprintf("%s?invite=%s", runURL, p.rawToken)
+		acceptURL = fmt.Sprintf("%s?invite=%s&accept=1", runURL, p.rawToken)
 	}
 
 	subject := runInviteSubject(host, p.run)
