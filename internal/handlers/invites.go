@@ -1189,6 +1189,10 @@ func (h *InviteHandler) RunCrewList(w http.ResponseWriter, r *http.Request) {
 		    ri.origin = 'request'
 		    OR ri.status = 'accepted'
 		    OR (ri.origin = 'invite' AND ri.status = 'invited' AND ri.dismissed_at IS NULL)
+		    -- Declined invite-origin rows too (WEB-3/4): the owner's roster
+		    -- shows "Declined" with a Re-invite affordance, and InviteToRun
+		    -- resurrects the same row — invisible here meant un-re-invitable.
+		    OR (ri.origin = 'invite' AND ri.status = 'declined')
 		  )
 		ORDER BY ri.created_at
 	`, runID)
