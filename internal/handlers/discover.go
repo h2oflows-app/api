@@ -200,19 +200,26 @@ type discoverCrewMeter struct {
 // nil for an orphaned run) — kept as a separate field for a subtitle, same
 // split every other calendar-domain summary in this package uses.
 type discoverCrewRun struct {
-	RunID      string            `json:"plan_run_id"`
-	Name       string            `json:"name"`
-	ReachName  *string           `json:"reach_name,omitempty"`
-	HostHandle string            `json:"host_handle"`
-	RunDate    string            `json:"run_date"`
-	RunTime    *string           `json:"run_time,omitempty"`
-	ClassMin   *float64          `json:"class_min,omitempty"`
-	ClassMax   *float64          `json:"class_max,omitempty"`
-	FlowBand   *string           `json:"flow_band,omitempty"`
-	FlowColor  *string           `json:"flow_color,omitempty"`
-	GaugeCFS   *float64          `json:"gauge_cfs,omitempty"`
-	MeetupSpot *string           `json:"meetup_spot,omitempty"`
-	Crew       discoverCrewMeter `json:"crew"`
+	RunID      string  `json:"plan_run_id"`
+	Name       string  `json:"name"`
+	ReachName  *string `json:"reach_name,omitempty"`
+	HostHandle string  `json:"host_handle"`
+	// HostDisplayName (display-names feature, mig 000130): additive
+	// alongside HostHandle — the user_profiles join is already here (up),
+	// so this is a free extra column, no new join. nil for the
+	// COALESCE(up.handle, 'h2oflows')-fallback synthetic-host case below
+	// (no real up row to read a display_name off of) as well as for a real
+	// host who hasn't typed one in.
+	HostDisplayName *string           `json:"host_display_name,omitempty"`
+	RunDate         string            `json:"run_date"`
+	RunTime         *string           `json:"run_time,omitempty"`
+	ClassMin        *float64          `json:"class_min,omitempty"`
+	ClassMax        *float64          `json:"class_max,omitempty"`
+	FlowBand        *string           `json:"flow_band,omitempty"`
+	FlowColor       *string           `json:"flow_color,omitempty"`
+	GaugeCFS        *float64          `json:"gauge_cfs,omitempty"`
+	MeetupSpot      *string           `json:"meetup_spot,omitempty"`
+	Crew            discoverCrewMeter `json:"crew"`
 }
 
 // ListPlans handles GET /api/v1/discover/plans — public crew-call browse.
@@ -277,7 +284,7 @@ func (h *DiscoverHandler) ListPlans(w http.ResponseWriter, r *http.Request) {
 	// additive alongside the existing reach-name/meetup_spot match, never
 	// narrows a previously-matching result).
 	rows, err := h.db.Query(ctx, `
-		SELECT cr.id::text, cr.name, ur.name, COALESCE(up.handle, 'h2oflows'),
+		SELECT cr.id::text, cr.name, ur.name, COALESCE(up.handle, 'h2oflows'), up.display_name,
 		       cr.run_date::text, cr.run_time::text,
 		       ur.class_min, ur.class_max, cr.flow_band, cr.flow_color, cr.gauge_cfs,
 		       cr.meetup_spot, cr.max_crew, COALESCE(cm.filled, 0)
@@ -306,7 +313,7 @@ func (h *DiscoverHandler) ListPlans(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var dr discoverCrewRun
 		if err := rows.Scan(
-			&dr.RunID, &dr.Name, &dr.ReachName, &dr.HostHandle, &dr.RunDate, &dr.RunTime,
+			&dr.RunID, &dr.Name, &dr.ReachName, &dr.HostHandle, &dr.HostDisplayName, &dr.RunDate, &dr.RunTime,
 			&dr.ClassMin, &dr.ClassMax, &dr.FlowBand, &dr.FlowColor, &dr.GaugeCFS,
 			&dr.MeetupSpot, &dr.Crew.Max, &dr.Crew.Filled,
 		); err != nil {

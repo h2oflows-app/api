@@ -446,7 +446,7 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 		       cr.meetup_spot, cr.meetup_rapid_id::text, cr.meetup_access_id::text,
 		       cr.owner_id,
 		       ur.slug, ur.owner_id::text, urp.handle,
-		       me.status, me.id, COALESCE(hostp.handle, '')
+		       me.status, me.id, COALESCE(hostp.handle, ''), hostp.display_name
 		FROM calendar_runs cr
 		LEFT JOIN user_reaches ur ON ur.id = cr.user_reach_id
 		LEFT JOIN user_profiles urp ON urp.owner_id = ur.owner_id
@@ -469,7 +469,7 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 		&run.MeetupSpot, &meetupRapidID, &meetupAccessID,
 		&hostOwnerID,
 		&run.UserReachSlug, &userReachOwnerID, &userReachOwnerHandle,
-		&run.MyRSVP, &run.MyMemberID, &run.HostHandle,
+		&run.MyRSVP, &run.MyMemberID, &run.HostHandle, &run.HostDisplayName,
 	)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, "run not found")
@@ -540,14 +540,14 @@ func (h *PlanHandler) renderPlanRun(w http.ResponseWriter, r *http.Request, runI
 	// keeps the query from needing a COALESCE fallback a LEFT JOIN would
 	// otherwise require.
 	if crewRows, cerr := h.db.Query(ctx, `
-		SELECT up.handle FROM run_invites ri
+		SELECT up.handle, up.display_name FROM run_invites ri
 		JOIN user_profiles up ON up.owner_id = ri.member_owner_id
 		WHERE ri.run_id = $1::uuid AND ri.status = 'accepted'
 		ORDER BY up.handle
 	`, run.ID); cerr == nil {
 		for crewRows.Next() {
 			var cm crewMemberHandle
-			if crewRows.Scan(&cm.Handle) == nil {
+			if crewRows.Scan(&cm.Handle, &cm.DisplayName) == nil {
 				run.CrewMembers = append(run.CrewMembers, cm)
 			}
 		}

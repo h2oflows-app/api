@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // Method values BuildRunInvite accepts. RunInviteInput.Method's zero value
@@ -237,7 +238,15 @@ func attendeeLine(name, email string) string {
 // otherwise it's returned bare (PTEXT), since those are the only three
 // characters that would otherwise be misread as param/property delimiters.
 func quoteParamValue(s string) string {
-	s = strings.ReplaceAll(s, `"`, "")
+	// DQUOTE has no escape inside a quoted param value, and CTLs (CR/LF
+	// above all) would split the content line — RFC 5545 §3.2 permits
+	// neither, so both are dropped regardless of what the caller stored.
+	s = strings.Map(func(r rune) rune {
+		if r == '"' || unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, s)
 	if strings.ContainsAny(s, ":;,") {
 		return `"` + s + `"`
 	}
