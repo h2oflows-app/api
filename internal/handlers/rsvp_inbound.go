@@ -46,6 +46,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/h2oflow/h2oflow/apps/api/internal/mail"
@@ -125,7 +126,11 @@ func (h *RSVPInboundHandler) Inbound(w http.ResponseWriter, r *http.Request) {
 
 	parsed, ignoreReason, perr := parseRSVPReply(raw)
 	if perr != nil {
-		log.Printf("rsvp-inbound: parse error envelope-from=%s: %v", redactEmail(envelopeFrom), perr)
+		// Deliberately does NOT echo perr: net/mail wraps the offending header
+		// text into its error string, and a malformed header line (e.g. an
+		// mbox-style "From attacker@example.com ..." separator) would leak an
+		// unredacted address into the logs. envelope-from is already redacted.
+		log.Printf("rsvp-inbound: parse error (unreadable message) envelope-from=%s", redactEmail(envelopeFrom))
 		jsonResponse(w, http.StatusOK, map[string]string{"status": "ignored"})
 		return
 	}
@@ -135,13 +140,27 @@ func (h *RSVPInboundHandler) Inbound(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Anti-spoof (see package doc comment): the shared secret only proves
-	// the Worker relayed SOME mail sent to invites@h2oflows.app — anyone on the
-	// internet can address mail there. The only signal that this REPLY
-	// actually came from the attendee is that their mail client sends it
-	// From their own account, so require From == ATTENDEE exactly (case-
-	// insensitively — RFC 5321 domain-parts are case-insensitive, and in
-	// practice no real mailbox provider enforces local-part case either).
+	// Anti-forgery layer 1 — DMARC. The From==ATTENDEE compare below only
+	// checks that two attacker-authorable fields agree; anyone can mail
+	// invites@h2oflows.app with a forged From set to a victim's address. But
+	// Cloudflare Email Routing evaluates the sender domain's DKIM/SPF and
+	// prepends an Authentication-Results header with the DMARC verdict — a
+	// forger can't produce a DKIM signature aligned to the victim's domain,
+	// so a forged From yields dmarc=fail/none. Require dmarc=pass. Fails
+	// closed: no pass verdict (missing header, misconfigured sender domain)
+	// -> ignored, never accepted. See dmarcPass for the parse.
+	if !parsed.AuthPass {
+		log.Printf("rsvp-inbound: ignored (no dmarc=pass) run=%s from=%s",
+			parsed.RunID, redactEmail(parsed.FromEmail))
+		jsonResponse(w, http.StatusOK, map[string]string{"status": "ignored"})
+		return
+	}
+
+	// Anti-forgery layer 2 — the REPLY must be about the mailbox it came
+	// from. DMARC proves From wasn't forged; this proves the RSVP concerns
+	// that same person (a genuine mail client sends the REPLY From the
+	// attendee's own account). Case-insensitive: RFC 5321 domain-parts are
+	// case-insensitive, and no real mailbox provider enforces local-part case.
 	if !strings.EqualFold(parsed.FromEmail, parsed.Attendee) {
 		log.Printf("rsvp-inbound: ignored (From != ATTENDEE) run=%s from=%s attendee=%s",
 			parsed.RunID, redactEmail(parsed.FromEmail), redactEmail(parsed.Attendee))
@@ -199,16 +218,40 @@ func (h *RSVPInboundHandler) applyRSVP(ctx context.Context, runID, attendeeEmail
 
 	// Run guard: must be live and not yet logged. Mirrors InviteToRun/
 	// ResendInvite's "no inviting to logged runs" gate (invites.go, API-2
-	// Amendments) — a REPLY for a deleted or already-paddled run has
-	// nothing left to RSVP to.
-	var runExists bool
-	if err := tx.QueryRow(ctx, `
-		SELECT EXISTS(SELECT 1 FROM calendar_runs WHERE id = $1::uuid AND deleted_at IS NULL AND NOT paddled)
-	`, runID).Scan(&runExists); err != nil {
+	// Amendments). SELECT ... FOR UPDATE (not EXISTS) so this transaction
+	// holds the calendar_runs row lock for its duration — every in-app flip
+	// path (AcceptInvite invites.go:854, RunCrewAccept :1320, LeaveRun) locks
+	// this same row, and AcceptInvite's double-notify fix is a PLAIN in-tx
+	// re-read whose correctness depends on all writers serializing on it. An
+	// inbound RSVP that only locked the run_invites row would race those
+	// paths (both could read the pre-flip status and both email the
+	// organizer); locking calendar_runs here closes that cross-path race.
+	var runDeleted, runPaddled bool
+	err = tx.QueryRow(ctx, `
+		SELECT deleted_at IS NOT NULL, paddled FROM calendar_runs WHERE id = $1::uuid FOR UPDATE
+	`, runID).Scan(&runDeleted, &runPaddled)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", "run not found", nil
+		}
 		return "", "", fmt.Errorf("run guard: %w", err)
 	}
-	if !runExists {
-		return "", "run not found, deleted, or already paddled", nil
+	if runDeleted || runPaddled {
+		return "", "run deleted or already paddled", nil
+	}
+
+	// The attendee's account owner_id, if they have one (user_emails captures
+	// an address per authed user, mig 000148). Used to (a) prefer their bound
+	// membership row in resolution and (b) BIND an unbound email-invite row on
+	// accept — AcceptInvite requires an account and binds member_owner_id, so
+	// inbound accept must too (an accepted row with member_owner_id NULL is a
+	// broken state AcceptInvite/RunCrewList mishandle). nil => no account.
+	var accepterOwnerID *string
+	if e := tx.QueryRow(ctx,
+		`SELECT owner_id FROM user_emails WHERE LOWER(email) = LOWER($1) ORDER BY owner_id LIMIT 1`,
+		attendeeEmail,
+	).Scan(&accepterOwnerID); e != nil && !errors.Is(e, pgx.ErrNoRows) {
+		return "", "", fmt.Errorf("resolve accepter account: %w", e)
 	}
 
 	// Resolve the invitee row for this run — email-invite match, OR a bound
@@ -216,11 +259,15 @@ func (h *RSVPInboundHandler) applyRSVP(ctx context.Context, runID, attendeeEmail
 	// invites.go's repeated "member_owner_id = $ownerID OR (member_owner_id
 	// IS NULL AND LOWER(invite_email) = LOWER($email))" pattern (LeaveRun/
 	// DismissInvite/MyInvites all use exactly that shape) for a caller that
-	// has only an EMAIL ADDRESS in hand, not an authenticated ownerID —
-	// inbound mail proves nothing about identity beyond "this address sent
-	// this REPLY" (checked by the From==ATTENDEE compare in Inbound above),
-	// so resolution runs the opposite direction here: email -> owner_id,
-	// not owner_id -> email.
+	// has only an EMAIL ADDRESS in hand, not an authenticated ownerID.
+	// ORDER BY prefers a BOUND row (member_owner_id NOT NULL) over an unbound
+	// email-invite row: the two can coexist for one person (run_invites_email_uk
+	// is partial on member_owner_id IS NULL, so it can't dedupe a bound row
+	// against an email-invite row — AcceptInvite's own 23505 comment
+	// acknowledges this state), and without an explicit order QueryRow would
+	// flip a nondeterministic one. Preferring the bound row makes a repeat
+	// accept an idempotent no-op instead of double-seating; created_at ASC is
+	// a stable final tie-break.
 	var inviteID, status, origin string
 	var memberOwnerID *string
 	err = tx.QueryRow(ctx, `
@@ -231,6 +278,8 @@ func (h *RSVPInboundHandler) applyRSVP(ctx context.Context, runID, attendeeEmail
 		    (ri.member_owner_id IS NULL AND LOWER(ri.invite_email) = LOWER($2))
 		    OR ri.member_owner_id IN (SELECT owner_id FROM user_emails WHERE LOWER(email) = LOWER($2))
 		  )
+		ORDER BY (ri.member_owner_id IS NOT NULL) DESC, ri.created_at ASC
+		LIMIT 1
 		FOR UPDATE
 	`, runID, attendeeEmail).Scan(&inviteID, &status, &origin, &memberOwnerID)
 	if err != nil {
@@ -243,6 +292,18 @@ func (h *RSVPInboundHandler) applyRSVP(ctx context.Context, runID, attendeeEmail
 	var notify bool
 	switch partstat {
 	case "ACCEPTED":
+		// Accept applies ONLY to host invites (origin='invite'), exactly like
+		// AcceptInvite (invites.go:897, WHERE origin='invite'). A 'request'-
+		// origin row is a self-initiated JoinRun awaiting HOST approval
+		// (RunCrewAccept, host-gated) — and no legitimate mail flow ever
+		// produces an ACCEPTED reply for one (JoinRun sends no ICS; only the
+		// host's InviteToRun emits a METHOD:REQUEST, which sets 'invited').
+		// Honoring an ACCEPTED reply on a 'requested' row would let a
+		// requester self-approve onto the crew, bypassing the host gate — so
+		// ignore it.
+		if origin != "invite" {
+			return "", "inbound accept applies to host invites only, not join requests", nil
+		}
 		switch status {
 		case "accepted":
 			return "", "already accepted (idempotent)", nil
@@ -263,12 +324,49 @@ func (h *RSVPInboundHandler) applyRSVP(ctx context.Context, runID, attendeeEmail
 			// the web UI), same as any other declined row.
 			return "", "was declined; inbound accept never resurrects a declined row (see code comment)", nil
 		}
-		// status IN ('invited', 'requested').
-		if _, uerr := tx.Exec(ctx, `
-			UPDATE run_invites SET status = 'accepted', responded_at = NOW(), updated_at = NOW()
-			WHERE id = $1::uuid
-		`, inviteID); uerr != nil {
-			return "", "", fmt.Errorf("flip to accepted: %w", uerr)
+		// status == 'invited'. Mirror AcceptInvite's accept UPDATE exactly:
+		// bind member_owner_id and single-use the token (invite_token_hash =
+		// NULL) so a later click of the same email link can't reassign the
+		// membership, and so we never leave the accepted+unbound state.
+		if memberOwnerID == nil {
+			// Unbound email invite. Binding REQUIRES an account (AcceptInvite
+			// contract decision #8). No account for this address -> can't make
+			// a proper membership; ignore and leave the invite pending so the
+			// invitee can still accept via the link + sign-in.
+			if accepterOwnerID == nil {
+				return "", "inbound accept needs an account; use the invite link to sign in", nil
+			}
+			tag, uerr := tx.Exec(ctx, `
+				UPDATE run_invites
+				SET status = 'accepted', member_owner_id = $2, invite_token_hash = NULL,
+				    responded_at = NOW(), updated_at = NOW()
+				WHERE id = $1::uuid AND status = 'invited'
+				  AND (member_owner_id IS NULL OR member_owner_id = $2)
+			`, inviteID, *accepterOwnerID)
+			if uerr != nil {
+				// Binding can hit run_invites_owner_uk (run_id, member_owner_id)
+				// if the accepter already holds a bound row on this run — the
+				// bound-first ORDER BY normally targets that row instead, so
+				// this is a belt-and-braces guard: treat the conflict as an
+				// idempotent no-op, not a 500.
+				if pgErr := (*pgconn.PgError)(nil); errors.As(uerr, &pgErr) && pgErr.Code == "23505" {
+					return "", "already a member of this run (bind conflict)", nil
+				}
+				return "", "", fmt.Errorf("flip to accepted (bind): %w", uerr)
+			}
+			if tag.RowsAffected() == 0 {
+				return "", "invite no longer in 'invited' state (raced)", nil
+			}
+			memberOwnerID = accepterOwnerID // for the organizer-notify handle lookup below
+		} else {
+			if _, uerr := tx.Exec(ctx, `
+				UPDATE run_invites
+				SET status = 'accepted', invite_token_hash = NULL,
+				    responded_at = NOW(), updated_at = NOW()
+				WHERE id = $1::uuid
+			`, inviteID); uerr != nil {
+				return "", "", fmt.Errorf("flip to accepted: %w", uerr)
+			}
 		}
 		action = "accepted"
 		notify = true // same side effect as AcceptInvite (invites.go): notifyOrganizerAccepted.
@@ -350,6 +448,27 @@ type parsedRSVP struct {
 	FromEmail string // the message's own From header address, lowercased
 	Attendee  string // the REPLY's ATTENDEE mailto: address, lowercased
 	PartStat  string // upper-cased PARTSTAT param value (ACCEPTED/DECLINED/TENTATIVE/NEEDS-ACTION/anything else a client sends)
+	AuthPass  bool   // true iff an Authentication-Results header reports dmarc=pass (anti-forgery; see dmarcPass)
+}
+
+// dmarcRE matches a DMARC "pass" verdict in an Authentication-Results header
+// value, tolerating the RFC 8601 whitespace/comment noise around the '='
+// (e.g. "dmarc=pass", "dmarc = pass", "dmarc=pass (p=none ...)").
+var dmarcRE = regexp.MustCompile(`(?i)\bdmarc\s*=\s*pass\b`)
+
+// dmarcPass reports whether any Authentication-Results header on the message
+// carries dmarc=pass. Cloudflare Email Routing computes DMARC against the
+// sending domain and prepends this header before relaying to the Worker;
+// ARC-Authentication-Results (a different header, added by intermediate
+// forwarders and NOT authoritative here) is deliberately ignored. Direct map
+// access uses the canonical key net/textproto stores headers under.
+func dmarcPass(h netmail.Header) bool {
+	for _, v := range h["Authentication-Results"] {
+		if dmarcRE.MatchString(v) {
+			return true
+		}
+	}
+	return false
 }
 
 // uidDomainSuffix is the fixed suffix every UID this app ever emits carries
@@ -389,6 +508,7 @@ func parseRSVPReply(raw []byte) (parsedRSVP, string, error) {
 		return parsedRSVP{}, "no parseable From address", nil
 	}
 	fromEmail := strings.ToLower(fromAddr.Address)
+	authPass := dmarcPass(msg.Header)
 
 	calBody, found := findCalendarPart(msg.Header, msg.Body)
 	if !found {
@@ -416,6 +536,7 @@ func parseRSVPReply(raw []byte) (parsedRSVP, string, error) {
 		FromEmail: fromEmail,
 		Attendee:  attendeeEmail,
 		PartStat:  strings.ToUpper(partstat),
+		AuthPass:  authPass,
 	}, "", nil
 }
 

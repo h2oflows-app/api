@@ -7,6 +7,7 @@ import (
 	"mime/quotedprintable"
 	"net/http"
 	"net/http/httptest"
+	netmail "net/mail"
 	"strings"
 	"testing"
 
@@ -275,6 +276,73 @@ func TestParseRSVPReply(t *testing.T) {
 		}
 		if strings.EqualFold(got.FromEmail, got.Attendee) {
 			t.Fatalf("test fixture bug: FromEmail (%q) unexpectedly matches Attendee (%q)", got.FromEmail, got.Attendee)
+		}
+	})
+}
+
+func TestDMARCPass(t *testing.T) {
+	cases := []struct {
+		name string
+		hdr  string // Authentication-Results value; "" means the header is absent
+		want bool
+	}{
+		{"header absent", "", false},
+		{"dmarc=pass", "mx.cloudflare.net; dkim=pass header.d=gmail.com; spf=pass; dmarc=pass", true},
+		{"pass with policy comment", "cf; dmarc=pass (p=none dis=none) header.from=gmail.com", true},
+		{"spaces around equals", "cf; dmarc = pass", true},
+		{"uppercase", "cf; DMARC=PASS", true},
+		{"dmarc=fail", "cf; dkim=fail; dmarc=fail", false},
+		{"dmarc=none", "cf; dmarc=none", false},
+		{"passable is not pass", "cf; dmarc=passable", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hdr := netmail.Header{}
+			if tc.hdr != "" {
+				hdr["Authentication-Results"] = []string{tc.hdr}
+			}
+			if got := dmarcPass(hdr); got != tc.want {
+				t.Errorf("dmarcPass(%q) = %v, want %v", tc.hdr, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseRSVPReply_AuthPass: parseRSVPReply carries the DMARC verdict
+// through on the AuthPass field (the anti-forgery gate that Inbound enforces).
+func TestParseRSVPReply_AuthPass(t *testing.T) {
+	withHeader := func(authResults string) []byte {
+		attendeeLine := "ATTENDEE;PARTSTAT=ACCEPTED:mailto:jane@example.com"
+		ics := buildICS("REPLY", testUID, attendeeLine)
+		hdr := ""
+		if authResults != "" {
+			hdr = "Authentication-Results: " + authResults + "\r\n"
+		}
+		msg := "From: Test Attendee <jane@example.com>\r\n" +
+			"To: invites@h2oflows.app\r\n" +
+			hdr +
+			"Content-Type: text/calendar; method=REPLY; charset=UTF-8\r\n" +
+			"\r\n" + ics
+		return []byte(msg)
+	}
+
+	t.Run("dmarc=pass -> AuthPass true", func(t *testing.T) {
+		got, _, err := parseRSVPReply(withHeader("cf; dmarc=pass"))
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if !got.AuthPass {
+			t.Error("AuthPass = false, want true")
+		}
+	})
+
+	t.Run("no Authentication-Results -> AuthPass false", func(t *testing.T) {
+		got, _, err := parseRSVPReply(withHeader(""))
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if got.AuthPass {
+			t.Error("AuthPass = true, want false")
 		}
 	})
 }
