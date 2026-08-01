@@ -280,20 +280,21 @@ func TestParseRSVPReply(t *testing.T) {
 	})
 }
 
-func TestDMARCPass(t *testing.T) {
+func TestDMARCResult(t *testing.T) {
 	cases := []struct {
 		name string
 		hdr  string // Authentication-Results value; "" means the header is absent
-		want bool
+		want string
 	}{
-		{"header absent", "", false},
-		{"dmarc=pass", "mx.cloudflare.net; dkim=pass header.d=gmail.com; spf=pass; dmarc=pass", true},
-		{"pass with policy comment", "cf; dmarc=pass (p=none dis=none) header.from=gmail.com", true},
-		{"spaces around equals", "cf; dmarc = pass", true},
-		{"uppercase", "cf; DMARC=PASS", true},
-		{"dmarc=fail", "cf; dkim=fail; dmarc=fail", false},
-		{"dmarc=none", "cf; dmarc=none", false},
-		{"passable is not pass", "cf; dmarc=passable", false},
+		{"header absent", "", ""},
+		{"dmarc=pass", "mx.cloudflare.net; dkim=pass header.d=gmail.com; spf=pass; dmarc=pass", "pass"},
+		{"pass with policy comment", "cf; dmarc=pass (p=none dis=none) header.from=gmail.com", "pass"},
+		{"spaces around equals", "cf; dmarc = pass", "pass"},
+		{"uppercase normalized", "cf; DMARC=PASS", "pass"},
+		{"dmarc=fail", "cf; dkim=fail; dmarc=fail (p=reject)", "fail"},
+		{"dmarc=none", "cf; dmarc=none", "none"},
+		{"dmarc=temperror", "cf; dmarc=temperror", "temperror"},
+		{"passable is not a token", "cf; dmarc=passable", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -301,16 +302,17 @@ func TestDMARCPass(t *testing.T) {
 			if tc.hdr != "" {
 				hdr["Authentication-Results"] = []string{tc.hdr}
 			}
-			if got := dmarcPass(hdr); got != tc.want {
-				t.Errorf("dmarcPass(%q) = %v, want %v", tc.hdr, got, tc.want)
+			if got := dmarcResult(hdr); got != tc.want {
+				t.Errorf("dmarcResult(%q) = %q, want %q", tc.hdr, got, tc.want)
 			}
 		})
 	}
 }
 
-// TestParseRSVPReply_AuthPass: parseRSVPReply carries the DMARC verdict
-// through on the AuthPass field (the anti-forgery gate that Inbound enforces).
-func TestParseRSVPReply_AuthPass(t *testing.T) {
+// TestParseRSVPReply_DMARC: parseRSVPReply carries the DMARC result token
+// through on the DMARC field (the anti-forgery gate that Inbound enforces —
+// it blocks only "fail").
+func TestParseRSVPReply_DMARC(t *testing.T) {
 	withHeader := func(authResults string) []byte {
 		attendeeLine := "ATTENDEE;PARTSTAT=ACCEPTED:mailto:jane@example.com"
 		ics := buildICS("REPLY", testUID, attendeeLine)
@@ -326,25 +328,39 @@ func TestParseRSVPReply_AuthPass(t *testing.T) {
 		return []byte(msg)
 	}
 
-	t.Run("dmarc=pass -> AuthPass true", func(t *testing.T) {
-		got, _, err := parseRSVPReply(withHeader("cf; dmarc=pass"))
+	t.Run("dmarc=fail -> DMARC 'fail'", func(t *testing.T) {
+		got, _, err := parseRSVPReply(withHeader("cf; dmarc=fail"))
 		if err != nil {
 			t.Fatalf("err = %v", err)
 		}
-		if !got.AuthPass {
-			t.Error("AuthPass = false, want true")
+		if got.DMARC != "fail" {
+			t.Errorf("DMARC = %q, want fail", got.DMARC)
 		}
 	})
 
-	t.Run("no Authentication-Results -> AuthPass false", func(t *testing.T) {
+	t.Run("no Authentication-Results -> DMARC empty", func(t *testing.T) {
 		got, _, err := parseRSVPReply(withHeader(""))
 		if err != nil {
 			t.Fatalf("err = %v", err)
 		}
-		if got.AuthPass {
-			t.Error("AuthPass = true, want false")
+		if got.DMARC != "" {
+			t.Errorf("DMARC = %q, want empty", got.DMARC)
 		}
 	})
+}
+
+// TestDMARCResultFromValues covers the Worker-forwarded X-Cf-Auth-Results
+// fallback parse (same tokenizer, raw string slice).
+func TestDMARCResultFromValues(t *testing.T) {
+	if got := dmarcResultFromValues([]string{"cf; dmarc=fail"}); got != "fail" {
+		t.Errorf("got %q, want fail", got)
+	}
+	if got := dmarcResultFromValues([]string{""}); got != "" {
+		t.Errorf("got %q, want empty", got)
+	}
+	if got := dmarcResultFromValues(nil); got != "" {
+		t.Errorf("got %q, want empty", got)
+	}
 }
 
 func TestRedactEmail(t *testing.T) {
