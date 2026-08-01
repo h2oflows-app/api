@@ -265,6 +265,70 @@ func TestBuildRunInvite_CNControlChars(t *testing.T) {
 	}
 }
 
+// TestBuildRunInvite_AttendeePartStatAccepted covers the PARTSTAT-preserving
+// update path added to fix an already-accepted crew member getting
+// re-prompted to RSVP on a material-change update: AttendeePartStat:
+// "ACCEPTED" must render PARTSTAT=ACCEPTED (not the default NEEDS-ACTION)
+// and RSVP=FALSE (not TRUE) — the organizer isn't soliciting a fresh answer
+// from someone who already gave one, only pushing an in-place detail update.
+func TestBuildRunInvite_AttendeePartStatAccepted(t *testing.T) {
+	got, err := BuildRunInvite(RunInviteInput{
+		RunID:            "r4",
+		Name:             "Test Run",
+		RunDate:          "2026-08-01",
+		OrganizerEmail:   "trips@h2oflows.app",
+		AttendeeName:     "Jamie",
+		AttendeeEmail:    "j@example.com",
+		AttendeePartStat: "ACCEPTED",
+	})
+	if err != nil {
+		t.Fatalf("BuildRunInvite error: %v", err)
+	}
+	want := `ATTENDEE;CN=Jamie;PARTSTAT=ACCEPTED;RSVP=FALSE:mailto:j@example.com`
+	if !strings.Contains(got, want) {
+		t.Errorf("got %q, want a line containing %q", got, want)
+	}
+}
+
+// TestBuildRunInvite_AttendeePartStatDeclinedAndDefault rounds out the
+// PARTSTAT matrix: DECLINED also derives RSVP=FALSE (same reasoning as
+// ACCEPTED — an already-answered attendee isn't being re-asked), and an
+// unrecognized/garbage value defensively falls back to the original
+// NEEDS-ACTION/RSVP=TRUE behavior rather than emitting a bogus PARTSTAT.
+func TestBuildRunInvite_AttendeePartStatDeclinedAndDefault(t *testing.T) {
+	got, err := BuildRunInvite(RunInviteInput{
+		RunID:            "r5",
+		Name:             "Test Run",
+		RunDate:          "2026-08-01",
+		OrganizerEmail:   "trips@h2oflows.app",
+		AttendeeEmail:    "d@example.com",
+		AttendeePartStat: "declined", // lowercase - normalizePartStat must uppercase
+	})
+	if err != nil {
+		t.Fatalf("BuildRunInvite error: %v", err)
+	}
+	want := `ATTENDEE;PARTSTAT=DECLINED;RSVP=FALSE:mailto:d@example.com`
+	if !strings.Contains(got, want) {
+		t.Errorf("got %q, want a line containing %q", got, want)
+	}
+
+	got2, err := BuildRunInvite(RunInviteInput{
+		RunID:            "r6",
+		Name:             "Test Run",
+		RunDate:          "2026-08-01",
+		OrganizerEmail:   "trips@h2oflows.app",
+		AttendeeEmail:    "g@example.com",
+		AttendeePartStat: "some-garbage-value",
+	})
+	if err != nil {
+		t.Fatalf("BuildRunInvite error: %v", err)
+	}
+	want2 := `ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:g@example.com`
+	if !strings.Contains(got2, want2) {
+		t.Errorf("got %q, want a line containing %q", got2, want2)
+	}
+}
+
 // TestQuoteParamValue is the direct unit-level check of the RFC 5545 §3.2
 // param-value quoting rules quoteParamValue implements: any embedded DQUOTE
 // is stripped first (neither PTEXT nor QUOTED-STRING can represent one),
