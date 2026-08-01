@@ -219,13 +219,15 @@ func runInviteSubject(hostLabel string, run invitedRunInfo) string {
 // accept IN-APP — the feed + their member row surface the invite — so there
 // is no token to mint or embed). Returns HTML + a plain-text mirror.
 //
-// API-2 RSVP copy-steer (INVITE_SYNC_PLAN.md Amendments): this .ics is
-// always METHOD:REQUEST (sendRunInviteMail), so every mail client renders
-// its OWN native Accept/Decline UI from the attachment's ORGANIZER/ATTENDEE
-// lines — a one-way iTIP REPLY nothing on our side reads yet (inbound RSVP
-// processing is a FUTURE wave). rsvpButtonHTML/rsvpSteerLine
-// (notifications.go) make OUR Accept link visually primary and add the
-// mandated steer line so the recipient taps THAT instead.
+// API-2 RSVP copy-steer (INVITE_SYNC_PLAN.md Amendments), revised for
+// inbound RSVP (api#176 — a Cloudflare Email Worker now relays a mail
+// client's own METHOD:REPLY back to a webhook that applies the RSVP, so a
+// mail client's native Accept/Decline UI on this .ics's ORGANIZER/ATTENDEE
+// lines is no longer a dead end): rsvpButtonHTML/rsvpSteerLine
+// (notifications.go) still make OUR Accept link visually primary — it's the
+// reliable path across every provider, since not all mail clients render
+// native iTIP UI the same way — but the steer copy no longer claims the
+// mail client's own reply does nothing, since that's no longer true.
 //
 // hostLabel is caller-rendered (sendRunInviteMail — same value passed to
 // runInviteSubject, see its doc comment) rather than read off run.HostHandle
@@ -240,7 +242,7 @@ func buildRunInviteEmailBody(hostLabel string, run invitedRunInfo, acceptURL str
 	// per email type.
 	htmlDetails, textDetails := runDetailLines(run.RiverName, run.RunDate, run.RunTime, run.MeetupSpot, run.GaugeCFS, run.FlowBand)
 
-	const steer = "RSVP in your mail app only updates your calendar — tap Accept to join the crew."
+	const steer = "Tap Accept to join the crew — your reply lands right on H2OFlows."
 	htmlBody = fmt.Sprintf(
 		`<p>%s invited you on H2OFlows.</p><h2>%s</h2><ul>%s</ul><p>%s</p>%s`,
 		html.EscapeString(hostLabel), html.EscapeString(run.Name), htmlDetails,

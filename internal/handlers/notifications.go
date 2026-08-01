@@ -126,6 +126,13 @@ type notifyRecipient struct {
 	MemberOwnerID *string
 	DisplayName   string
 	Email         string
+	// Status is this row's CURRENT run_invites.status ('invited' or
+	// 'accepted' — loadRunNotifyRecipients' WHERE already excludes anything
+	// else) — threaded into ics.RunInviteInput.AttendeePartStat by
+	// buildAndSendRunICSMail so a material-change REQUEST reflects the
+	// recipient's real RSVP state instead of resetting it (see
+	// buildAndSendRunICSMail's doc comment).
+	Status string
 }
 
 // loadRunNotifyRecipients is the run-scoped recipient fan-out query from
@@ -141,7 +148,7 @@ type notifyRecipient struct {
 func loadRunNotifyRecipients(ctx context.Context, db *pgxpool.Pool, runID string) ([]notifyRecipient, error) {
 	rows, err := db.Query(ctx, `
 		SELECT ri.id, ri.member_owner_id, COALESCE(up.display_name, up.handle, ri.invite_handle, ''),
-		       COALESCE(ue.email, ri.invite_email) AS notify_email
+		       COALESCE(ue.email, ri.invite_email) AS notify_email, ri.status::text
 		FROM run_invites ri
 		LEFT JOIN user_profiles up ON up.owner_id = ri.member_owner_id
 		LEFT JOIN user_emails ue ON ue.owner_id = ri.member_owner_id
@@ -156,7 +163,7 @@ func loadRunNotifyRecipients(ctx context.Context, db *pgxpool.Pool, runID string
 	var out []notifyRecipient
 	for rows.Next() {
 		var rcpt notifyRecipient
-		if err := rows.Scan(&rcpt.InviteID, &rcpt.MemberOwnerID, &rcpt.DisplayName, &rcpt.Email); err != nil {
+		if err := rows.Scan(&rcpt.InviteID, &rcpt.MemberOwnerID, &rcpt.DisplayName, &rcpt.Email, &rcpt.Status); err != nil {
 			return nil, err
 		}
 		out = append(out, rcpt)
@@ -261,6 +268,24 @@ func rsvpSteerLine(sentence string) string {
 	return fmt.Sprintf(`<p style="color:#666666;font-size:13px;">%s</p>`, html.EscapeString(sentence))
 }
 
+// runInvitesStatusToPartStat maps a run_invites.status value to the ICS
+// PARTSTAT it should carry on a REQUEST/CANCEL .ics — 'accepted' ->
+// ics.RunInviteInput.AttendeePartStat "ACCEPTED" (so the update preserves
+// their RSVP instead of resetting it to needs-action, see
+// buildAndSendRunICSMail's doc comment), 'invited' (and anything else —
+// defensive default, matching ics.normalizePartStat's own fallback) ->
+// "NEEDS-ACTION". Applied unconditionally regardless of method: for a
+// CANCEL (notifyRunCancelled) the PARTSTAT is immaterial since STATUS:
+// CANCELLED already tells the client the event is gone, so mapping it the
+// same way here is harmless and keeps this one small helper method-agnostic
+// rather than special-casing CANCEL.
+func runInvitesStatusToPartStat(status string) string {
+	if status == "accepted" {
+		return "ACCEPTED"
+	}
+	return "NEEDS-ACTION"
+}
+
 // buildAndSendRunICSMail builds one email (with a per-recipient .ics
 // attachment) and sends it — the shared plumbing behind every sender in
 // this file that emits a REQUEST/CANCEL (notifyRunMaterialChange,
@@ -274,21 +299,33 @@ func rsvpSteerLine(sentence string) string {
 // the email WITHOUT the attachment rather than not sending at all — the
 // in-app state change is still real even if the external-calendar sync
 // isn't available.
+//
+// AttendeePartStat (runInvitesStatusToPartStat(rcpt.Status)) is the fix for
+// an already-accepted crew member getting reset to "needs response" by a
+// material-change update REQUEST: previously every ATTENDEE line
+// hardcoded PARTSTAT=NEEDS-ACTION;RSVP=TRUE regardless of the recipient's
+// actual run_invites.status, so Outlook/Gmail would re-prompt someone who'd
+// already accepted every time the organizer edited the date/time/meetup/
+// name. rcpt.Status is only populated by loadRunNotifyRecipients (notifyUninvited's
+// caller-supplied rcpt leaves it "" -> NEEDS-ACTION default, which is
+// correct there too — an uninvite CANCEL's PARTSTAT is immaterial, same
+// reasoning as notifyRunCancelled above).
 func buildAndSendRunICSMail(ctx context.Context, mailer mail.Mailer, run runNotifyInfo, rcpt notifyRecipient, method, subject, htmlBody, textBody string) {
 	icsBody, err := ics.BuildRunInvite(ics.RunInviteInput{
-		RunID:          run.ID,
-		Method:         method,
-		Sequence:       run.ICSSequence,
-		Cancelled:      method == ics.MethodCancel,
-		OrganizerName:  organizerName,
-		OrganizerEmail: organizerEmail,
-		AttendeeName:   rcpt.DisplayName,
-		AttendeeEmail:  rcpt.Email,
-		Name:           run.Name,
-		RunDate:        run.RunDate,
-		RunTime:        run.RunTime,
-		MeetupSpot:     run.MeetupSpot,
-		URL:            fmt.Sprintf("%s/plan-runs/%s", webBaseURL, run.ID),
+		RunID:            run.ID,
+		Method:           method,
+		Sequence:         run.ICSSequence,
+		Cancelled:        method == ics.MethodCancel,
+		OrganizerName:    organizerName,
+		OrganizerEmail:   organizerEmail,
+		AttendeeName:     rcpt.DisplayName,
+		AttendeeEmail:    rcpt.Email,
+		AttendeePartStat: runInvitesStatusToPartStat(rcpt.Status),
+		Name:             run.Name,
+		RunDate:          run.RunDate,
+		RunTime:          run.RunTime,
+		MeetupSpot:       run.MeetupSpot,
+		URL:              fmt.Sprintf("%s/plan-runs/%s", webBaseURL, run.ID),
 	})
 
 	msg := mail.Message{To: rcpt.Email, Subject: subject, HTML: htmlBody, Text: textBody}
@@ -333,22 +370,36 @@ func notifyRunMaterialChange(mailer mail.Mailer, db *pgxpool.Pool, runID string)
 	host := displayHost(run.HostDisplayName, run.HostHandle)
 	subject := fmt.Sprintf("Trip updated: %s", run.Name)
 	runURL := fmt.Sprintf("%s/plan-runs/%s", webBaseURL, run.ID)
+	// leaveURL carries ?leave=1 (web's plan-runs/[id].vue, mirroring
+	// sendRunInviteMail's ?accept=1 convention) for the "Not going" button
+	// below — API-1 (Part A, this same change): now that an already-
+	// accepted recipient's ATTENDEE PARTSTAT is preserved (RSVP=FALSE) on
+	// this REQUEST instead of always resetting to NEEDS-ACTION;RSVP=TRUE,
+	// their mail client no longer shows its own native Decline UI on this
+	// update, so this is the one remaining way to bail from the email
+	// itself rather than opening the app and hunting for the leave control.
+	leaveURL := runURL + "?leave=1"
 	htmlDetails, textDetails := runDetailLines(run.RiverName, run.RunDate, run.RunTime, run.MeetupSpot, run.GaugeCFS, run.FlowBand)
-	// API-2 RSVP copy-steer (Amendments): this is also a METHOD:REQUEST
-	// .ics (buildAndSendRunICSMail below, ics.MethodRequest) — recipients
-	// include still-pending invitees as well as already-accepted crew
-	// (loadRunNotifyRecipients), so the steer line is adapted from
-	// buildRunInviteEmailBody's "tap Accept to join the crew" (that
-	// wouldn't read right for someone already on the crew) to name THIS
-	// email's own button, "View run", and point at managing an RSVP rather
-	// than joining one.
-	const steer = "RSVP in your mail app only updates your calendar — tap View run to update your RSVP on H2OFlows."
+	// API-2 RSVP copy-steer (Amendments), revised for Part A/B (PARTSTAT
+	// preservation + the Not-going button above): recipients include
+	// still-pending invitees as well as already-accepted crew
+	// (loadRunNotifyRecipients), but now that an accepted recipient's own
+	// calendar already reflects the update in place (Part A) there's
+	// nothing for them to tap UNLESS they can't make it anymore — so this
+	// no longer tells everyone to "tap View run to update your RSVP"
+	// (false for accepted crew now that RSVP=FALSE means their mail client
+	// won't even solicit one) and instead names the Not-going button
+	// directly.
+	const steer = "You're on the crew — the new details are already on your calendar, nothing to do. Can't make it? Tap Not going."
 	htmlBody := fmt.Sprintf(
-		`<p>%s updated <strong>%s</strong> on H2OFlows.</p><ul>%s</ul><p>%s</p>%s`,
+		`<p>%s updated <strong>%s</strong> on H2OFlows.</p><ul>%s</ul><p>%s %s</p>%s`,
 		html.EscapeString(host), html.EscapeString(run.Name), htmlDetails,
-		rsvpButtonHTML(runURL, "View run"), rsvpSteerLine(steer),
+		rsvpButtonHTML(runURL, "View run"), rsvpButtonHTML(leaveURL, "Not going"), rsvpSteerLine(steer),
 	)
-	textBody := fmt.Sprintf("%s updated %s.\n%s\nView run: %s\n\n%s\n", host, run.Name, textDetails, runURL, steer)
+	textBody := fmt.Sprintf(
+		"%s updated %s.\n%s\nView run: %s\nCan't make it? Cancel your RSVP: %s\n\n%s\n",
+		host, run.Name, textDetails, runURL, leaveURL, steer,
+	)
 
 	for _, rcpt := range recipients {
 		buildAndSendRunICSMail(ctx, mailer, run, rcpt, ics.MethodRequest, subject, htmlBody, textBody)

@@ -79,6 +79,15 @@ type RunInviteInput struct {
 	// AttendeeEmail) for REQUEST/CANCEL.
 	AttendeeName  string
 	AttendeeEmail string
+	// AttendeePartStat is this recipient's CURRENT run_invites.status,
+	// threaded into ATTENDEE;PARTSTAT= so an update REQUEST reflects their
+	// real RSVP state instead of resetting it. Accepted values:
+	// "NEEDS-ACTION", "ACCEPTED", "DECLINED" — empty defaults to
+	// "NEEDS-ACTION" (the initial-invite path, invites.go's
+	// sendRunInviteMail, never sets this — an invitee who hasn't responded
+	// yet has nothing else it could be). See attendeeLine for the
+	// PARTSTAT->RSVP derivation.
+	AttendeePartStat string
 	// Cancelled emits STATUS:CANCELLED on the VEVENT. Set together with
 	// Method=MethodCancel by every caller in this codebase — kept as its
 	// own field rather than inferred from Method so a CANCEL .ics's two
@@ -169,7 +178,7 @@ func BuildRunInvite(in RunInviteInput) (string, error) {
 		"SEQUENCE:" + strconv.Itoa(in.Sequence),
 		"DTSTAMP:" + now.Format(icsDateTimeLayout),
 		organizerLine(in.OrganizerName, in.OrganizerEmail),
-		attendeeLine(in.AttendeeName, in.AttendeeEmail),
+		attendeeLine(in.AttendeeName, in.AttendeeEmail, normalizePartStat(in.AttendeePartStat)),
 	}
 
 	if rt, ok := parseRunTime(in.RunTime); ok {
@@ -214,14 +223,53 @@ func organizerLine(name, email string) string {
 	return "ORGANIZER;CN=" + quoteParamValue(name) + ":mailto:" + email
 }
 
-// attendeeLine renders ATTENDEE;CN=<name>;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:
-// mailto:<email>, omitting CN when name is "" (a handle-less email invitee
-// has no known display name yet).
-func attendeeLine(name, email string) string {
-	if name == "" {
-		return "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:" + email
+// partStatNeedsAction/partStatAccepted/partStatDeclined are the PARTSTAT
+// values attendeeLine accepts (RunInviteInput.AttendeePartStat, already
+// normalized via normalizePartStat by the time attendeeLine sees it).
+const (
+	partStatNeedsAction = "NEEDS-ACTION"
+	partStatAccepted    = "ACCEPTED"
+	partStatDeclined    = "DECLINED"
+)
+
+// normalizePartStat uppercases raw (tolerating whatever casing a caller
+// passed) and maps anything other than the three known PARTSTAT values —
+// including "" (the initial-invite path, which never sets
+// AttendeePartStat) — defensively to NEEDS-ACTION, so a bad/unexpected
+// run_invites.status value can never produce a malformed or misleading
+// ATTENDEE line.
+func normalizePartStat(raw string) string {
+	switch strings.ToUpper(strings.TrimSpace(raw)) {
+	case partStatAccepted:
+		return partStatAccepted
+	case partStatDeclined:
+		return partStatDeclined
+	default:
+		return partStatNeedsAction
 	}
-	return "ATTENDEE;CN=" + quoteParamValue(name) + ";PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:" + email
+}
+
+// attendeeLine renders ATTENDEE;CN=<name>;PARTSTAT=<partStat>;RSVP=<rsvp>:
+// mailto:<email>, omitting CN when name is "" (a handle-less email invitee
+// has no known display name yet). partStat must already be normalized (see
+// normalizePartStat) — one of NEEDS-ACTION/ACCEPTED/DECLINED. RSVP is
+// derived from it rather than passed separately: NEEDS-ACTION means the
+// organizer is still soliciting an answer (RSVP=TRUE, the original/only
+// behavior before AttendeePartStat existed), while ACCEPTED/DECLINED means
+// the attendee already answered and this .ics is just an in-place update to
+// event details — RSVP=FALSE tells Outlook/Google/Apple not to re-prompt
+// them for a fresh response (the bug this field exists to fix: an update
+// email used to always say RSVP=TRUE regardless of the recipient's real
+// status, resetting already-accepted crew back to "needs response").
+func attendeeLine(name, email, partStat string) string {
+	rsvp := "TRUE"
+	if partStat != partStatNeedsAction {
+		rsvp = "FALSE"
+	}
+	if name == "" {
+		return "ATTENDEE;PARTSTAT=" + partStat + ";RSVP=" + rsvp + ":mailto:" + email
+	}
+	return "ATTENDEE;CN=" + quoteParamValue(name) + ";PARTSTAT=" + partStat + ";RSVP=" + rsvp + ":mailto:" + email
 }
 
 // quoteParamValue renders an RFC 5545 §3.2 property-parameter value (CN in
