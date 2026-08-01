@@ -26,28 +26,36 @@ type Config struct {
 	ResendAPIKey     string // #246 A4: unset -> invite emails degrade to mail.NoopMailer (logs instead of sending)
 	MailFrom         string // #246 A4: RFC 5322 From header, e.g. "H2OFlows <trips@h2oflows.app>" — must be set together with ResendAPIKey
 	WebBaseURL       string // #246: web origin embedded in invite emails/.ics links — staging must point at its own web deploy, not prod
+	// RSVPInboundSecret gates POST /api/v1/hooks/rsvp-inbound (X-RSVP-Secret
+	// header, compared constant-time) — the Cloudflare Email Worker relaying
+	// inbound METHOD:REPLY mail for invites@h2oflows.app
+	// (infra/cloudflare/rsvp-inbound-worker.js) is configured with the same
+	// value. Unset -> the handler refuses ALL requests (503) rather than
+	// running with no gate at all; see handlers.NewRSVPInboundHandler.
+	RSVPInboundSecret string
 }
 
 func Load() Config {
 	return Config{
-		DatabaseURL:      mustEnv("DATABASE_URL"),
-		RedisURL:         env("REDIS_URL", "redis://localhost:6379"),
-		Port:             env("APP_PORT", "8080"),
-		AppName:          env("APP_NAME", "H2OFlows"),
-		AppDomain:        env("APP_DOMAIN", "localhost"),
-		SupabaseURL:      env("SUPABASE_URL", ""),
-		SupabaseJWKSURL:  env("SUPABASE_JWKS_URL", ""),
-		SupabaseService:  env("SUPABASE_SERVICE_KEY", ""),
-		AnthropicAPIKey:  env("ANTHROPIC_API_KEY", ""),
-		VoyageAPIKey:     env("VOYAGE_API_KEY", ""),
-		USGSAPIKey:       env("USGS_API_KEY", ""),
-		DWRAPIKeys:       env("DWR_API_KEY", ""),
-		USGSPollInterval: env("USGS_POLL_INTERVAL", "15m"),
-		DWRPollInterval:  env("DWR_POLL_INTERVAL", "15m"),
-		MigrationsPath:   env("MIGRATIONS_PATH", "migrations"),
-		ResendAPIKey:     env("RESEND_API_KEY", ""),
-		MailFrom:         env("MAIL_FROM", ""),
-		WebBaseURL:       env("WEB_BASE_URL", "https://h2oflows.app"),
+		DatabaseURL:       mustEnv("DATABASE_URL"),
+		RedisURL:          env("REDIS_URL", "redis://localhost:6379"),
+		Port:              env("APP_PORT", "8080"),
+		AppName:           env("APP_NAME", "H2OFlows"),
+		AppDomain:         env("APP_DOMAIN", "localhost"),
+		SupabaseURL:       env("SUPABASE_URL", ""),
+		SupabaseJWKSURL:   env("SUPABASE_JWKS_URL", ""),
+		SupabaseService:   env("SUPABASE_SERVICE_KEY", ""),
+		AnthropicAPIKey:   env("ANTHROPIC_API_KEY", ""),
+		VoyageAPIKey:      env("VOYAGE_API_KEY", ""),
+		USGSAPIKey:        env("USGS_API_KEY", ""),
+		DWRAPIKeys:        env("DWR_API_KEY", ""),
+		USGSPollInterval:  env("USGS_POLL_INTERVAL", "15m"),
+		DWRPollInterval:   env("DWR_POLL_INTERVAL", "15m"),
+		MigrationsPath:    env("MIGRATIONS_PATH", "migrations"),
+		ResendAPIKey:      env("RESEND_API_KEY", ""),
+		MailFrom:          env("MAIL_FROM", ""),
+		WebBaseURL:        env("WEB_BASE_URL", "https://h2oflows.app"),
+		RSVPInboundSecret: env("RSVP_INBOUND_SECRET", ""),
 	}
 }
 
