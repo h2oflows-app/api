@@ -142,18 +142,41 @@ func (h *RSVPInboundHandler) Inbound(w http.ResponseWriter, r *http.Request) {
 
 	// Anti-forgery layer 1 — DMARC. The From==ATTENDEE compare below only
 	// checks that two attacker-authorable fields agree; anyone can mail
-	// invites@h2oflows.app with a forged From set to a victim's address. But
-	// Cloudflare Email Routing evaluates the sender domain's DKIM/SPF and
-	// prepends an Authentication-Results header with the DMARC verdict — a
-	// forger can't produce a DKIM signature aligned to the victim's domain,
-	// so a forged From yields dmarc=fail/none. Require dmarc=pass. Fails
-	// closed: no pass verdict (missing header, misconfigured sender domain)
-	// -> ignored, never accepted. See dmarcPass for the parse.
-	if !parsed.AuthPass {
-		log.Printf("rsvp-inbound: ignored (no dmarc=pass) run=%s from=%s",
+	// invites@h2oflows.app with a forged From. Cloudflare Email Routing
+	// evaluates the sender domain's DKIM/SPF/DMARC and records the verdict in
+	// an Authentication-Results header — read the DMARC *result* token and
+	// block ONLY a definitive "fail": a From forged from a domain that
+	// publishes DMARC with alignment (e.g. gmail/outlook) yields dmarc=fail,
+	// which is the real attack. dmarc=pass/none/temperror/permerror and an
+	// absent verdict are all ALLOWED: 'none'/absent means the sending domain
+	// publishes no DMARC to evaluate, so it is forgeable by anyone regardless
+	// of what we do here — failing closed there would silently break RSVP for
+	// the many personal/corporate domains without DMARC (the first real test
+	// hit exactly this). Residual risk (a forged reply from a no-DMARC domain)
+	// is bounded by the shared secret, the From==ATTENDEE compare, and needing
+	// the run UUID; acceptable for the pilot. See dmarcResult for the parse.
+	//
+	// dmarcResult prefers the message's own Authentication-Results, then falls
+	// back to X-Cf-Auth-Results — a copy the Worker forwards from
+	// message.headers (trusted: the shared secret authenticated the Worker),
+	// covering the case where CF's verdict isn't inside message.raw.
+	dmarc := parsed.DMARC
+	if dmarc == "" {
+		dmarc = dmarcResultFromValues([]string{r.Header.Get("X-Cf-Auth-Results")})
+	}
+	if dmarc == "fail" {
+		log.Printf("rsvp-inbound: ignored (dmarc=fail, forged From) run=%s from=%s",
 			parsed.RunID, redactEmail(parsed.FromEmail))
 		jsonResponse(w, http.StatusOK, map[string]string{"status": "ignored"})
 		return
+	}
+	// Diagnostic: record the verdict actually seen (empty == no header) so we
+	// can confirm CF's Authentication-Results is reaching us and tighten the
+	// gate later if it proves reliably present.
+	if dmarc == "" {
+		log.Printf("rsvp-inbound: dmarc verdict absent run=%s from=%s", parsed.RunID, redactEmail(parsed.FromEmail))
+	} else {
+		log.Printf("rsvp-inbound: dmarc=%s run=%s from=%s", dmarc, parsed.RunID, redactEmail(parsed.FromEmail))
 	}
 
 	// Anti-forgery layer 2 — the REPLY must be about the mailbox it came
@@ -448,27 +471,36 @@ type parsedRSVP struct {
 	FromEmail string // the message's own From header address, lowercased
 	Attendee  string // the REPLY's ATTENDEE mailto: address, lowercased
 	PartStat  string // upper-cased PARTSTAT param value (ACCEPTED/DECLINED/TENTATIVE/NEEDS-ACTION/anything else a client sends)
-	AuthPass  bool   // true iff an Authentication-Results header reports dmarc=pass (anti-forgery; see dmarcPass)
+	DMARC     string // lower-cased DMARC result token from Authentication-Results (pass/fail/none/temperror/permerror), or "" if no verdict present
 }
 
-// dmarcRE matches a DMARC "pass" verdict in an Authentication-Results header
+// dmarcRE captures the DMARC result token in an Authentication-Results header
 // value, tolerating the RFC 8601 whitespace/comment noise around the '='
-// (e.g. "dmarc=pass", "dmarc = pass", "dmarc=pass (p=none ...)").
-var dmarcRE = regexp.MustCompile(`(?i)\bdmarc\s*=\s*pass\b`)
+// (e.g. "dmarc=pass", "dmarc = pass", "dmarc=fail (p=reject ...)").
+var dmarcRE = regexp.MustCompile(`(?i)\bdmarc\s*=\s*(pass|fail|none|temperror|permerror)\b`)
 
-// dmarcPass reports whether any Authentication-Results header on the message
-// carries dmarc=pass. Cloudflare Email Routing computes DMARC against the
-// sending domain and prepends this header before relaying to the Worker;
-// ARC-Authentication-Results (a different header, added by intermediate
-// forwarders and NOT authoritative here) is deliberately ignored. Direct map
-// access uses the canonical key net/textproto stores headers under.
-func dmarcPass(h netmail.Header) bool {
-	for _, v := range h["Authentication-Results"] {
-		if dmarcRE.MatchString(v) {
-			return true
+// dmarcResult returns the DMARC result token from any Authentication-Results
+// header on the message ("" if none present). Cloudflare Email Routing
+// computes DMARC against the sending domain and records the verdict in this
+// header; ARC-Authentication-Results (a different header, added by
+// intermediate forwarders and NOT authoritative here) is deliberately
+// ignored. Direct map access uses the canonical key net/textproto stores
+// headers under.
+func dmarcResult(h netmail.Header) string {
+	return dmarcResultFromValues(h["Authentication-Results"])
+}
+
+// dmarcResultFromValues is the shared parse over raw header value strings —
+// used both for the message's own header (dmarcResult) and for the Worker-
+// forwarded X-Cf-Auth-Results fallback. Returns the first result token found,
+// lower-cased, or "".
+func dmarcResultFromValues(values []string) string {
+	for _, v := range values {
+		if m := dmarcRE.FindStringSubmatch(v); m != nil {
+			return strings.ToLower(m[1])
 		}
 	}
-	return false
+	return ""
 }
 
 // uidDomainSuffix is the fixed suffix every UID this app ever emits carries
@@ -508,7 +540,7 @@ func parseRSVPReply(raw []byte) (parsedRSVP, string, error) {
 		return parsedRSVP{}, "no parseable From address", nil
 	}
 	fromEmail := strings.ToLower(fromAddr.Address)
-	authPass := dmarcPass(msg.Header)
+	dmarc := dmarcResult(msg.Header)
 
 	calBody, found := findCalendarPart(msg.Header, msg.Body)
 	if !found {
@@ -536,7 +568,7 @@ func parseRSVPReply(raw []byte) (parsedRSVP, string, error) {
 		FromEmail: fromEmail,
 		Attendee:  attendeeEmail,
 		PartStat:  strings.ToUpper(partstat),
-		AuthPass:  authPass,
+		DMARC:     dmarc,
 	}, "", nil
 }
 

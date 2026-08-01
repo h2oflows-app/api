@@ -6,6 +6,12 @@
 export default {
   async email(message, env, ctx) {
     try {
+      // Forward Cloudflare's own Authentication-Results (DMARC/DKIM/SPF
+      // verdict) as a trusted header: the api's anti-forgery gate reads the
+      // DMARC result from message.raw, but if CF's verdict isn't inside the
+      // raw bytes this is the authoritative fallback. Trusted because the
+      // shared secret authenticates this Worker to the endpoint.
+      const authResults = message.headers.get('Authentication-Results') || ''
       const resp = await fetch(env.RSVP_HOOK_URL, {
         method: 'POST',
         headers: {
@@ -13,6 +19,7 @@ export default {
           'Content-Type': 'message/rfc822',
           'X-Envelope-From': message.from,
           'X-Envelope-To': message.to,
+          'X-Cf-Auth-Results': authResults,
         },
         body: message.raw,
       })
