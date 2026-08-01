@@ -380,28 +380,32 @@ func notifyRunMaterialChange(mailer mail.Mailer, db *pgxpool.Pool, runID string)
 	// itself rather than opening the app and hunting for the leave control.
 	leaveURL := runURL + "?leave=1"
 	htmlDetails, textDetails := runDetailLines(run.RiverName, run.RunDate, run.RunTime, run.MeetupSpot, run.GaugeCFS, run.FlowBand)
-	// API-2 RSVP copy-steer (Amendments), revised for Part A/B (PARTSTAT
-	// preservation + the Not-going button above): recipients include
-	// still-pending invitees as well as already-accepted crew
-	// (loadRunNotifyRecipients), but now that an accepted recipient's own
-	// calendar already reflects the update in place (Part A) there's
-	// nothing for them to tap UNLESS they can't make it anymore — so this
-	// no longer tells everyone to "tap View run to update your RSVP"
-	// (false for accepted crew now that RSVP=FALSE means their mail client
-	// won't even solicit one) and instead names the Not-going button
-	// directly.
-	const steer = "You're on the crew — the new details are already on your calendar, nothing to do. Can't make it? Tap Not going."
-	htmlBody := fmt.Sprintf(
-		`<p>%s updated <strong>%s</strong> on H2OFlows.</p><ul>%s</ul><p>%s %s</p>%s`,
-		html.EscapeString(host), html.EscapeString(run.Name), htmlDetails,
-		rsvpButtonHTML(runURL, "View run"), rsvpButtonHTML(leaveURL, "Not going"), rsvpSteerLine(steer),
-	)
-	textBody := fmt.Sprintf(
-		"%s updated %s.\n%s\nView run: %s\nCan't make it? Cancel your RSVP: %s\n\n%s\n",
-		host, run.Name, textDetails, runURL, leaveURL, steer,
-	)
 
+	// API-2 RSVP copy-steer (Amendments), revised for Part A/B (PARTSTAT
+	// preservation + the Not-going button). loadRunNotifyRecipients returns
+	// BOTH accepted crew and still-pending invitees, and the steer line has
+	// to be honest to each — so the body is built PER RECIPIENT here rather
+	// than once. An accepted recipient's calendar already reflects the update
+	// in place (Part A: PARTSTAT=ACCEPTED;RSVP=FALSE, no re-prompt), so there
+	// is genuinely nothing for them to do unless they now can't make it. A
+	// still-pending invitee's .ics still carries NEEDS-ACTION;RSVP=TRUE (their
+	// mail client is still asking them to RSVP), so telling them "you're on
+	// the crew, nothing to do" would be false and contradict their own
+	// invite — they get an actionable line instead.
 	for _, rcpt := range recipients {
+		steer := "Heads up — the details changed. Tap View run to see them and RSVP. Can't make it? Tap Not going."
+		if rcpt.Status == "accepted" {
+			steer = "You're on the crew — the new details are already on your calendar, nothing to do. Can't make it? Tap Not going."
+		}
+		htmlBody := fmt.Sprintf(
+			`<p>%s updated <strong>%s</strong> on H2OFlows.</p><ul>%s</ul><p>%s %s</p>%s`,
+			html.EscapeString(host), html.EscapeString(run.Name), htmlDetails,
+			rsvpButtonHTML(runURL, "View run"), rsvpButtonHTML(leaveURL, "Not going"), rsvpSteerLine(steer),
+		)
+		textBody := fmt.Sprintf(
+			"%s updated %s.\n%s\nView run: %s\nCan't make it? Cancel your RSVP: %s\n\n%s\n",
+			host, run.Name, textDetails, runURL, leaveURL, steer,
+		)
 		buildAndSendRunICSMail(ctx, mailer, run, rcpt, ics.MethodRequest, subject, htmlBody, textBody)
 	}
 }
