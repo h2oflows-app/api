@@ -33,6 +33,43 @@ func (h *BasinOverrideHandler) ownerID(r *http.Request) (string, bool) {
 	return "", false
 }
 
+// targetOwnerID resolves the owner whose basin-override rows a request should
+// read or write. Mirrors UserReachHandler.authorOwnerID (internal/handlers/
+// user_reaches.go) exactly, so ?as= behaves identically across both authoring
+// surfaces: when the request carries ?as={handle}, the handle must name an
+// existing special user AND the caller must hold an app role equal to that
+// handle (loaded from user_roles by the LoadAppRoles middleware). When both
+// hold, the target is that special user's owner_id. When ?as= is absent, OR
+// present but the caller does not hold the matching role, this falls through
+// to the caller's own id — the same silent-ignore fallback authorOwnerID
+// uses. That is a deliberate, not accidental, choice: an unauthorized ?as=
+// never resolves to someone else's owner_id, so there is no privilege
+// escalation and no cross-account write — the request just gets treated as
+// if ?as= had not been supplied and lands under the caller's own account
+// instead of erroring. Returns ("", false, false) when unauthenticated.
+func (h *BasinOverrideHandler) targetOwnerID(r *http.Request) (ownerID string, asSpecial bool, ok bool) {
+	id, ok := h.ownerID(r)
+	if !ok {
+		return "", false, false
+	}
+	if as := r.URL.Query().Get("as"); as != "" {
+		for _, role := range auth.AppRolesFromContext(r.Context()) {
+			if role != as {
+				continue
+			}
+			var specialOwnerID string
+			err := h.db.QueryRow(r.Context(),
+				`SELECT owner_id FROM user_profiles WHERE is_special AND handle = $1`, as,
+			).Scan(&specialOwnerID)
+			if err == nil {
+				return specialOwnerID, true, true
+			}
+			break
+		}
+	}
+	return id, false, true
+}
+
 type RiverBasinOverride struct {
 	ID        string    `json:"id"`
 	RiverID   string    `json:"river_id"`
@@ -42,10 +79,15 @@ type RiverBasinOverride struct {
 }
 
 // ── GET /api/v1/me/river-basin-overrides ─────────────────────────────────────
-// Returns all of the caller's per-river basin overrides.
+// Returns all of the caller's per-river basin overrides. Accepts ?as={handle}
+// (see targetOwnerID) so the run edit form can read a special user's current
+// overrides while authoring as them — without it, an admin editing a run
+// ?as=h2oflows would see their own personal overrides instead of h2oflows',
+// and the "Override Basin" modal would never pre-fill or show "reset to
+// default" correctly.
 
 func (h *BasinOverrideHandler) List(w http.ResponseWriter, r *http.Request) {
-	ownerID, ok := h.ownerID(r)
+	ownerID, _, ok := h.targetOwnerID(r)
 	if !ok {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
 		return
@@ -81,10 +123,12 @@ func (h *BasinOverrideHandler) List(w http.ResponseWriter, r *http.Request) {
 }
 
 // ── PUT /api/v1/me/rivers/{riverID}/basin-override ───────────────────────────
-// Upsert a basin override for a single river. Body: { basin_key }.
+// Upsert a basin override for a single river. Body: { basin_key }. Accepts
+// ?as={handle} (see targetOwnerID) so an admin can save the override under a
+// special user's account.
 
 func (h *BasinOverrideHandler) Upsert(w http.ResponseWriter, r *http.Request) {
-	ownerID, ok := h.ownerID(r)
+	ownerID, _, ok := h.targetOwnerID(r)
 	if !ok {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
 		return
@@ -130,9 +174,11 @@ func (h *BasinOverrideHandler) Upsert(w http.ResponseWriter, r *http.Request) {
 
 // ── DELETE /api/v1/me/rivers/{riverID}/basin-override ────────────────────────
 // Removes a river basin override. Idempotent — 204 even if no row existed.
+// Accepts ?as={handle} (see targetOwnerID) so an admin can clear the override
+// under a special user's account.
 
 func (h *BasinOverrideHandler) Delete(w http.ResponseWriter, r *http.Request) {
-	ownerID, ok := h.ownerID(r)
+	ownerID, _, ok := h.targetOwnerID(r)
 	if !ok {
 		errorResponse(w, http.StatusUnauthorized, "authentication required")
 		return
