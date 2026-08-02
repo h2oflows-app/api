@@ -728,7 +728,7 @@ func (h *InviteHandler) MyInvites(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := h.db.Query(ctx, `
 		SELECT ri.id, ri.status::text, ri.dismissed_at, (ri.invite_handle IS NOT NULL) AS via_handle, ri.created_at,
-		       cr.id::text, cr.slug, cr.name, ur.name, ur.river_name, rv.state_abbr,
+		       cr.id::text, cr.slug, cr.name, ur.name, ur.river_name, COALESCE(ur.state_abbr, rv.state_abbr),
 		       cr.run_date::text, cr.run_time::text, cr.meetup_spot,
 		       cr.gauge_cfs, cr.flow_band, cr.flow_color,
 		       cr.max_crew, COALESCE(cm.filled, 0),

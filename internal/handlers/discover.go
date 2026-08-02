@@ -98,7 +98,7 @@ func (h *DiscoverHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 				ur.slug                             AS slug,
 				ur.name                             AS name,
 				ur.river_name                       AS river_name,
-				rv.state_abbr                       AS state_abbr,
+				COALESCE(ur.state_abbr, rv.state_abbr) AS state_abbr,
 				COALESCE(up.handle, 'h2oflows')     AS handle,
 				COALESCE(up.is_special, false)      AS is_special,
 				ur.class_min                        AS class_min,

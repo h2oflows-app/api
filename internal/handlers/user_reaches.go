@@ -97,6 +97,25 @@ func riverMetaFromCoords(ctx context.Context, lat, lng float64) (stateAbbr, basi
 	return
 }
 
+// runStateFromCoords resolves the two-letter US state abbreviation for a
+// run's OWN put-in coordinate via nldi.StateAt (TIGERweb Census lookup) —
+// the same service riverMetaFromCoords above uses for the river-level value.
+// Fails soft: a zero coordinate, a network/parse error, or a point outside
+// all US state polygons all yield "" so callers can leave/clear
+// user_reaches.state_abbr rather than fail the request (#356 — per-run
+// state, independent of the shared river row, which multi-state rivers like
+// the Colorado need since one river row can no longer speak for every run).
+func runStateFromCoords(ctx context.Context, lat, lng float64) string {
+	if lat == 0 && lng == 0 {
+		return ""
+	}
+	abbr, err := nldi.StateAt(ctx, lat, lng)
+	if err != nil {
+		return ""
+	}
+	return abbr
+}
+
 // UserReachHandler handles /api/v1/me/reaches routes.
 // All mutations are owner-scoped. devFallbackID is used in development when
 // SUPABASE_JWKS_URL is not set so routes remain testable without a real JWT.
@@ -637,7 +656,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.db.Query(r.Context(), `
 		SELECT
 			ur.id, ur.slug, ur.name, ur.long_name, ur.river_name,
-			rv.id::text AS river_id, rv.state_abbr, rv.basin AS basin_group,
+			rv.id::text AS river_id, COALESCE(ur.state_abbr, rv.state_abbr) AS state_abbr, rv.basin AS basin_group,
 			ST_X(ur.put_in::geometry)    AS put_in_lng,
 			ST_Y(ur.put_in::geometry)    AS put_in_lat,
 			ST_X(ur.take_out::geometry)  AS take_out_lng,
@@ -747,7 +766,7 @@ func (h *UserReachHandler) ReferencedRuns(w http.ResponseWriter, r *http.Request
 	rows, err := h.db.Query(r.Context(), `
 		SELECT
 			ur.id, ur.slug, ur.name, ur.long_name, ur.river_name,
-			rv.state_abbr, rv.basin AS basin_group,
+			COALESCE(ur.state_abbr, rv.state_abbr) AS state_abbr, rv.basin AS basin_group,
 			COALESCE(lr.value, cg.last_value_cfs) AS current_cfs,
 			COALESCE(lr.timestamp, cg.last_value_at) AS last_reading_at,
 			CASE
@@ -874,7 +893,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 			END AS flow_status,
 			fr.band_label AS flow_band,
 			rv.slug AS river_slug,
-			rv.state_abbr AS river_state_abbr,
+			COALESCE(ur.state_abbr, rv.state_abbr) AS river_state_abbr,
 			rv.basin AS river_basin,
 			ur.visibility,
 			fr_reach.slug AS forked_from_slug,
@@ -1087,7 +1106,7 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 			END AS flow_status,
 			fr.band_label AS flow_band,
 			rv.slug AS river_slug,
-			rv.state_abbr AS river_state_abbr,
+			COALESCE(ur.state_abbr, rv.state_abbr) AS river_state_abbr,
 			rv.basin AS river_basin,
 			ur.visibility,
 			fr_reach.slug AS forked_from_slug,
@@ -1391,6 +1410,12 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Resolve this run's OWN state from its own put-in (#356) — independent
+	// of the river row's COALESCE-once state_abbr, which multiple runs on a
+	// multi-state river (e.g. Colorado River: AZ, UT, CO reaches) can't all
+	// share correctly. put_in is validated non-zero above.
+	stateAbbr := runStateFromCoords(ctx, body.PutIn.Lat, body.PutIn.Lng)
+
 	// Generate slug from name.
 	baseSlug := kmlimport.Slugify(body.Name)
 	slug := baseSlug
@@ -1412,7 +1437,7 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var reachID string
 	err := h.db.QueryRow(ctx, `
 		INSERT INTO user_reaches
-			(owner_id, slug, name, long_name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, class_min, class_max, visibility, published_at, river_confirmed)
+			(owner_id, slug, name, long_name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, class_min, class_max, visibility, published_at, river_confirmed, state_abbr)
 		VALUES
 			($1, $2, $3, $4, $5, $6,
 			 ST_SetSRID(ST_MakePoint($7, $8), 4326)::geography,
@@ -1420,14 +1445,14 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 			 NULLIF($11,''), NULLIF($12,''), $13, $14, $15,
 			 $16::run_visibility,
 			 CASE WHEN $16 = 'public' THEN NOW() ELSE NULL END,
-			 $17)
+			 $17, NULLIF($18,''))
 		RETURNING id
 	`, ownerID, slug, body.Name, body.LongName, riverID, finalRiverName,
 		body.PutIn.Lng, body.PutIn.Lat,
 		body.TakeOut.Lng, body.TakeOut.Lat,
 		body.UpComID, body.DownComID, body.Note,
 		body.ClassMin, body.ClassMax, createVisibility,
-		riverID != nil,
+		riverID != nil, stateAbbr,
 	).Scan(&reachID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("create failed: %v", err))
@@ -1512,6 +1537,9 @@ func (h *UserReachHandler) Import(w http.ResponseWriter, r *http.Request) { //no
 		}
 	}
 
+	// Resolve this run's OWN state from its own put-in (#356) — see Create.
+	stateAbbr := runStateFromCoords(ctx, body.PutIn.Lat, body.PutIn.Lng)
+
 	baseSlug := kmlimport.Slugify(body.Name)
 	slug := baseSlug
 	for i := 2; i <= 20; i++ {
@@ -1527,18 +1555,18 @@ func (h *UserReachHandler) Import(w http.ResponseWriter, r *http.Request) { //no
 	var reachID string
 	err := h.db.QueryRow(ctx, `
 		INSERT INTO user_reaches
-			(owner_id, slug, name, long_name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, river_confirmed)
+			(owner_id, slug, name, long_name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, river_confirmed, state_abbr)
 		VALUES
 			($1, $2, $3, $4, $5, $6,
 			 ST_SetSRID(ST_MakePoint($7, $8), 4326)::geography,
 			 ST_SetSRID(ST_MakePoint($9, $10), 4326)::geography,
-			 NULLIF($11,''), NULLIF($12,''), $13, $14)
+			 NULLIF($11,''), NULLIF($12,''), $13, $14, NULLIF($15,''))
 		RETURNING id
 	`, ownerID, slug, body.Name, body.LongName, riverID, finalRiverName,
 		body.PutIn.Lng, body.PutIn.Lat,
 		body.TakeOut.Lng, body.TakeOut.Lat,
 		body.UpComID, body.DownComID, body.Note,
-		riverID != nil,
+		riverID != nil, stateAbbr,
 	).Scan(&reachID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("import failed: %v", err))
@@ -1747,12 +1775,27 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Re-resolve river when river_name is being set, so state/basin/huc8 get populated.
+	// Use this request's new put-in when the caller supplied one (geometry can
+	// arrive in the same PATCH as river_name); otherwise there is no real
+	// coordinate to resolve against here. Previously this hardcoded 0,0
+	// ("null island") on every call — resolveOrCreateRiver only consults
+	// putInLat/putInLng at all when it's creating a brand-new river row with
+	// no gnis_id, so that garbage point could silently seed a new river's
+	// state/basin/huc8 from the Gulf of Guinea instead of the run's actual
+	// location. 0,0 is still passed when we truly have no coordinate (no
+	// put_in in this PATCH) — resolveOrCreateRiver already treats that as
+	// "unknown, skip coord resolution" (putInLat != 0 && putInLng != 0 guard),
+	// so it's a meaningful sentinel here, not fed-in garbage.
 	if riverName != nil {
 		gnisID := ""
 		if body.GnisID != nil {
 			gnisID = strings.TrimSpace(*body.GnisID)
 		}
-		rid := resolveOrCreateRiver(ctx, h.db, *riverName, gnisID, 0, 0)
+		var putInLat, putInLng float64
+		if body.PutIn != nil {
+			putInLat, putInLng = body.PutIn.Lat, body.PutIn.Lng
+		}
+		rid := resolveOrCreateRiver(ctx, h.db, *riverName, gnisID, putInLat, putInLng)
 		if rid != "" {
 			_, _ = h.db.Exec(ctx,
 				`UPDATE user_reaches SET river_id = $3 WHERE owner_id = $1 AND slug = $2`,
@@ -1760,8 +1803,16 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Geometry update — only when all four geometry fields provided.
+	// Geometry update — only when all four geometry fields provided. The
+	// put-in moving means this run's OWN state may have changed too (#356),
+	// so recompute state_abbr from the NEW put-in on every geometry update —
+	// unconditionally replacing rather than merging: if the fresh lookup
+	// fails softly (network error, or point outside all US polygons) we set
+	// NULL rather than keep whatever state matched the OLD put-in, since a
+	// stale-but-plausible value is worse than a visibly-missing one once we
+	// know the location changed.
 	if body.PutIn != nil && body.TakeOut != nil && body.UpComID != nil && body.DownComID != nil {
+		newStateAbbr := runStateFromCoords(ctx, body.PutIn.Lat, body.PutIn.Lng)
 		_, _ = h.db.Exec(ctx, `
 			UPDATE user_reaches
 			SET
@@ -1769,12 +1820,13 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 				take_out   = ST_SetSRID(ST_MakePoint($5, $6), 4326)::geography,
 				up_comid   = NULLIF($7, ''),
 				down_comid = NULLIF($8, ''),
+				state_abbr = NULLIF($9, ''),
 				updated_at = NOW()
 			WHERE owner_id = $1 AND slug = $2
 		`, ownerID, slug,
 			body.PutIn.Lng, body.PutIn.Lat,
 			body.TakeOut.Lng, body.TakeOut.Lat,
-			*body.UpComID, *body.DownComID)
+			*body.UpComID, *body.DownComID, newStateAbbr)
 	}
 
 	// Recompute completeness after any field change. (V18)
@@ -2714,7 +2766,7 @@ func (h *UserReachHandler) ListCommunity(w http.ResponseWriter, r *http.Request)
 	query := `
 		SELECT
 			ur.id, ur.slug, ur.name, ur.long_name, ur.river_name,
-			rv.state_abbr, rv.basin AS basin_group,
+			COALESCE(ur.state_abbr, rv.state_abbr) AS state_abbr, rv.basin AS basin_group,
 			ST_X(ur.put_in::geometry)   AS put_in_lng,
 			ST_Y(ur.put_in::geometry)   AS put_in_lat,
 			ST_X(ur.take_out::geometry) AS take_out_lng,

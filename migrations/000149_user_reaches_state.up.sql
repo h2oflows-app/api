@@ -1,0 +1,22 @@
+-- #356: per-run US state, replacing the shared rivers.state_abbr for display.
+-- user_reaches (the runs table) had no state of its own — every run read
+-- rivers.state_abbr via river_id, and resolveOrCreateRiver only ever sets
+-- that field once (COALESCE-on-conflict), so a multi-state river (e.g. the
+-- Colorado River: Grand Canyon in AZ, Westwater/Cataract/Moab reaches in UT)
+-- reported one state for every run hung off it forever.
+--
+-- Mirrors the state_abbr column the old (dropped, mig 000122) reaches table
+-- carried — same type, same TIGERweb-Census-lookup provenance (mig 000064),
+-- now scoped to the run's own put-in instead of a curated reach's
+-- start_point.
+--
+-- Nullable: a lookup failure (network error, or a point TIGERweb can't place
+-- in any state polygon) must not block a run from being created or updated.
+-- No backfill here — every existing row starts NULL; cmd/backfill-run-state
+-- populates all existing rows from their own put-in as a separate,
+-- re-runnable step (data backfills don't ride inside schema migrations in
+-- this repo — see cmd/backfill-river-gnis for the established pattern).
+--
+-- rivers.state_abbr is untouched: still written on river create/backfill,
+-- still the fallback wherever a run has no per-run value yet.
+ALTER TABLE user_reaches ADD COLUMN state_abbr VARCHAR(2);

@@ -58,8 +58,23 @@ func (h *AdminHandler) SlugCheck(w http.ResponseWriter, r *http.Request) {
 // ListRivers returns all rivers with their reach count.
 // GET /api/v1/admin/rivers
 func (h *AdminHandler) ListRivers(w http.ResponseWriter, r *http.Request) {
+	// #356: rv.state_abbr is now only the shared fallback — prefer the mode
+	// (most common non-null value) among this river's own runs, since a
+	// multi-state river (e.g. Colorado River: AZ/UT/CO reaches) can no
+	// longer be summarized by one COALESCE-once river-level field alone.
+	// Precomputed in a CTE (rather than mode() WITHIN GROUP inline) because
+	// this query already GROUPs BY rv.id for the reach/gauge-health counts,
+	// and re.state_abbr — a column from the many-side of that join — can't
+	// be referenced un-aggregated alongside them.
 	rows, err := h.db.Query(r.Context(), `
-		SELECT rv.id, rv.slug, rv.name, rv.gnis_id, rv.basin, rv.state_abbr,
+		WITH river_state AS (
+			SELECT river_id, mode() WITHIN GROUP (ORDER BY state_abbr) AS state_abbr
+			FROM user_reaches
+			WHERE owner_id = '00000000-0000-0000-0000-000000000001' AND deleted_at IS NULL AND state_abbr IS NOT NULL
+			GROUP BY river_id
+		)
+		SELECT rv.id, rv.slug, rv.name, rv.gnis_id, rv.basin,
+		       COALESCE(rs.state_abbr, rv.state_abbr) AS state_abbr,
 		       COUNT(re.id) AS reach_count,
 		       COUNT(g.id) FILTER (WHERE g.poll_health = 'degraded')    AS gauges_degraded,
 		       COUNT(g.id) FILTER (WHERE g.poll_health = 'stale')       AS gauges_stale,
@@ -67,7 +82,8 @@ func (h *AdminHandler) ListRivers(w http.ResponseWriter, r *http.Request) {
 		FROM rivers rv
 		LEFT JOIN user_reaches re ON re.river_id = rv.id AND re.owner_id='00000000-0000-0000-0000-000000000001' AND re.deleted_at IS NULL
 		LEFT JOIN gauges g ON g.id = re.primary_gauge_id
-		GROUP BY rv.id
+		LEFT JOIN river_state rs ON rs.river_id = rv.id
+		GROUP BY rv.id, rs.state_abbr
 		ORDER BY rv.name
 	`)
 	if err != nil {
