@@ -26,7 +26,11 @@ import (
 // no match exists, INSERTs a new river — populating state_abbr/basin/huc8 via
 // NHD + WBD/TIGERweb when gnisID is present, or via put-in coords when not.
 // Returns river ID, "" on failure.
-func resolveOrCreateRiver(ctx context.Context, db *pgxpool.Pool, riverName, gnisID string, putInLat, putInLng float64) string {
+// knownState: the run's own state for this same put-in, already resolved by
+// the caller (runStateFromCoords), threaded down to riverMetaFromCoords so a
+// brand-new river row doesn't trigger a second TIGERweb lookup for a
+// coordinate we just looked up. "" is fine — see riverMetaFromCoords.
+func resolveOrCreateRiver(ctx context.Context, db *pgxpool.Pool, riverName, gnisID string, putInLat, putInLng float64, knownState string) string {
 	riverSlug := kmlimport.Slugify(riverName)
 	var rid string
 
@@ -62,7 +66,7 @@ func resolveOrCreateRiver(ctx context.Context, db *pgxpool.Pool, riverName, gnis
 			gnisParam = gnisID
 			stateAbbr, basin, huc8 = riverMetaFromGNIS(ctx, gnisID)
 		} else if putInLat != 0 && putInLng != 0 {
-			stateAbbr, basin, huc8 = riverMetaFromCoords(ctx, putInLat, putInLng)
+			stateAbbr, basin, huc8 = riverMetaFromCoords(ctx, putInLat, putInLng, knownState)
 		}
 		_ = db.QueryRow(ctx, `
 			INSERT INTO rivers (slug, name, gnis_id, state_abbr, basin, huc8)
@@ -81,13 +85,19 @@ func resolveOrCreateRiver(ctx context.Context, db *pgxpool.Pool, riverName, gnis
 
 // riverMetaFromCoords resolves state/basin/huc8 from a lat/lng directly —
 // used when a stream has no GNIS ID (unnamed tributaries, custom routes).
-func riverMetaFromCoords(ctx context.Context, lat, lng float64) (stateAbbr, basin, huc8 string) {
-	stateCh := make(chan string, 1)
+// knownState is the caller's already-resolved state for this SAME
+// coordinate (runStateFromCoords). Passing it skips a second, redundant
+// nldi.StateAt call: every caller that reaches here has just looked the
+// point up for the run's own state_abbr, and hitting TIGERweb twice for one
+// coordinate in one request doubled both the worst-case latency (two
+// sequential 20s-bounded client timeouts) and the load we put on the Census
+// service. Pass "" only when the caller genuinely has no answer, in which
+// case the basin's own States field is still consulted as a fallback below.
+func riverMetaFromCoords(ctx context.Context, lat, lng float64, knownState string) (stateAbbr, basin, huc8 string) {
 	type basinResult struct{ info nldi.BasinInfo }
 	basinCh := make(chan basinResult, 1)
-	go func() { v, _ := nldi.StateAt(ctx, lat, lng); stateCh <- v }()
 	go func() { v, _ := nldi.BasinAt(ctx, lat, lng); basinCh <- basinResult{v} }()
-	stateAbbr = <-stateCh
+	stateAbbr = knownState
 	basinRes := <-basinCh
 	if stateAbbr == "" && basinRes.info.States != "" {
 		stateAbbr = strings.SplitN(basinRes.info.States, ",", 2)[0]
@@ -105,15 +115,23 @@ func riverMetaFromCoords(ctx context.Context, lat, lng float64) (stateAbbr, basi
 // user_reaches.state_abbr rather than fail the request (#356 — per-run
 // state, independent of the shared river row, which multi-state rivers like
 // the Colorado need since one river row can no longer speak for every run).
-func runStateFromCoords(ctx context.Context, lat, lng float64) string {
+// ok distinguishes "the lookup ran and this is the answer" (including a
+// legitimate "" for a point outside every US state polygon) from "the lookup
+// FAILED and we know nothing" (network/parse error, or a zero coordinate we
+// refused to look up). Callers that are about to OVERWRITE a stored value
+// must branch on it: writing a failure's "" would blank a previously-correct
+// state on a transient TIGERweb blip, silently recreating the very bug #356
+// fixes. Callers inserting a brand-new row can ignore it — there is nothing
+// to clobber, and "" simply means NULL.
+func runStateFromCoords(ctx context.Context, lat, lng float64) (abbr string, ok bool) {
 	if lat == 0 && lng == 0 {
-		return ""
+		return "", false
 	}
 	abbr, err := nldi.StateAt(ctx, lat, lng)
 	if err != nil {
-		return ""
+		return "", false
 	}
-	return abbr
+	return abbr, true
 }
 
 // UserReachHandler handles /api/v1/me/reaches routes.
@@ -1399,22 +1417,26 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
+	// Resolve this run's OWN state from its own put-in (#356) — independent
+	// of the river row's COALESCE-once state_abbr, which multiple runs on a
+	// multi-state river (e.g. Colorado River: AZ, UT, CO reaches) can't all
+	// share correctly. put_in is validated non-zero above. Resolved BEFORE
+	// the river block below so the same answer can be handed to
+	// resolveOrCreateRiver instead of it looking the identical coordinate up
+	// a second time. ok is ignored here: this is an INSERT, so there is no
+	// stored value a failed lookup's "" could clobber.
+	stateAbbr, _ := runStateFromCoords(ctx, body.PutIn.Lat, body.PutIn.Lng)
+
 	// Auto-assign or create river if river_name provided.
 	var riverID *string
 	var finalRiverName *string
 	if rn := strings.TrimSpace(body.RiverName); rn != "" {
 		finalRiverName = &rn
-		rid := resolveOrCreateRiver(ctx, h.db, rn, body.GnisID, body.PutIn.Lat, body.PutIn.Lng)
+		rid := resolveOrCreateRiver(ctx, h.db, rn, body.GnisID, body.PutIn.Lat, body.PutIn.Lng, stateAbbr)
 		if rid != "" {
 			riverID = &rid
 		}
 	}
-
-	// Resolve this run's OWN state from its own put-in (#356) — independent
-	// of the river row's COALESCE-once state_abbr, which multiple runs on a
-	// multi-state river (e.g. Colorado River: AZ, UT, CO reaches) can't all
-	// share correctly. put_in is validated non-zero above.
-	stateAbbr := runStateFromCoords(ctx, body.PutIn.Lat, body.PutIn.Lng)
 
 	// Generate slug from name.
 	baseSlug := kmlimport.Slugify(body.Name)
@@ -1527,18 +1549,19 @@ func (h *UserReachHandler) Import(w http.ResponseWriter, r *http.Request) { //no
 
 	ctx := r.Context()
 
+	// Resolve this run's OWN state from its own put-in (#356) — see Create,
+	// including why this runs before the river block and why ok is ignored.
+	stateAbbr, _ := runStateFromCoords(ctx, body.PutIn.Lat, body.PutIn.Lng)
+
 	var riverID *string
 	var finalRiverName *string
 	if rn := strings.TrimSpace(body.RiverName); rn != "" {
 		finalRiverName = &rn
-		rid := resolveOrCreateRiver(ctx, h.db, rn, body.GnisID, body.PutIn.Lat, body.PutIn.Lng)
+		rid := resolveOrCreateRiver(ctx, h.db, rn, body.GnisID, body.PutIn.Lat, body.PutIn.Lng, stateAbbr)
 		if rid != "" {
 			riverID = &rid
 		}
 	}
-
-	// Resolve this run's OWN state from its own put-in (#356) — see Create.
-	stateAbbr := runStateFromCoords(ctx, body.PutIn.Lat, body.PutIn.Lng)
 
 	baseSlug := kmlimport.Slugify(body.Name)
 	slug := baseSlug
@@ -1786,6 +1809,16 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 	// put_in in this PATCH) — resolveOrCreateRiver already treats that as
 	// "unknown, skip coord resolution" (putInLat != 0 && putInLng != 0 guard),
 	// so it's a meaningful sentinel here, not fed-in garbage.
+	// Resolve this request's state ONCE, up front, so the river block and the
+	// geometry block below share one TIGERweb lookup instead of issuing two
+	// for the same coordinate (they can both fire on a single PATCH).
+	// stateOK=false means the lookup failed outright — see the geometry block.
+	var newStateAbbr string
+	var stateOK bool
+	if body.PutIn != nil {
+		newStateAbbr, stateOK = runStateFromCoords(ctx, body.PutIn.Lat, body.PutIn.Lng)
+	}
+
 	if riverName != nil {
 		gnisID := ""
 		if body.GnisID != nil {
@@ -1795,7 +1828,7 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		if body.PutIn != nil {
 			putInLat, putInLng = body.PutIn.Lat, body.PutIn.Lng
 		}
-		rid := resolveOrCreateRiver(ctx, h.db, *riverName, gnisID, putInLat, putInLng)
+		rid := resolveOrCreateRiver(ctx, h.db, *riverName, gnisID, putInLat, putInLng, newStateAbbr)
 		if rid != "" {
 			_, _ = h.db.Exec(ctx,
 				`UPDATE user_reaches SET river_id = $3 WHERE owner_id = $1 AND slug = $2`,
@@ -1805,14 +1838,21 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 
 	// Geometry update — only when all four geometry fields provided. The
 	// put-in moving means this run's OWN state may have changed too (#356),
-	// so recompute state_abbr from the NEW put-in on every geometry update —
-	// unconditionally replacing rather than merging: if the fresh lookup
-	// fails softly (network error, or point outside all US polygons) we set
-	// NULL rather than keep whatever state matched the OLD put-in, since a
-	// stale-but-plausible value is worse than a visibly-missing one once we
-	// know the location changed.
+	// so state_abbr is rewritten from the NEW put-in here.
+	//
+	// The write is gated on stateOK, NOT on the resolved string: a failed
+	// lookup ("" with ok=false — a TIGERweb blip, exactly the sort of
+	// transient the rest of this file treats as routine) must leave the
+	// stored value alone. Writing its "" would blank a previously-correct
+	// state and silently recreate the bug #356 exists to fix, on a request
+	// that still returns 200. Note this block fires whenever all four
+	// geometry fields are PRESENT, not only when the put-in actually moved,
+	// so a client resubmitting an unchanged geometry bundle must not lose its
+	// state to a network hiccup either. A lookup that genuinely succeeds with
+	// "" (a point outside every US state polygon) does still clear the column
+	// — that is a real answer, not a failure. Same never-clobber-on-error
+	// rule cmd/backfill-run-state follows.
 	if body.PutIn != nil && body.TakeOut != nil && body.UpComID != nil && body.DownComID != nil {
-		newStateAbbr := runStateFromCoords(ctx, body.PutIn.Lat, body.PutIn.Lng)
 		_, _ = h.db.Exec(ctx, `
 			UPDATE user_reaches
 			SET
@@ -1820,13 +1860,13 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 				take_out   = ST_SetSRID(ST_MakePoint($5, $6), 4326)::geography,
 				up_comid   = NULLIF($7, ''),
 				down_comid = NULLIF($8, ''),
-				state_abbr = NULLIF($9, ''),
+				state_abbr = CASE WHEN $9 THEN NULLIF($10, '') ELSE state_abbr END,
 				updated_at = NOW()
 			WHERE owner_id = $1 AND slug = $2
 		`, ownerID, slug,
 			body.PutIn.Lng, body.PutIn.Lat,
 			body.TakeOut.Lng, body.TakeOut.Lat,
-			*body.UpComID, *body.DownComID, newStateAbbr)
+			*body.UpComID, *body.DownComID, stateOK, newStateAbbr)
 	}
 
 	// Recompute completeness after any field change. (V18)
