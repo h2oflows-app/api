@@ -1689,22 +1689,22 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	type latLng struct {
-		Lat float64 `json:"lat"`
-		Lng float64 `json:"lng"`
-	}
+	// PutIn/TakeOut reuse uploadLatLng (run_upload.go) instead of a
+	// function-local type so the geometry block below can hand them straight
+	// to buildUploadCenterline — the exact fetch+trim helper UploadUpdate
+	// uses — with no conversion (#344).
 	var body struct {
-		Name      *string  `json:"name"`
-		NewSlug   *string  `json:"slug"`
-		Note      *string  `json:"note"`
-		RiverName *string  `json:"river_name"`
-		GnisID    *string  `json:"gnis_id"`
-		PutIn     *latLng  `json:"put_in"`
-		TakeOut   *latLng  `json:"take_out"`
-		UpComID   *string  `json:"up_comid"`
-		DownComID *string  `json:"down_comid"`
-		ClassMin  *float64 `json:"class_min"`
-		ClassMax  *float64 `json:"class_max"`
+		Name      *string       `json:"name"`
+		NewSlug   *string       `json:"slug"`
+		Note      *string       `json:"note"`
+		RiverName *string       `json:"river_name"`
+		GnisID    *string       `json:"gnis_id"`
+		PutIn     *uploadLatLng `json:"put_in"`
+		TakeOut   *uploadLatLng `json:"take_out"`
+		UpComID   *string       `json:"up_comid"`
+		DownComID *string       `json:"down_comid"`
+		ClassMin  *float64      `json:"class_min"`
+		ClassMax  *float64      `json:"class_max"`
 		// is_private kept for backward compat; maps to visibility column
 		IsPrivate  *bool   `json:"is_private"`
 		Visibility *string `json:"visibility"`
@@ -1836,12 +1836,17 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Geometry update — only when all four geometry fields provided. The
-	// put-in moving means this run's OWN state may have changed too (#356),
-	// so state_abbr is rewritten from the NEW put-in here.
+	// Geometry update — only when all four geometry fields provided. This is
+	// the ONLY place in the JWT-authenticated in-app path that writes
+	// put_in/take_out, so the centerline re-trim below lives in the SAME
+	// block by construction: a future change to this handler cannot move
+	// put_in/take_out without also re-trimming the centerline, short of
+	// deliberately splitting this block apart. The put-in moving also means
+	// this run's OWN state may have changed too (#356), so state_abbr is
+	// rewritten from the NEW put-in here.
 	//
-	// The write is gated on stateOK, NOT on the resolved string: a failed
-	// lookup ("" with ok=false — a TIGERweb blip, exactly the sort of
+	// The state_abbr write is gated on stateOK, NOT on the resolved string: a
+	// failed lookup ("" with ok=false — a TIGERweb blip, exactly the sort of
 	// transient the rest of this file treats as routine) must leave the
 	// stored value alone. Writing its "" would blank a previously-correct
 	// state and silently recreate the bug #356 exists to fix, on a request
@@ -1852,7 +1857,28 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 	// "" (a point outside every US state polygon) does still clear the column
 	// — that is a real answer, not a failure. Same never-clobber-on-error
 	// rule cmd/backfill-run-state follows.
+	//
+	// centerline (#344): re-fetched + re-trimmed from the NEW put-in/take-out
+	// via buildUploadCenterline — the SAME NLDI-fetch-then-PostGIS-trim
+	// helper UploadUpdate (run_upload.go) already uses, so the two handlers
+	// can no longer drift apart on how a moved endpoint updates the line.
+	// UNLIKE state_abbr, a failed re-trim does NOT leave the old centerline
+	// in place — clOK=false clears it instead, mirroring UploadUpdate's
+	// existing precedent exactly. The two fields fail differently on
+	// purpose: state_abbr staleness is invisible (a wrong-but-plausible
+	// label, worth preserving over a blank one), but a stale centerline is
+	// visibly wrong on the map, AND once the endpoints have moved it no
+	// longer describes a real path between them at all — it was trimmed
+	// against coordinates that no longer apply, so "stale" here isn't a
+	// small drift, it's a line that can overshoot, undershoot, or point at
+	// the wrong fork entirely. Clearing it instead falls back to the
+	// client's synthesized 2-point straight line between the NEW, correct
+	// endpoints (see MapAll/MapCommunity), which is a strictly safer failure
+	// mode. This NLDI round trip is bounded by buildUploadCenterline's own
+	// 30s context timeout and is fail-soft — it never aborts the request.
 	if body.PutIn != nil && body.TakeOut != nil && body.UpComID != nil && body.DownComID != nil {
+		cl, upC, downC, clOK := h.buildUploadCenterline(ctx, *body.UpComID, *body.DownComID, *body.PutIn, *body.TakeOut)
+
 		_, _ = h.db.Exec(ctx, `
 			UPDATE user_reaches
 			SET
@@ -1861,12 +1887,13 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 				up_comid   = NULLIF($7, ''),
 				down_comid = NULLIF($8, ''),
 				state_abbr = CASE WHEN $9 THEN NULLIF($10, '') ELSE state_abbr END,
+				centerline = CASE WHEN $11 THEN ST_GeomFromGeoJSON($12)::geography ELSE NULL END,
 				updated_at = NOW()
 			WHERE owner_id = $1 AND slug = $2
 		`, ownerID, slug,
 			body.PutIn.Lng, body.PutIn.Lat,
 			body.TakeOut.Lng, body.TakeOut.Lat,
-			*body.UpComID, *body.DownComID, stateOK, newStateAbbr)
+			upC, downC, stateOK, newStateAbbr, clOK, cl)
 	}
 
 	// Recompute completeness after any field change. (V18)
