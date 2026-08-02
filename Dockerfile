@@ -8,7 +8,8 @@ COPY . .
 
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o /api             ./cmd/server && \
     CGO_ENABLED=0 GOOS=linux go build -trimpath -o /seed-flows      ./cmd/seed-flow-ranges && \
-    CGO_ENABLED=0 GOOS=linux go build -trimpath -o /backfill-river-gnis ./cmd/backfill-river-gnis
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -o /backfill-river-gnis ./cmd/backfill-river-gnis && \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -o /backfill-run-state  ./cmd/backfill-run-state
 
 # --- runtime ---
 FROM alpine:3.20
@@ -17,6 +18,7 @@ RUN apk add --no-cache ca-certificates tzdata
 COPY --from=builder /api             /api
 COPY --from=builder /seed-flows      /seed-flows
 COPY --from=builder /backfill-river-gnis /backfill-river-gnis
+COPY --from=builder /backfill-run-state  /backfill-run-state
 COPY --from=builder /src/migrations  /migrations
 
 ENV MIGRATIONS_PATH=/migrations
