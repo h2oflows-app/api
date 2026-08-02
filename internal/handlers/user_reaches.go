@@ -882,7 +882,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 
 	err := h.db.QueryRow(r.Context(), `
 		SELECT
-			ur.id, ur.slug, ur.name, ur.long_name, ur.river_name,
+			ur.id, ur.river_id::text AS river_id, ur.slug, ur.name, ur.long_name, ur.river_name,
 			ST_X(ur.put_in::geometry)    AS put_in_lng,
 			ST_Y(ur.put_in::geometry)    AS put_in_lat,
 			ST_X(ur.take_out::geometry)  AS take_out_lng,
@@ -952,7 +952,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 		WHERE ur.owner_id = ANY($1::text[]) AND ur.slug = $2
 		ORDER BY (ur.owner_id = $3) DESC LIMIT 1
 	`, ids, slug, callerID).Scan(
-		&d.ID, &d.Slug, &d.Name, &d.LongName, &d.RiverName,
+		&d.ID, &d.RiverID, &d.Slug, &d.Name, &d.LongName, &d.RiverName,
 		&d.PutInLng, &d.PutInLat, &d.TakeOutLng, &d.TakeOutLat,
 		&d.Note, &d.CreatedAt,
 		&d.ClassMin, &d.ClassMax,
