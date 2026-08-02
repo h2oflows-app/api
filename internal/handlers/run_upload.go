@@ -235,12 +235,20 @@ func (h *UserReachHandler) createOneUploadRun(ctx context.Context, ownerID, name
 		return "", "", "", verr
 	}
 
+	// This run's OWN state from its own put-in (#356), resolved once and
+	// shared with resolveOrCreateRiver below so one coordinate costs one
+	// TIGERweb lookup. Bulk-uploaded runs need this as much as in-app ones:
+	// without it they'd fall back to the shared rivers.state_abbr and
+	// reinherit exactly the multi-state wrongness #356 fixes. ok is ignored —
+	// this is an INSERT, nothing to clobber.
+	stateAbbr, _ := runStateFromCoords(ctx, in.PutIn.Lat, in.PutIn.Lng)
+
 	// Auto-assign or create river if river_name provided.
 	var riverID *string
 	var finalRiverName *string
 	if rn := strings.TrimSpace(in.RiverName); rn != "" {
 		finalRiverName = &rn
-		if rid := resolveOrCreateRiver(ctx, h.db, rn, in.GnisID, in.PutIn.Lat, in.PutIn.Lng); rid != "" {
+		if rid := resolveOrCreateRiver(ctx, h.db, rn, in.GnisID, in.PutIn.Lat, in.PutIn.Lng, stateAbbr); rid != "" {
 			riverID = &rid
 		}
 	}
@@ -275,19 +283,19 @@ func (h *UserReachHandler) createOneUploadRun(ctx context.Context, ownerID, name
 
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO user_reaches
-			(owner_id, slug, name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, class_min, class_max, visibility, published_at, river_confirmed)
+			(owner_id, slug, name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, class_min, class_max, state_abbr, visibility, published_at, river_confirmed)
 		VALUES
 			($1, $2, $3, $4, $5,
 			 ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography,
 			 ST_SetSRID(ST_MakePoint($8, $9), 4326)::geography,
-			 NULLIF($10,''), NULLIF($11,''), $12, $13, $14,
+			 NULLIF($10,''), NULLIF($11,''), $12, $13, $14, NULLIF($15,''),
 			 'public', NOW(), false)
 		RETURNING id
 	`, ownerID, slug, name, riverID, finalRiverName,
 		in.PutIn.Lng, in.PutIn.Lat,
 		in.TakeOut.Lng, in.TakeOut.Lat,
 		finalUpComID, finalDownComID, in.Note,
-		in.ClassMin, in.ClassMax,
+		in.ClassMin, in.ClassMax, stateAbbr,
 	).Scan(&id); err != nil {
 		return "", "", "", fmt.Errorf("create failed: %w", err)
 	}
@@ -514,7 +522,9 @@ func (h *UserReachHandler) UploadUpdate(w http.ResponseWriter, r *http.Request) 
 		if body.GnisID != nil {
 			gnisID = strings.TrimSpace(*body.GnisID)
 		}
-		if rid := resolveOrCreateRiver(ctx, h.db, *riverName, gnisID, 0, 0); rid != "" {
+		// 0,0 is resolveOrCreateRiver's "no coordinate, skip coord resolution"
+		// sentinel; with no coordinate there is likewise no state to hand it.
+		if rid := resolveOrCreateRiver(ctx, h.db, *riverName, gnisID, 0, 0, ""); rid != "" {
 			_, _ = h.db.Exec(ctx,
 				`UPDATE user_reaches SET river_id = $3 WHERE owner_id = $1 AND slug = $2`,
 				ownerID, slug, rid)
@@ -564,6 +574,17 @@ func (h *UserReachHandler) UploadUpdate(w http.ResponseWriter, r *http.Request) 
 
 		cl, upC, downC, clOK := h.buildUploadCenterline(ctx, upHint, downHint, newPut, newTake)
 
+		// A moved put-in can change the run's state (#356). Only looked up
+		// when the put-in itself was supplied — a take-out-only edit leaves
+		// newPut at the stored value, so re-resolving it would be a wasted
+		// TIGERweb call. Gated on stateOK for the same reason as the in-app
+		// Update path: a failed lookup must not blank a stored state.
+		var newStateAbbr string
+		var stateOK bool
+		if body.PutIn != nil {
+			newStateAbbr, stateOK = runStateFromCoords(ctx, newPut.Lat, newPut.Lng)
+		}
+
 		_, _ = h.db.Exec(ctx, `
 			UPDATE user_reaches
 			SET
@@ -571,10 +592,11 @@ func (h *UserReachHandler) UploadUpdate(w http.ResponseWriter, r *http.Request) 
 				take_out        = ST_SetSRID(ST_MakePoint($5, $6), 4326)::geography,
 				up_comid        = NULLIF($7, ''),
 				down_comid      = NULLIF($8, ''),
+				state_abbr      = CASE WHEN $9 THEN NULLIF($10, '') ELSE state_abbr END,
 				river_confirmed = false,
 				updated_at      = NOW()
 			WHERE owner_id = $1 AND slug = $2
-		`, ownerID, slug, newPut.Lng, newPut.Lat, newTake.Lng, newTake.Lat, upC, downC)
+		`, ownerID, slug, newPut.Lng, newPut.Lat, newTake.Lng, newTake.Lat, upC, downC, stateOK, newStateAbbr)
 
 		if clOK {
 			_, _ = h.db.Exec(ctx,

@@ -751,7 +751,7 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 					COALESCE(ur.river_name, ur_rv.name) AS river_name,
 					COALESCE(ur_rv.basin, g.watershed_name) AS basin_group,
 					ST_X(ur.put_in::geometry) AS center_lng,
-					ur_rv.state_abbr,
+					COALESCE(ur.state_abbr, ur_rv.state_abbr) AS state_abbr,
 					NULL::smallint AS river_order,
 					up.handle AS author_handle,
 					ur_rv.id::text AS river_id,

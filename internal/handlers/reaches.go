@@ -601,7 +601,7 @@ func (h *ReachHandler) queryAllListItems(ctx context.Context, anonOnly bool) ([]
 			NULL::text  AS put_in_name,
 			NULL::text  AS take_out_name,
 			rv.basin,
-			rv.state_abbr,
+			COALESCE(r.state_abbr, rv.state_abbr) AS state_abbr,
 			r.class_min,
 			COALESCE(
 				(SELECT MAX(class_rating) FROM rapids WHERE user_reach_id = r.id AND class_rating IS NOT NULL),
