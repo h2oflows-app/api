@@ -882,7 +882,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 
 	err := h.db.QueryRow(r.Context(), `
 		SELECT
-			ur.id, ur.slug, ur.name, ur.long_name, ur.river_name,
+			ur.id, ur.river_id::text AS river_id, ur.slug, ur.name, ur.long_name, ur.river_name,
 			ST_X(ur.put_in::geometry)    AS put_in_lng,
 			ST_Y(ur.put_in::geometry)    AS put_in_lat,
 			ST_X(ur.take_out::geometry)  AS take_out_lng,
@@ -952,7 +952,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 		WHERE ur.owner_id = ANY($1::text[]) AND ur.slug = $2
 		ORDER BY (ur.owner_id = $3) DESC LIMIT 1
 	`, ids, slug, callerID).Scan(
-		&d.ID, &d.Slug, &d.Name, &d.LongName, &d.RiverName,
+		&d.ID, &d.RiverID, &d.Slug, &d.Name, &d.LongName, &d.RiverName,
 		&d.PutInLng, &d.PutInLat, &d.TakeOutLng, &d.TakeOutLat,
 		&d.Note, &d.CreatedAt,
 		&d.ClassMin, &d.ClassMax,
@@ -2735,7 +2735,33 @@ func forkRunTx(ctx context.Context, q pgxQueryer, ownerID, srcRunID string) (new
 	// Copy all features (rapids + access points) so a fork carries the whole run (#312).
 	copyRunFeatures(ctx, q, newID, src.ID)
 
+	// Copy the source author's basin override for this run's river, if they
+	// have one, so their curated basin name travels with the fork. Fork-copy
+	// only — this is never a global/public default, just a starting point for
+	// the forker's own view. No-op when the run has no river_id.
+	if src.RiverID != nil {
+		copyBasinOverride(ctx, q, ownerID, src.OwnerID, *src.RiverID)
+	}
+
 	return newID, newSlug, nil
+}
+
+// copyBasinOverride copies srcOwnerID's basin override for riverID (if one
+// exists) onto dstOwnerID's account. ON CONFLICT DO NOTHING is load-bearing:
+// dstOwnerID (the forking user) may already have their own override for this
+// river, and their own choice must always win — this never overwrites an
+// existing row, it only fills a gap. If srcOwnerID has no override for
+// riverID, the SELECT returns no rows and the INSERT is a natural no-op.
+// Best-effort like the rest of forkRunTx's copy steps: a fork must still
+// succeed even if this fails.
+func copyBasinOverride(ctx context.Context, q pgxQueryer, dstOwnerID, srcOwnerID, riverID string) {
+	_, _ = q.Exec(ctx, `
+		INSERT INTO user_river_basin_overrides (user_id, river_id, basin_key)
+		SELECT $1, river_id, basin_key
+		FROM user_river_basin_overrides
+		WHERE user_id = $2 AND river_id = $3::uuid
+		ON CONFLICT (user_id, river_id) DO NOTHING
+	`, dstOwnerID, srcOwnerID, riverID)
 }
 
 // copyRunFeatures clones every rapids + reach_access row from srcID's run onto
