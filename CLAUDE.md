@@ -64,5 +64,5 @@ APP_PORT=8080
 - Migrations: sequential numbered files (`000083_*.up.sql` / `*.down.sql`), never edit existing ones
 - Reach slugs are the canonical reach identifier across the codebase
 - Flow difficulty stored as floats (`3.5`), rendered as Roman numerals (`III+`)
-- Colorado rivers flow west→east, so `MIN(lng)` = most upstream, `MAX(lng)` = most downstream
+- Upstream→downstream ordering: use `user_reaches.put_in_elevation_ft` DESC (mig 000150; see `internal/handlers/run_elevation.go`) — direction-agnostic, unlike the retired `MIN(lng)`/`MAX(lng)` "Colorado rivers flow west→east" heuristic (web#386), which was wrong for north/south-flowing rivers. Longitude is now only a fallback for runs/gauges missing elevation.
 - Go param type inference: use `COALESCE($N::numeric, col)` not `CASE WHEN` for nullable params

@@ -199,43 +199,56 @@ func (h *UserReachHandler) authorOwnerID(r *http.Request) (ownerID string, asSpe
 // ── Types ────────────────────────────────────────────────────────────────────
 
 type userReachSummary struct {
-	ID              string     `json:"id"`
-	Slug            string     `json:"slug"`
-	Name            string     `json:"name"`
-	LongName        *string    `json:"long_name"`
-	RiverID         *string    `json:"river_id"`
-	RiverName       *string    `json:"river_name"`
-	StateAbbr       *string    `json:"state_abbr"`
-	BasinGroup      *string    `json:"basin_group"`
-	PutInLng        float64    `json:"put_in_lng"`
-	PutInLat        float64    `json:"put_in_lat"`
-	TakeOutLng      float64    `json:"take_out_lng"`
-	TakeOutLat      float64    `json:"take_out_lat"`
-	Note            *string    `json:"note"`
-	ClassMin        *float64   `json:"class_min"`
-	ClassMax        *float64   `json:"class_max"`
-	CurrentCFS      *float64   `json:"current_cfs"`
-	FlowBand        *string    `json:"flow_band"`
-	FlowStatus      string     `json:"flow_status"`
-	GaugeID         *string    `json:"gauge_id"`
-	GaugeExternalID *string    `json:"gauge_external_id"`
-	GaugeSource     *string    `json:"gauge_source"`
-	GaugeName       *string    `json:"gauge_name"`
-	GaugeLat        *float64   `json:"gauge_lat"`
-	GaugeLng        *float64   `json:"gauge_lng"`
-	CustomGaugeID   *string    `json:"custom_gauge_id"`
-	CustomGaugeSlug *string    `json:"custom_gauge_slug"`
-	CustomGaugeName *string    `json:"custom_gauge_name"`
-	LastReadAt      *time.Time `json:"last_reading_at"`
-	CreatedAt       time.Time  `json:"created_at"`
-	Visibility      string     `json:"visibility"`
-	IsPrivate       bool       `json:"is_private"` // backward compat; derived from Visibility
-	DeletedAt       *time.Time `json:"deleted_at"`
-	ForkCount       int        `json:"fork_count"`
-	IsFork          bool       `json:"is_fork"`
-	UpvoteCount     int        `json:"upvote_count"`
-	AuthorHandle    *string    `json:"author_handle"`
-	IsSpecial       bool       `json:"is_special"`
+	ID         string  `json:"id"`
+	Slug       string  `json:"slug"`
+	Name       string  `json:"name"`
+	LongName   *string `json:"long_name"`
+	RiverID    *string `json:"river_id"`
+	RiverName  *string `json:"river_name"`
+	StateAbbr  *string `json:"state_abbr"`
+	BasinGroup *string `json:"basin_group"`
+	PutInLng   float64 `json:"put_in_lng"`
+	PutInLat   float64 `json:"put_in_lat"`
+	TakeOutLng float64 `json:"take_out_lng"`
+	TakeOutLat float64 `json:"take_out_lat"`
+	// Elevation (mig 000150) — replaces put_in_lng as the dashboard's
+	// upstream→downstream sort basis (web#386 was a west=upstream heuristic,
+	// wrong for north/south rivers). Nullable: NULL until a successful USGS
+	// EPQS lookup; gradient additionally requires a centerline, so it's NULL
+	// more often than the elevations alone. See internal/handlers/run_elevation.go.
+	PutInElevationFt   *float64 `json:"put_in_elevation_ft"`
+	TakeOutElevationFt *float64 `json:"take_out_elevation_ft"`
+	GradientFpm        *float64 `json:"gradient_fpm"`
+	Note               *string  `json:"note"`
+	ClassMin           *float64 `json:"class_min"`
+	ClassMax           *float64 `json:"class_max"`
+	CurrentCFS         *float64 `json:"current_cfs"`
+	FlowBand           *string  `json:"flow_band"`
+	FlowStatus         string   `json:"flow_status"`
+	GaugeID            *string  `json:"gauge_id"`
+	GaugeExternalID    *string  `json:"gauge_external_id"`
+	GaugeSource        *string  `json:"gauge_source"`
+	GaugeName          *string  `json:"gauge_name"`
+	GaugeLat           *float64 `json:"gauge_lat"`
+	GaugeLng           *float64 `json:"gauge_lng"`
+	// Gauge's own elevation (gauges.elevation_ft, USGS alt_va) — the
+	// referenced-run fallback for PutInElevationFt, exactly parallel to how
+	// GaugeLng already backs up put_in_lng when is_reference is true (see
+	// web's userReachElevation()/userReachLng()).
+	GaugeElevationFt *float64   `json:"gauge_elevation_ft"`
+	CustomGaugeID    *string    `json:"custom_gauge_id"`
+	CustomGaugeSlug  *string    `json:"custom_gauge_slug"`
+	CustomGaugeName  *string    `json:"custom_gauge_name"`
+	LastReadAt       *time.Time `json:"last_reading_at"`
+	CreatedAt        time.Time  `json:"created_at"`
+	Visibility       string     `json:"visibility"`
+	IsPrivate        bool       `json:"is_private"` // backward compat; derived from Visibility
+	DeletedAt        *time.Time `json:"deleted_at"`
+	ForkCount        int        `json:"fork_count"`
+	IsFork           bool       `json:"is_fork"`
+	UpvoteCount      int        `json:"upvote_count"`
+	AuthorHandle     *string    `json:"author_handle"`
+	IsSpecial        bool       `json:"is_special"`
 }
 
 type userReachRapid struct {
@@ -679,6 +692,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			ST_Y(ur.put_in::geometry)    AS put_in_lat,
 			ST_X(ur.take_out::geometry)  AS take_out_lng,
 			ST_Y(ur.take_out::geometry)  AS take_out_lat,
+			ur.put_in_elevation_ft, ur.take_out_elevation_ft, ur.gradient_fpm,
 			ur.note, ur.created_at,
 			ur.class_min, ur.class_max,
 			COALESCE(lr.value, cg.last_value_cfs) AS current_cfs,
@@ -696,6 +710,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			g.name AS gauge_name,
 			ST_Y(g.location::geometry) AS gauge_lat,
 			ST_X(g.location::geometry) AS gauge_lng,
+			g.elevation_ft AS gauge_elevation_ft,
 			ur.custom_gauge_id::text AS custom_gauge_id,
 			cg.slug AS custom_gauge_slug,
 			cg.name AS custom_gauge_name,
@@ -745,12 +760,13 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			&s.ID, &s.Slug, &s.Name, &s.LongName, &s.RiverName,
 			&s.RiverID, &s.StateAbbr, &s.BasinGroup,
 			&s.PutInLng, &s.PutInLat, &s.TakeOutLng, &s.TakeOutLat,
+			&s.PutInElevationFt, &s.TakeOutElevationFt, &s.GradientFpm,
 			&s.Note, &s.CreatedAt,
 			&s.ClassMin, &s.ClassMax,
 			&s.CurrentCFS, &s.LastReadAt,
 			&s.FlowStatus, &s.FlowBand, &s.GaugeID,
 			&s.GaugeExternalID, &s.GaugeSource, &s.GaugeName,
-			&s.GaugeLat, &s.GaugeLng,
+			&s.GaugeLat, &s.GaugeLng, &s.GaugeElevationFt,
 			&s.CustomGaugeID, &s.CustomGaugeSlug, &s.CustomGaugeName,
 			&s.Visibility, &s.UpvoteCount, &s.AuthorHandle,
 		); err == nil {
@@ -800,6 +816,7 @@ func (h *UserReachHandler) ReferencedRuns(w http.ResponseWriter, r *http.Request
 			g.name AS gauge_name,
 			ST_Y(g.location::geometry) AS gauge_lat,
 			ST_X(g.location::geometry) AS gauge_lng,
+			g.elevation_ft AS gauge_elevation_ft,
 			ur.custom_gauge_id::text AS custom_gauge_id,
 			cg.slug AS custom_gauge_slug,
 			cg.name AS custom_gauge_name,
@@ -854,7 +871,7 @@ func (h *UserReachHandler) ReferencedRuns(w http.ResponseWriter, r *http.Request
 			&s.CurrentCFS, &s.LastReadAt,
 			&s.FlowStatus, &s.FlowBand, &s.GaugeID,
 			&s.GaugeExternalID, &s.GaugeSource, &s.GaugeName,
-			&s.GaugeLat, &s.GaugeLng,
+			&s.GaugeLat, &s.GaugeLng, &s.GaugeElevationFt,
 			&s.CustomGaugeID, &s.CustomGaugeSlug, &s.CustomGaugeName,
 			&s.AuthorHandle,
 		); err == nil {
@@ -887,6 +904,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 			ST_Y(ur.put_in::geometry)    AS put_in_lat,
 			ST_X(ur.take_out::geometry)  AS take_out_lng,
 			ST_Y(ur.take_out::geometry)  AS take_out_lat,
+			ur.put_in_elevation_ft, ur.take_out_elevation_ft, ur.gradient_fpm,
 			ur.note, ur.created_at,
 			ur.class_min, ur.class_max,
 			ur.up_comid, ur.down_comid,
@@ -954,6 +972,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 	`, ids, slug, callerID).Scan(
 		&d.ID, &d.RiverID, &d.Slug, &d.Name, &d.LongName, &d.RiverName,
 		&d.PutInLng, &d.PutInLat, &d.TakeOutLng, &d.TakeOutLat,
+		&d.PutInElevationFt, &d.TakeOutElevationFt, &d.GradientFpm,
 		&d.Note, &d.CreatedAt,
 		&d.ClassMin, &d.ClassMax,
 		&d.UpComID, &d.DownComID,
@@ -1100,6 +1119,7 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 			ST_Y(ur.put_in::geometry)    AS put_in_lat,
 			ST_X(ur.take_out::geometry)  AS take_out_lng,
 			ST_Y(ur.take_out::geometry)  AS take_out_lat,
+			ur.put_in_elevation_ft, ur.take_out_elevation_ft, ur.gradient_fpm,
 			ur.note, ur.created_at,
 			ur.class_min, ur.class_max,
 			ur.up_comid, ur.down_comid,
@@ -1168,6 +1188,7 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 	`, runID).Scan(
 		&d.ID, &d.Slug, &d.Name, &d.LongName, &d.RiverName,
 		&d.PutInLng, &d.PutInLat, &d.TakeOutLng, &d.TakeOutLat,
+		&d.PutInElevationFt, &d.TakeOutElevationFt, &d.GradientFpm,
 		&d.Note, &d.CreatedAt,
 		&d.ClassMin, &d.ClassMax,
 		&d.UpComID, &d.DownComID,
@@ -1417,6 +1438,16 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
+	// Kick off put-in/take-out elevation resolution now, in the background —
+	// joined just before the INSERT (elevDone below). Overlapping this with
+	// the state/river resolution calls below (each their own network round
+	// trip) means the up-to-elevationLookupTimeout USGS EPQS cost is usually
+	// fully hidden rather than adding to an already-sequential chain of
+	// external lookups. This is an INSERT, so unlike Update there is no
+	// stored value an EPQS failure could clobber — a nil result here just
+	// means the column starts NULL, same as any other unresolved field.
+	elevDone := startElevationLookup(ctx, body.PutIn.Lng, body.PutIn.Lat, body.TakeOut.Lng, body.TakeOut.Lat)
+
 	// Resolve this run's OWN state from its own put-in (#356) — independent
 	// of the river row's COALESCE-once state_abbr, which multiple runs on a
 	// multi-state river (e.g. Colorado River: AZ, UT, CO reaches) can't all
@@ -1456,10 +1487,15 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 	createVisibility := "public"
 	_ = asSpecial // retained; no longer affects visibility (all runs public already)
 
+	// Join the background elevation lookup started above — a no-op wait in
+	// the common case, since state/river resolution above already took at
+	// least as long as the up-to-elevationLookupTimeout EPQS round trip.
+	putFt, takeFt := elevDone()
+
 	var reachID string
 	err := h.db.QueryRow(ctx, `
 		INSERT INTO user_reaches
-			(owner_id, slug, name, long_name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, class_min, class_max, visibility, published_at, river_confirmed, state_abbr)
+			(owner_id, slug, name, long_name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, class_min, class_max, visibility, published_at, river_confirmed, state_abbr, put_in_elevation_ft, take_out_elevation_ft)
 		VALUES
 			($1, $2, $3, $4, $5, $6,
 			 ST_SetSRID(ST_MakePoint($7, $8), 4326)::geography,
@@ -1467,7 +1503,7 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 			 NULLIF($11,''), NULLIF($12,''), $13, $14, $15,
 			 $16::run_visibility,
 			 CASE WHEN $16 = 'public' THEN NOW() ELSE NULL END,
-			 $17, NULLIF($18,''))
+			 $17, NULLIF($18,''), $19, $20)
 		RETURNING id
 	`, ownerID, slug, body.Name, body.LongName, riverID, finalRiverName,
 		body.PutIn.Lng, body.PutIn.Lat,
@@ -1475,6 +1511,7 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 		body.UpComID, body.DownComID, body.Note,
 		body.ClassMin, body.ClassMax, createVisibility,
 		riverID != nil, stateAbbr,
+		putFt, takeFt,
 	).Scan(&reachID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("create failed: %v", err))
@@ -1549,6 +1586,12 @@ func (h *UserReachHandler) Import(w http.ResponseWriter, r *http.Request) { //no
 
 	ctx := r.Context()
 
+	// Kick off put-in/take-out elevation resolution now, joined just before
+	// the INSERT (elevDone below) — see Create's identical use of
+	// startElevationLookup for why this overlaps with, rather than adds to,
+	// the state/river resolution calls below.
+	elevDone := startElevationLookup(ctx, body.PutIn.Lng, body.PutIn.Lat, body.TakeOut.Lng, body.TakeOut.Lat)
+
 	// Resolve this run's OWN state from its own put-in (#356) — see Create,
 	// including why this runs before the river block and why ok is ignored.
 	stateAbbr, _ := runStateFromCoords(ctx, body.PutIn.Lat, body.PutIn.Lng)
@@ -1575,21 +1618,25 @@ func (h *UserReachHandler) Import(w http.ResponseWriter, r *http.Request) { //no
 		slug = fmt.Sprintf("%s-%d", baseSlug, i)
 	}
 
+	// Join the background elevation lookup started above (see Create).
+	putFt, takeFt := elevDone()
+
 	var reachID string
 	err := h.db.QueryRow(ctx, `
 		INSERT INTO user_reaches
-			(owner_id, slug, name, long_name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, river_confirmed, state_abbr)
+			(owner_id, slug, name, long_name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, river_confirmed, state_abbr, put_in_elevation_ft, take_out_elevation_ft)
 		VALUES
 			($1, $2, $3, $4, $5, $6,
 			 ST_SetSRID(ST_MakePoint($7, $8), 4326)::geography,
 			 ST_SetSRID(ST_MakePoint($9, $10), 4326)::geography,
-			 NULLIF($11,''), NULLIF($12,''), $13, $14, NULLIF($15,''))
+			 NULLIF($11,''), NULLIF($12,''), $13, $14, NULLIF($15,''), $16, $17)
 		RETURNING id
 	`, ownerID, slug, body.Name, body.LongName, riverID, finalRiverName,
 		body.PutIn.Lng, body.PutIn.Lat,
 		body.TakeOut.Lng, body.TakeOut.Lat,
 		body.UpComID, body.DownComID, body.Note,
 		riverID != nil, stateAbbr,
+		putFt, takeFt,
 	).Scan(&reachID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("import failed: %v", err))
@@ -1876,8 +1923,45 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 	// endpoints (see MapAll/MapCommunity), which is a strictly safer failure
 	// mode. This NLDI round trip is bounded by buildUploadCenterline's own
 	// 30s context timeout and is fail-soft — it never aborts the request.
+	// Elevation + gradient (mig 000150) join this same block — see the
+	// comment above for why geometry recomputation lives in ONE place, and
+	// note put_in_elevation_ft/take_out_elevation_ft/gradient_fpm all follow
+	// the CASE-WHEN-ok-flag pattern documented just above for state_abbr.
 	if body.PutIn != nil && body.TakeOut != nil && body.UpComID != nil && body.DownComID != nil {
+		// Kicked off BEFORE buildUploadCenterline so the up-to-
+		// elevationLookupTimeout USGS EPQS round trip (startElevationLookup)
+		// runs ALONGSIDE buildUploadCenterline's own up-to-30s NLDI fetch
+		// instead of stacking after it — this block's worst-case added
+		// latency is therefore ~0, not up to 8s more.
+		elevDone := startElevationLookup(ctx, body.PutIn.Lng, body.PutIn.Lat, body.TakeOut.Lng, body.TakeOut.Lat)
 		cl, upC, downC, clOK := h.buildUploadCenterline(ctx, *body.UpComID, *body.DownComID, *body.PutIn, *body.TakeOut)
+		putFt, takeFt := elevDone()
+
+		// put_in_elevation_ft/take_out_elevation_ft are gated on putOK/takeOK
+		// (whether EPQS returned a real value for THIS request) — never on
+		// the value itself — so a failed lookup leaves a previously-good
+		// elevation in place instead of blanking it, the same
+		// never-clobber-on-transient-failure rule state_abbr uses. Unlike
+		// state_abbr, there is no legitimate "successful but empty" EPQS
+		// result to distinguish from a failure (every US coordinate has a
+		// real elevation), so a nil pointer here always means "lookup
+		// failed" and putFt/takeFt != nil is exactly the right ok flag.
+		//
+		// gradient_fpm follows the same never-clobber philosophy for
+		// consistency: it's only recomputed when THIS request resolves both
+		// elevations and a centerline fresh (miles from the SAME geometry
+		// just built above, not a re-read of the stored row); otherwise the
+		// last known good gradient is kept as-is rather than cleared. That
+		// can leave gradient_fpm describing the pre-move endpoints for one
+		// request if EPQS has a transient failure exactly when put_in/
+		// take_out change — cmd/backfill-run-elevation is the re-runnable
+		// catch-up for exactly this kind of gap.
+		var gradFt float64
+		var gradOK bool
+		if clOK {
+			miles, milesOK := centerlineMiles(ctx, h.db, cl)
+			gradFt, gradOK = gradientFPM(putFt, takeFt, miles, milesOK)
+		}
 
 		_, _ = h.db.Exec(ctx, `
 			UPDATE user_reaches
@@ -1888,12 +1972,18 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 				down_comid = NULLIF($8, ''),
 				state_abbr = CASE WHEN $9 THEN NULLIF($10, '') ELSE state_abbr END,
 				centerline = CASE WHEN $11 THEN ST_GeomFromGeoJSON($12)::geography ELSE NULL END,
+				put_in_elevation_ft   = CASE WHEN $13 THEN $14::numeric ELSE put_in_elevation_ft END,
+				take_out_elevation_ft = CASE WHEN $15 THEN $16::numeric ELSE take_out_elevation_ft END,
+				gradient_fpm           = CASE WHEN $17 THEN $18::numeric ELSE gradient_fpm END,
 				updated_at = NOW()
 			WHERE owner_id = $1 AND slug = $2
 		`, ownerID, slug,
 			body.PutIn.Lng, body.PutIn.Lat,
 			body.TakeOut.Lng, body.TakeOut.Lat,
-			upC, downC, stateOK, newStateAbbr, clOK, cl)
+			upC, downC, stateOK, newStateAbbr, clOK, cl,
+			putFt != nil, putFt,
+			takeFt != nil, takeFt,
+			gradOK, gradFt)
 	}
 
 	// Recompute completeness after any field change. (V18)
@@ -2624,21 +2714,24 @@ type pgxQueryer interface {
 // routes), and the watchlist auto-fork path (watchlist.go).
 func forkRunTx(ctx context.Context, q pgxQueryer, ownerID, srcRunID string) (newID, newSlug string, err error) {
 	type srcRow struct {
-		ID           string
-		Name         string
-		OwnerID      string
-		AuthorHandle *string
-		RiverID      *string
-		RiverName    *string
-		Note         *string
-		ClassMin     *float64
-		ClassMax     *float64
-		GaugeID      *string
-		PutInLng     float64
-		PutInLat     float64
-		TakeOutLng   float64
-		TakeOutLat   float64
-		Centerline   []byte
+		ID                 string
+		Name               string
+		OwnerID            string
+		AuthorHandle       *string
+		RiverID            *string
+		RiverName          *string
+		Note               *string
+		ClassMin           *float64
+		ClassMax           *float64
+		GaugeID            *string
+		PutInLng           float64
+		PutInLat           float64
+		TakeOutLng         float64
+		TakeOutLat         float64
+		Centerline         []byte
+		PutInElevationFt   *float64
+		TakeOutElevationFt *float64
+		GradientFpm        *float64
 	}
 	var src srcRow
 	err = q.QueryRow(ctx, `
@@ -2650,7 +2743,8 @@ func forkRunTx(ctx context.Context, q pgxQueryer, ownerID, srcRunID string) (new
 			ur.primary_gauge_id::text,
 			ST_X(ur.put_in::geometry),  ST_Y(ur.put_in::geometry),
 			ST_X(ur.take_out::geometry), ST_Y(ur.take_out::geometry),
-			ST_AsGeoJSON(ur.centerline::geometry)
+			ST_AsGeoJSON(ur.centerline::geometry),
+			ur.put_in_elevation_ft, ur.take_out_elevation_ft, ur.gradient_fpm
 		FROM user_reaches ur
 		LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
 		WHERE ur.id = $1 AND ur.deleted_at IS NULL
@@ -2663,6 +2757,7 @@ func forkRunTx(ctx context.Context, q pgxQueryer, ownerID, srcRunID string) (new
 		&src.PutInLng, &src.PutInLat,
 		&src.TakeOutLng, &src.TakeOutLat,
 		&src.Centerline,
+		&src.PutInElevationFt, &src.TakeOutElevationFt, &src.GradientFpm,
 	)
 	if err != nil {
 		return "", "", fmt.Errorf("run not found: %w", err)
@@ -2680,6 +2775,12 @@ func forkRunTx(ctx context.Context, q pgxQueryer, ownerID, srcRunID string) (new
 		newSlug = fmt.Sprintf("%s-%d", baseSlug, i)
 	}
 
+	// put_in/take_out are copied VERBATIM from src below (fork never moves
+	// them), so put_in_elevation_ft/take_out_elevation_ft/gradient_fpm are
+	// copied the same way — same coordinates and centerline mean the same
+	// derived values, with no new EPQS/PostGIS round trip needed (unlike
+	// every other create path in this file, none of which start from an
+	// already-resolved source row).
 	if err = q.QueryRow(ctx, `
 		INSERT INTO user_reaches
 			(owner_id, slug, name, river_id, river_name, note,
@@ -2687,7 +2788,8 @@ func forkRunTx(ctx context.Context, q pgxQueryer, ownerID, srcRunID string) (new
 			 class_min, class_max, primary_gauge_id,
 			 forked_from_user_reach_id,
 			 original_author_handle, original_author_owner_id, original_forked_at,
-			 river_confirmed, visibility, published_at)
+			 river_confirmed, visibility, published_at,
+			 put_in_elevation_ft, take_out_elevation_ft, gradient_fpm)
 		VALUES
 			($1, $2, $3, $4::uuid, $5, $17,
 			 ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography,
@@ -2695,7 +2797,8 @@ func forkRunTx(ctx context.Context, q pgxQueryer, ownerID, srcRunID string) (new
 			 $10, $11, $12::uuid,
 			 $13::uuid,
 			 $14, $15::uuid, NOW(),
-			 $16, 'public'::run_visibility, NOW())
+			 $16, 'public'::run_visibility, NOW(),
+			 $18, $19, $20)
 		RETURNING id
 	`, ownerID, newSlug, src.Name, src.RiverID, src.RiverName,
 		src.PutInLng, src.PutInLat,
@@ -2705,6 +2808,7 @@ func forkRunTx(ctx context.Context, q pgxQueryer, ownerID, srcRunID string) (new
 		src.AuthorHandle, src.OwnerID,
 		src.RiverID != nil,
 		src.Note,
+		src.PutInElevationFt, src.TakeOutElevationFt, src.GradientFpm,
 	).Scan(&newID); err != nil {
 		return "", "", fmt.Errorf("fork insert failed: %w", err)
 	}

@@ -235,6 +235,14 @@ func (h *UserReachHandler) createOneUploadRun(ctx context.Context, ownerID, name
 		return "", "", "", verr
 	}
 
+	// Kick off put-in/take-out elevation resolution now, joined below (after
+	// buildUploadCenterline) — see Create's identical use of
+	// startElevationLookup for why this overlaps with, rather than adds to,
+	// the state/river resolution and centerline fetch that follow. This is
+	// an INSERT, nothing to clobber, so unlike Update the raw fetch result
+	// is used as-is (no ok-flag CASE needed).
+	elevDone := startElevationLookup(ctx, in.PutIn.Lng, in.PutIn.Lat, in.TakeOut.Lng, in.TakeOut.Lat)
+
 	// This run's OWN state from its own put-in (#356), resolved once and
 	// shared with resolveOrCreateRiver below so one coordinate costs one
 	// TIGERweb lookup. Bulk-uploaded runs need this as much as in-app ones:
@@ -263,6 +271,21 @@ func (h *UserReachHandler) createOneUploadRun(ctx context.Context, ownerID, name
 		finalUpComID, finalDownComID = upC, downC
 	}
 
+	// Join the background elevation lookup — overlapped with state/river
+	// resolution and the centerline fetch above, so it costs ~0 additional
+	// wall-clock time in the common case. Gradient needs both elevations AND
+	// the centerline just resolved above (river_miles = ST_Length of that
+	// SAME geometry) — see gradientFPM's divide-by-zero guard.
+	putFt, takeFt := elevDone()
+	var gradFtPtr *float64
+	if clOK {
+		if miles, milesOK := centerlineMiles(ctx, h.db, clGeoJSON); milesOK {
+			if gradFt, gradOK := gradientFPM(putFt, takeFt, miles, milesOK); gradOK {
+				gradFtPtr = &gradFt
+			}
+		}
+	}
+
 	// Generate a unique slug for this owner.
 	baseSlug := kmlimport.Slugify(name)
 	slug = baseSlug
@@ -283,19 +306,20 @@ func (h *UserReachHandler) createOneUploadRun(ctx context.Context, ownerID, name
 
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO user_reaches
-			(owner_id, slug, name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, class_min, class_max, state_abbr, visibility, published_at, river_confirmed)
+			(owner_id, slug, name, river_id, river_name, put_in, take_out, up_comid, down_comid, note, class_min, class_max, state_abbr, visibility, published_at, river_confirmed, put_in_elevation_ft, take_out_elevation_ft, gradient_fpm)
 		VALUES
 			($1, $2, $3, $4, $5,
 			 ST_SetSRID(ST_MakePoint($6, $7), 4326)::geography,
 			 ST_SetSRID(ST_MakePoint($8, $9), 4326)::geography,
 			 NULLIF($10,''), NULLIF($11,''), $12, $13, $14, NULLIF($15,''),
-			 'public', NOW(), false)
+			 'public', NOW(), false, $16, $17, $18)
 		RETURNING id
 	`, ownerID, slug, name, riverID, finalRiverName,
 		in.PutIn.Lng, in.PutIn.Lat,
 		in.TakeOut.Lng, in.TakeOut.Lat,
 		finalUpComID, finalDownComID, in.Note,
 		in.ClassMin, in.ClassMax, stateAbbr,
+		putFt, takeFt, gradFtPtr,
 	).Scan(&id); err != nil {
 		return "", "", "", fmt.Errorf("create failed: %w", err)
 	}
@@ -572,6 +596,19 @@ func (h *UserReachHandler) UploadUpdate(w http.ResponseWriter, r *http.Request) 
 			downHint = *body.DownComID
 		}
 
+		// Elevation (mig 000150), like the centerline fetch just below, is
+		// always re-resolved for BOTH endpoints whenever either one changes —
+		// this block already rebuilds the centerline fully rather than
+		// patching it incrementally (buildUploadCenterline gets newPut AND
+		// newTake even on a take-out-only edit), so re-querying both
+		// elevations matches that same "derive fresh from the current pair"
+		// approach rather than adding a second code path for "only one side
+		// moved". Kicked off BEFORE buildUploadCenterline so the up-to-
+		// elevationLookupTimeout EPQS round trip runs ALONGSIDE
+		// buildUploadCenterline's own up-to-30s NLDI fetch instead of
+		// stacking after it (see startElevationLookup / Create).
+		elevDone := startElevationLookup(ctx, newPut.Lng, newPut.Lat, newTake.Lng, newTake.Lat)
+
 		cl, upC, downC, clOK := h.buildUploadCenterline(ctx, upHint, downHint, newPut, newTake)
 
 		// A moved put-in can change the run's state (#356). Only looked up
@@ -585,18 +622,38 @@ func (h *UserReachHandler) UploadUpdate(w http.ResponseWriter, r *http.Request) 
 			newStateAbbr, stateOK = runStateFromCoords(ctx, newPut.Lat, newPut.Lng)
 		}
 
+		// Join the background elevation lookup. put_in_elevation_ft/
+		// take_out_elevation_ft/gradient_fpm all follow the SAME
+		// never-clobber-on-transient-failure rule as state_abbr above — see
+		// the in-app Update handler (user_reaches.go) for the full rationale,
+		// including why gradient_fpm is only refreshed when this SAME
+		// request resolves both elevations and a centerline together.
+		putFt, takeFt := elevDone()
+		var gradFt float64
+		var gradOK bool
+		if clOK {
+			miles, milesOK := centerlineMiles(ctx, h.db, cl)
+			gradFt, gradOK = gradientFPM(putFt, takeFt, miles, milesOK)
+		}
+
 		_, _ = h.db.Exec(ctx, `
 			UPDATE user_reaches
 			SET
-				put_in          = ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography,
-				take_out        = ST_SetSRID(ST_MakePoint($5, $6), 4326)::geography,
-				up_comid        = NULLIF($7, ''),
-				down_comid      = NULLIF($8, ''),
-				state_abbr      = CASE WHEN $9 THEN NULLIF($10, '') ELSE state_abbr END,
-				river_confirmed = false,
-				updated_at      = NOW()
+				put_in                 = ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography,
+				take_out               = ST_SetSRID(ST_MakePoint($5, $6), 4326)::geography,
+				up_comid               = NULLIF($7, ''),
+				down_comid             = NULLIF($8, ''),
+				state_abbr             = CASE WHEN $9 THEN NULLIF($10, '') ELSE state_abbr END,
+				river_confirmed        = false,
+				put_in_elevation_ft    = CASE WHEN $11 THEN $12::numeric ELSE put_in_elevation_ft END,
+				take_out_elevation_ft  = CASE WHEN $13 THEN $14::numeric ELSE take_out_elevation_ft END,
+				gradient_fpm           = CASE WHEN $15 THEN $16::numeric ELSE gradient_fpm END,
+				updated_at             = NOW()
 			WHERE owner_id = $1 AND slug = $2
-		`, ownerID, slug, newPut.Lng, newPut.Lat, newTake.Lng, newTake.Lat, upC, downC, stateOK, newStateAbbr)
+		`, ownerID, slug, newPut.Lng, newPut.Lat, newTake.Lng, newTake.Lat, upC, downC, stateOK, newStateAbbr,
+			putFt != nil, putFt,
+			takeFt != nil, takeFt,
+			gradOK, gradFt)
 
 		if clOK {
 			_, _ = h.db.Exec(ctx,
