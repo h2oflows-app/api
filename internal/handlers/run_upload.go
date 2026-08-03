@@ -536,7 +536,22 @@ func (h *UserReachHandler) UploadUpdate(w http.ResponseWriter, r *http.Request) 
 		errorResponse(w, http.StatusNotFound, "run not found")
 		return
 	}
+	// Cascade the rename to any watchlist rows still pointing at the old
+	// slug — same #395 fix as the JWT Update handler (user_reaches.go);
+	// this API-key upload path renames a run's slug too and was an
+	// identical, separate hole. Scoped to rows with no gauge_id, or a
+	// gauge_id matching this run's own primary_gauge_id, so a coincidental
+	// slug collision on an unrelated reach owned by a different user
+	// (slugs are only unique per-owner) is never repointed.
 	if newSlug != nil {
+		_, _ = h.db.Exec(ctx, `
+			UPDATE user_watchlists uw
+			SET    reach_slug = $1
+			FROM   user_reaches ur
+			WHERE  ur.owner_id = $2 AND ur.slug = $1 AND ur.deleted_at IS NULL
+			  AND  uw.reach_slug = $3
+			  AND  (uw.gauge_id IS NULL OR uw.gauge_id = ur.primary_gauge_id)
+		`, *newSlug, ownerID, slug)
 		slug = *newSlug
 	}
 
