@@ -161,12 +161,12 @@ func (h *WatchlistHandler) Add(w http.ResponseWriter, r *http.Request) {
 
 		var ownedID string
 		ownErr := tx.QueryRow(r.Context(),
-			`SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2`,
+			`SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2 AND deleted_at IS NULL`,
 			userID, *body.ReachSlug,
 		).Scan(&ownedID)
 		if ownErr != nil {
-			// Not owned by caller — check if a special-user (curated) reach exists;
-			// if yes, fork.
+			// Not owned by caller (or the caller's own copy was deleted) —
+			// check if a special-user (curated) reach exists; if yes, fork.
 			var curatedID string
 			cErr := tx.QueryRow(r.Context(),
 				`SELECT id FROM user_reaches
@@ -193,9 +193,36 @@ func (h *WatchlistHandler) Add(w http.ResponseWriter, r *http.Request) {
 					}
 					finalReachSlug = &newSlug
 				}
+			} else {
+				// Slug is neither owned by the caller nor a curated reach.
+				// #395 root cause: reach_slug has no FK to user_reaches, so
+				// this branch used to trust body.ReachSlug verbatim — any
+				// stale/renamed/garbage client-supplied slug was written
+				// straight into user_watchlists and orphaned on arrival.
+				// Validate it resolves to SOME live reach (e.g. another
+				// user's public run, referenced by slug without forking —
+				// the one case this branch is legitimately for) before
+				// trusting it; otherwise drop the dead context to NULL
+				// rather than storing a value already known to be wrong.
+				var anyLiveID string
+				liveErr := tx.QueryRow(r.Context(),
+					`SELECT id FROM user_reaches WHERE slug = $1 AND deleted_at IS NULL LIMIT 1`,
+					*body.ReachSlug,
+				).Scan(&anyLiveID)
+				if liveErr != nil {
+					finalReachSlug = nil
+				}
 			}
-			// else: slug is for another user's user_reaches — leave as-is; insert will
-			// either fail FK or pin a reference. (No cross-user fork via watchlist yet.)
+		}
+
+		// The only field that named a target was an unresolvable reach_slug
+		// — surface that plainly instead of letting the INSERT below fail
+		// opaquely against the user_watchlists_gauge_xor CHECK constraint
+		// (gauge_id, custom_gauge_id, reach_slug, referenced_user_reach_id
+		// can't all be NULL).
+		if finalReachSlug == nil && body.GaugeID == nil && body.CustomGaugeID == nil {
+			errorResponse(w, http.StatusNotFound, "reach_slug does not resolve to any reach")
+			return
 		}
 
 		var insertErr error

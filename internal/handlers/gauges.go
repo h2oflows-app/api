@@ -740,7 +740,14 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 		JOIN gauges g ON g.id = ctx.gauge_id
 		LEFT JOIN LATERAL (
 			-- Resolve the context reach: curated reaches first, user reaches as fallback.
-			-- Use the requested slug if provided; else first alphabetical match per table.
+			-- Use the requested slug if it still names a live reach on this gauge;
+			-- else first alphabetical match per table. (#395: a stored reach_slug
+			-- can go stale — renamed, or a leftover from before runs-unify — so
+			-- this never trusts ctx.reach_slug blindly; it's validated against
+			-- THIS gauge's live reaches first, same as the no-slug-given case
+			-- already did. A gauge shared by several reaches still degrades to a
+			-- single best guess rather than no context at all — the same
+			-- trade-off the existing no-slug fallback already makes.)
 			SELECT common_name, full_name, river_name, basin_group, center_lng,
 			       state_abbr, river_order, author_handle, river_id
 			-- runs-unify 5c: context reach resolved from user_reaches (curated
@@ -763,8 +770,8 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 				WHERE ur.primary_gauge_id = g.id
 				  AND ur.deleted_at IS NULL
 				  AND ur.slug = COALESCE(
-				      ctx.reach_slug,
-				      (SELECT slug FROM user_reaches WHERE primary_gauge_id = g.id ORDER BY slug LIMIT 1)
+				      (SELECT slug FROM user_reaches WHERE primary_gauge_id = g.id AND deleted_at IS NULL AND slug = ctx.reach_slug),
+				      (SELECT slug FROM user_reaches WHERE primary_gauge_id = g.id AND deleted_at IS NULL ORDER BY slug LIMIT 1)
 				  )
 			) _cr
 			ORDER BY _prio ASC
@@ -783,7 +790,7 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 				SELECT id, base_label, base_color FROM user_reaches
 				WHERE primary_gauge_id = g.id AND owner_id = '00000000-0000-0000-0000-000000000001' AND deleted_at IS NULL
 				  AND slug = COALESCE(
-				      ctx.reach_slug,
+				      (SELECT slug FROM user_reaches WHERE primary_gauge_id = g.id AND owner_id = '00000000-0000-0000-0000-000000000001' AND deleted_at IS NULL AND slug = ctx.reach_slug),
 				      (SELECT slug FROM user_reaches WHERE primary_gauge_id = g.id AND owner_id = '00000000-0000-0000-0000-000000000001' AND deleted_at IS NULL ORDER BY slug LIMIT 1)
 				  )
 				LIMIT 1
