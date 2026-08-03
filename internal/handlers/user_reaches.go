@@ -2302,6 +2302,12 @@ func (h *UserReachHandler) SetRapids(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
+	// rapids.name is NOT NULL in the DB (unlike reach_access.name, which is
+	// nullable) — so unlike access points, a rapid can never be persisted
+	// nameless. Reject it clearly here rather than let it fall through to a
+	// raw not-null-constraint 500 at INSERT. Well-behaved callers (the run
+	// wizard) never actually hit this: an unnamed rapid gets a
+	// disambiguated type-label default client-side before it's sent (#398).
 	for i := range body.Rapids {
 		body.Rapids[i].Name = strings.TrimSpace(body.Rapids[i].Name)
 		if body.Rapids[i].Name == "" {
@@ -2342,7 +2348,8 @@ func (h *UserReachHandler) SetRapids(w http.ResponseWriter, r *http.Request) {
 		}
 		if insertErr != nil {
 			if isUniqueViolation(insertErr) {
-				errorResponse(w, http.StatusConflict, fmt.Sprintf("duplicate rapid name: %q", rp.Name))
+				errorResponse(w, http.StatusConflict, fmt.Sprintf(
+					"another rapid on this run is already named %q — give this one a different name", rp.Name))
 			} else {
 				errorResponse(w, http.StatusInternalServerError, "insert failed: "+insertErr.Error())
 			}
@@ -2449,7 +2456,8 @@ func (h *UserReachHandler) SetAccessPoints(w http.ResponseWriter, r *http.Reques
 				if ap.Name != nil {
 					name = *ap.Name
 				}
-				errorResponse(w, http.StatusConflict, fmt.Sprintf("duplicate access point: %s %q", ap.AccessType, name))
+				errorResponse(w, http.StatusConflict, fmt.Sprintf(
+					"another %s on this run is already named %q — give this one a different name", ap.AccessType, name))
 			} else {
 				errorResponse(w, http.StatusInternalServerError, "insert failed: "+insertErr.Error())
 			}
