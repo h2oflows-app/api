@@ -261,6 +261,14 @@ type userReachRapid struct {
 	HazardType        *string  `json:"hazard_type"`
 	Lng               *float64 `json:"lng"`
 	Lat               *float64 `json:"lat"`
+	// LinePosition (#388): fractional 0-1 position along the run's centerline
+	// (ST_LineLocatePoint), ASC = upstream->downstream. Nil when the run has
+	// no centerline or this feature has no coords -- the row still sorts
+	// (NULLS LAST server-side) but callers that want to interleave rapids
+	// and access points into one ordered list (e.g. meetupSpot.ts) can't
+	// merge by absence, so treat a nil here as "unknown position, append
+	// last" rather than assuming 0.
+	LinePosition *float64 `json:"line_position,omitempty"`
 }
 
 type userReachAccessPoint struct {
@@ -270,6 +278,8 @@ type userReachAccessPoint struct {
 	Notes      *string  `json:"notes"`
 	Lng        *float64 `json:"lng"`
 	Lat        *float64 `json:"lat"`
+	// LinePosition (#388): see userReachRapid.LinePosition.
+	LinePosition *float64 `json:"line_position,omitempty"`
 }
 
 type userReachDetail struct {
@@ -1022,14 +1032,24 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Rapids
+	// Ordered upstream->downstream by fractional position along the run's own
+	// centerline (issue #388) rather than name: ST_LineLocatePoint is exact
+	// (the point is known to lie on this line) and free, unlike the
+	// dashboard's cross-river elevation/lng heuristics which exist only
+	// because runs there share no common geometry. centerline is nullable
+	// (in-app re-trim can NULL it on failure) and location itself is
+	// nullable (feature added without coords) -- NULLS LAST plus the
+	// original `name` ordering as secondary key keeps behaviour
+	// deterministic instead of random in either case.
 	d.Rapids = make([]userReachRapid, 0)
 	rapRows, _ := h.db.Query(r.Context(), `
 		SELECT id, name, description, class_rating,
 		       is_surf_wave, is_permanent_hazard, hazard_type,
-		       ST_X(location::geometry), ST_Y(location::geometry)
+		       ST_X(location::geometry), ST_Y(location::geometry),
+		       ST_LineLocatePoint((SELECT centerline FROM user_reaches WHERE id = $1)::geometry, location::geometry) AS line_position
 		FROM rapids
 		WHERE user_reach_id = $1
-		ORDER BY name
+		ORDER BY line_position ASC NULLS LAST, name
 	`, d.ID)
 	if rapRows != nil {
 		defer rapRows.Close()
@@ -1037,27 +1057,33 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 			var rr userReachRapid
 			if rapRows.Scan(&rr.ID, &rr.Name, &rr.Description, &rr.ClassRating,
 				&rr.IsSurfWave, &rr.IsPermanentHazard, &rr.HazardType,
-				&rr.Lng, &rr.Lat) == nil {
+				&rr.Lng, &rr.Lat, &rr.LinePosition) == nil {
 				d.Rapids = append(d.Rapids, rr)
 			}
 		}
 	}
 
-	// Access points
+	// Access points — same upstream->downstream position ordering (#388),
+	// access_type/name kept as the secondary tiebreak. LinePosition
+	// (line_position) is exposed alongside so the web can interleave rapids
+	// and access points into a single ordered list (e.g. the "meet up at"
+	// combobox, meetupSpot.ts) without guessing at a merge order across the
+	// two separately-fetched arrays.
 	d.AccessPoints = make([]userReachAccessPoint, 0)
 	apRows, _ := h.db.Query(r.Context(), `
 		SELECT id, access_type, name, notes,
-		       ST_X(location::geometry), ST_Y(location::geometry)
+		       ST_X(location::geometry), ST_Y(location::geometry),
+		       ST_LineLocatePoint((SELECT centerline FROM user_reaches WHERE id = $1)::geometry, location::geometry) AS line_position
 		FROM reach_access
 		WHERE user_reach_id = $1
-		ORDER BY access_type, name
+		ORDER BY line_position ASC NULLS LAST, access_type, name
 	`, d.ID)
 	if apRows != nil {
 		defer apRows.Close()
 		for apRows.Next() {
 			var ap userReachAccessPoint
 			if apRows.Scan(&ap.ID, &ap.AccessType, &ap.Name, &ap.Notes,
-				&ap.Lng, &ap.Lat) == nil {
+				&ap.Lng, &ap.Lat, &ap.LinePosition) == nil {
 				d.AccessPoints = append(d.AccessPoints, ap)
 			}
 		}
@@ -1246,13 +1272,17 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 		}
 	}
 
-	// Rapids
+	// Rapids — upstream->downstream by centerline position (#388); see Get's
+	// identical block above for the full rationale/NULL-handling comment.
+	// LinePosition exposed for client-side interleaving (meetupSpot.ts etc).
 	d.Rapids = make([]userReachRapid, 0)
 	rapRows, _ := h.db.Query(r.Context(), `
 		SELECT id, name, description, class_rating,
 		       is_surf_wave, is_permanent_hazard, hazard_type,
-		       ST_X(location::geometry), ST_Y(location::geometry)
-		FROM rapids WHERE user_reach_id = $1 ORDER BY name
+		       ST_X(location::geometry), ST_Y(location::geometry),
+		       ST_LineLocatePoint((SELECT centerline FROM user_reaches WHERE id = $1)::geometry, location::geometry) AS line_position
+		FROM rapids WHERE user_reach_id = $1
+		ORDER BY line_position ASC NULLS LAST, name
 	`, d.ID)
 	if rapRows != nil {
 		defer rapRows.Close()
@@ -1260,25 +1290,27 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 			var rr userReachRapid
 			if rapRows.Scan(&rr.ID, &rr.Name, &rr.Description, &rr.ClassRating,
 				&rr.IsSurfWave, &rr.IsPermanentHazard, &rr.HazardType,
-				&rr.Lng, &rr.Lat) == nil {
+				&rr.Lng, &rr.Lat, &rr.LinePosition) == nil {
 				d.Rapids = append(d.Rapids, rr)
 			}
 		}
 	}
 
-	// Access points
+	// Access points — same upstream->downstream position ordering (#388).
 	d.AccessPoints = make([]userReachAccessPoint, 0)
 	apRows, _ := h.db.Query(r.Context(), `
 		SELECT id, access_type, name, notes,
-		       ST_X(location::geometry), ST_Y(location::geometry)
-		FROM reach_access WHERE user_reach_id = $1 ORDER BY access_type, name
+		       ST_X(location::geometry), ST_Y(location::geometry),
+		       ST_LineLocatePoint((SELECT centerline FROM user_reaches WHERE id = $1)::geometry, location::geometry) AS line_position
+		FROM reach_access WHERE user_reach_id = $1
+		ORDER BY line_position ASC NULLS LAST, access_type, name
 	`, d.ID)
 	if apRows != nil {
 		defer apRows.Close()
 		for apRows.Next() {
 			var ap userReachAccessPoint
 			if apRows.Scan(&ap.ID, &ap.AccessType, &ap.Name, &ap.Notes,
-				&ap.Lng, &ap.Lat) == nil {
+				&ap.Lng, &ap.Lat, &ap.LinePosition) == nil {
 				d.AccessPoints = append(d.AccessPoints, ap)
 			}
 		}
@@ -1351,9 +1383,13 @@ func (h *UserReachHandler) ListFeatures(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
+	// Upstream->downstream by centerline position (#388), same rationale as
+	// Get/getPublicByID's rapids/access_points blocks.
 	rapids := make([]userReachFeatureOption, 0)
-	rapRows, _ := h.db.Query(ctx,
-		`SELECT id, name FROM rapids WHERE user_reach_id = $1::uuid ORDER BY name`, runID)
+	rapRows, _ := h.db.Query(ctx, `
+		SELECT id, name FROM rapids WHERE user_reach_id = $1::uuid
+		ORDER BY ST_LineLocatePoint((SELECT centerline FROM user_reaches WHERE id = $1::uuid)::geometry, location::geometry) ASC NULLS LAST, name
+	`, runID)
 	if rapRows != nil {
 		defer rapRows.Close()
 		for rapRows.Next() {
@@ -1369,7 +1405,7 @@ func (h *UserReachHandler) ListFeatures(w http.ResponseWriter, r *http.Request) 
 		SELECT id, COALESCE(name, ''), access_type FROM reach_access
 		WHERE user_reach_id = $1::uuid
 		  AND access_type IN ('camp','parking','boat_ramp','intermediate','shuttle_drop')
-		ORDER BY access_type, name
+		ORDER BY ST_LineLocatePoint((SELECT centerline FROM user_reaches WHERE id = $1::uuid)::geometry, location::geometry) ASC NULLS LAST, access_type, name
 	`, runID)
 	if apRows != nil {
 		defer apRows.Close()
