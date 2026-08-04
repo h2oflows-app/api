@@ -33,6 +33,13 @@ type userProfileRun struct {
 	// fallback for runs still missing an elevation lookup. put_in is
 	// NOT NULL (mig 000071) so PutInLng is never null; elevation is
 	// nullable (EPQS lookup can fail — mig 000150 comment).
+	// RiverSequence: position in the river's NHDPlus flowline order
+	// (mig 000151, web#392). The EXACT upstream→downstream key — elevation
+	// and longitude below are proxies that fail on flat rivers and on rivers
+	// not flowing west→east respectively. NULL when the river is unsequenced
+	// or the run sits off the sequenced mainstem, in which case the elevation
+	// tier still applies.
+	RiverSequence    *int      `json:"river_sequence"`
 	PutInElevationFt *float64  `json:"put_in_elevation_ft,omitempty"`
 	PutInLng         float64   `json:"put_in_lng"`
 	CurrentCFS       *float64  `json:"current_cfs"`
@@ -65,6 +72,7 @@ func (h *UserProfileHandler) GetProfile(w http.ResponseWriter, r *http.Request) 
 			ur.id, ur.slug, ur.name, ur.river_name,
 			ur.class_min, ur.class_max,
 			ur.put_in_elevation_ft,
+			ur.river_sequence,
 			ST_X(ur.put_in::geometry) AS put_in_lng,
 			COALESCE(lr.value, cg.last_value_cfs) AS current_cfs,
 			CASE
@@ -97,7 +105,7 @@ func (h *UserProfileHandler) GetProfile(w http.ResponseWriter, r *http.Request) 
 		WHERE ur.owner_id = $1 AND ur.visibility = 'public' AND ur.deleted_at IS NULL
 		  AND ur.forked_from_user_reach_id IS NULL
 	`+anonPublicOnMapFilter(r, "ur.owner_id")+`
-		ORDER BY ur.put_in_elevation_ft DESC NULLS LAST, ST_X(ur.put_in::geometry) ASC, ur.created_at DESC
+		ORDER BY ur.river_sequence ASC NULLS LAST, ur.put_in_elevation_ft DESC NULLS LAST, ST_X(ur.put_in::geometry) ASC, ur.created_at DESC
 	`, ownerID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
@@ -111,7 +119,7 @@ func (h *UserProfileHandler) GetProfile(w http.ResponseWriter, r *http.Request) 
 		if err := rows.Scan(
 			&run.ID, &run.Slug, &run.Name, &run.RiverName,
 			&run.ClassMin, &run.ClassMax,
-			&run.PutInElevationFt, &run.PutInLng,
+			&run.PutInElevationFt, &run.RiverSequence, &run.PutInLng,
 			&run.CurrentCFS, &run.FlowStatus, &run.CreatedAt,
 		); err == nil {
 			runs = append(runs, run)
@@ -184,7 +192,7 @@ func (h *UserProfileHandler) MapAllByHandle(w http.ResponseWriter, r *http.Reque
 		WHERE ur.owner_id = $1 AND ur.visibility = 'public' AND ur.deleted_at IS NULL
 		  AND ur.forked_from_user_reach_id IS NULL
 	`+anonPublicOnMapFilter(r, "ur.owner_id")+`
-		ORDER BY ur.put_in_elevation_ft DESC NULLS LAST, ST_X(ur.put_in::geometry) ASC, ur.created_at DESC
+		ORDER BY ur.river_sequence ASC NULLS LAST, ur.put_in_elevation_ft DESC NULLS LAST, ST_X(ur.put_in::geometry) ASC, ur.created_at DESC
 	`, ownerID, callerID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
