@@ -79,11 +79,6 @@ func main() {
 	pollerCtx, stopPoller := context.WithCancel(context.Background())
 	go p.Run(pollerCtx)
 
-	var describer *ai.TripDescriber
-	if cfg.AnthropicAPIKey != "" {
-		describer = ai.NewTripDescriber(pool, cfg.AnthropicAPIKey)
-	}
-
 	// #246 A4: invite email — degrades to NoopMailer (logs instead of
 	// sending) when RESEND_API_KEY is unset, same nil/degrade shape as the
 	// ai.* clients above.
@@ -126,7 +121,6 @@ func main() {
 	// Warm the reach map cache immediately, then refresh every poll cycle.
 	reaches.WarmCache(context.Background())
 	reaches.StartCacheRefresh(pollerCtx, pollInterval.USGS)
-	trips := handlers.NewTripHandler(pool, describer)
 	reports := handlers.NewReportHandler(pool, devFallbackID)
 	flowProposals := handlers.NewFlowProposalHandler(pool, devFallbackID)
 	flowBandOverrides := handlers.NewFlowBandOverrideHandler(pool, devFallbackID)
@@ -487,12 +481,6 @@ func main() {
 		r.Patch("/me/dashboards/{slug}", dashboards.Update)
 		r.Delete("/me/dashboards/{slug}", dashboards.Delete)
 		r.Patch("/me/dashboards-reorder", dashboards.Reorder)
-
-		r.Post("/trips", trips.Create)
-		r.Get("/trips", trips.List)
-		r.Get("/trips/{id}", trips.Get)
-		r.Patch("/trips/{id}", trips.Patch)
-		r.Post("/trips/{id}/describe", trips.Describe)
 	})
 
 	// OpenGraph share-card PNGs — no auth, top-level path so social scrapers
