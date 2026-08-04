@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -16,6 +17,7 @@ import (
 	gauge "github.com/h2oflow/h2oflow/apps/api/internal/gaugecore"
 	"github.com/h2oflow/h2oflow/apps/api/internal/kmlimport"
 	"github.com/h2oflow/h2oflow/apps/api/internal/nldi"
+	"github.com/h2oflow/h2oflow/apps/api/internal/rivertopology"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -1635,6 +1637,7 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("create failed: %v", err))
 		return
 	}
+	resequenceRun(ctx, h.db, reachID)
 
 	// Insert flow bands.
 	if fb := body.FlowBands; fb != nil {
@@ -1760,6 +1763,7 @@ func (h *UserReachHandler) Import(w http.ResponseWriter, r *http.Request) { //no
 		errorResponse(w, http.StatusInternalServerError, fmt.Sprintf("import failed: %v", err))
 		return
 	}
+	resequenceRun(ctx, h.db, reachID)
 
 	if fb := body.FlowBands; fb != nil {
 		_, _ = h.db.Exec(ctx,
@@ -2125,6 +2129,12 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if h.db.QueryRow(ctx, `SELECT id FROM user_reaches WHERE owner_id = $1 AND slug = $2`,
 		ownerID, slug).Scan(&runID) == nil {
 		saveCompleteness(ctx, h.db, runID)
+		// Unconditional rather than gated on "did up_comid change": moving a
+		// put-in re-snaps it, and a re-snap that lands off the sequenced
+		// mainstem has to clear the old sequence, not keep it. Resequence is
+		// idempotent and network-free, so the cheapest correct rule is to run
+		// it on every edit.
+		resequenceRun(ctx, h.db, runID)
 	}
 
 	jsonResponse(w, http.StatusOK, map[string]string{"slug": slug})
@@ -2843,6 +2853,25 @@ type pgxQueryer interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
 
+// resequenceRun places a newly created or newly moved run on its river
+// (web#406), reading only the cached flowline order — no NLDI, no network.
+//
+// Called on every write path that creates a run or changes its endpoints.
+// Without it a run's river_sequence stays NULL until someone runs
+// cmd/backfill-river-topology by hand, so a new run would sort to the bottom
+// of its river no matter where it actually sits, and stay there indefinitely.
+//
+// Best-effort by design. The run is already committed, and -infer-only
+// re-derives every sequence on the next sweep, so a failure here costs
+// ordering until then rather than the request. It is also idempotent, which is
+// why the update path can call it unconditionally instead of trying to detect
+// whether a comid actually moved.
+func resequenceRun(ctx context.Context, q pgxQueryer, runID string) {
+	if err := rivertopology.Resequence(ctx, q, runID); err != nil {
+		log.Printf("resequence run %s: %v", runID, err)
+	}
+}
+
 // forkRunTx forks any forkable run — public, or the caller's own — into a new
 // user_reaches row owned by ownerID. Always snapshots
 // original_author_handle/original_author_owner_id so provenance survives
@@ -2954,6 +2983,13 @@ func forkRunTx(ctx context.Context, q pgxQueryer, ownerID, srcRunID string) (new
 	).Scan(&newID); err != nil {
 		return "", "", fmt.Errorf("fork insert failed: %w", err)
 	}
+
+	// A fork carries no up_comid (the insert above copies coordinates, not
+	// network identity), so it can never be sequenced from topology and would
+	// otherwise sort to the bottom of a river it sits in the middle of. Its
+	// put-in elevation is copied verbatim from the source, so interpolation
+	// places it exactly where the original sits.
+	resequenceRun(ctx, q, newID)
 
 	if len(src.Centerline) > 0 {
 		_, _ = q.Exec(ctx, `

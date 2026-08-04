@@ -323,6 +323,8 @@ func (h *UserReachHandler) createOneUploadRun(ctx context.Context, ownerID, name
 	).Scan(&id); err != nil {
 		return "", "", "", fmt.Errorf("create failed: %w", err)
 	}
+	// Inside the tx, so a sequence can't outlive a rolled-back run.
+	resequenceRun(ctx, tx, id)
 
 	if clOK {
 		if _, err := tx.Exec(ctx,

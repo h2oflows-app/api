@@ -22,8 +22,18 @@ import (
 
 	"github.com/h2oflow/h2oflow/apps/api/internal/nldi"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// Execer is the subset of pgx a resequence needs. Declared as an interface so
+// Resequence works both on the pool and inside a caller's transaction — the
+// upload path (run_upload.go) creates a run inside one, and a sequence written
+// outside it would survive a rollback.
+type Execer interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
 
 // Navigation distances in km. NLDI caps distance at ~9999.
 //
@@ -59,8 +69,13 @@ func New(db *pgxpool.Pool) *Syncer {
 
 // RiverResult reports what one river's sync did. Uncovered is the count of
 // members whose comid did NOT appear in the mainstem order — almost always
-// runs on a tributary of the same-named river. They keep river_sequence NULL
-// and fall back to elevation rather than being guessed at.
+// runs on a tributary of the same-named river, a fork (which carries no comid
+// at all), or a put-in that snapped across a confluence.
+//
+// Uncovered runs get an INFERRED sequence rather than staying NULL (web#406),
+// counted separately in Inferred: their position comes from elevation, not
+// topology, and the two must stay distinguishable. Sequenced counts only
+// surveyed rows.
 type RiverResult struct {
 	RiverID   string
 	RiverName string
@@ -69,6 +84,7 @@ type RiverResult struct {
 	Flowlines int
 	Members   int
 	Sequenced int
+	Inferred  int
 	Uncovered []string
 	Err       error
 }
@@ -147,12 +163,28 @@ func (s *Syncer) SyncRiver(ctx context.Context, riverID string) RiverResult {
 		return res
 	}
 
+	// Clear last sweep's guesses BEFORE assigning, so assignRuns sees a clean
+	// surveyed/NULL split and inferRuns interpolates against measured topology
+	// only. Re-inferring from a mix of surveyed and previously-inferred rows
+	// would let one guess anchor the next.
+	if err := clearInferred(ctx, s.db, riverID); err != nil {
+		res.Err = err
+		return res
+	}
+
 	n, err := s.assignRuns(ctx, riverID)
 	if err != nil {
 		res.Err = err
 		return res
 	}
 	res.Sequenced = n
+
+	inf, err := inferRuns(ctx, s.db, riverID, nil)
+	if err != nil {
+		res.Err = err
+		return res
+	}
+	res.Inferred = inf
 	return res
 }
 
@@ -300,12 +332,203 @@ func (s *Syncer) assignRuns(ctx context.Context, riverID string) (int, error) {
 	// The UPDATE above is guarded by IS DISTINCT FROM so it is idempotent —
 	// counting affected rows made a correct re-run log "sequenced=0", which
 	// reads as a failure rather than as "already correct".
+	//
+	// Inferred rows are excluded so this stays a count of MEASURED topology.
+	// Callers use it to judge coverage, and folding guesses in would report a
+	// river as fully sequenced when half of it was interpolated.
 	var total int
 	if err := s.db.QueryRow(ctx, `
 		SELECT count(*) FROM user_reaches
-		WHERE river_id = $1 AND deleted_at IS NULL AND river_sequence IS NOT NULL
+		WHERE river_id = $1 AND deleted_at IS NULL
+		  AND river_sequence IS NOT NULL
+		  AND NOT river_sequence_inferred
 	`, riverID).Scan(&total); err != nil {
 		return 0, err
+	}
+	return total, nil
+}
+
+// clearInferred drops a river's interpolated sequences back to NULL. Always
+// paired with a following inferRuns — leaving them cleared would reintroduce
+// the NULL branch this feature exists to close.
+func clearInferred(ctx context.Context, db Execer, riverID string) error {
+	_, err := db.Exec(ctx, `
+		UPDATE user_reaches
+		SET river_sequence = NULL, river_sequence_inferred = FALSE
+		WHERE river_id = $1::uuid
+		  AND deleted_at IS NULL
+		  AND river_sequence_inferred
+	`, riverID)
+	return err
+}
+
+// inferRuns gives every still-unsequenced run on a river a sequence
+// interpolated from where its put-in elevation falls among the river's
+// SURVEYED runs (web#406). Passing reachID limits it to one run, for the
+// create/update path; nil does the whole river.
+//
+// The point is not to improve on elevation — it is to collapse two ordering
+// keys into one. A pairwise comparator is only transitive when each tier is a
+// total preorder (i.e. NULLS LAST), so "compare by sequence only when both
+// sides have one" cannot be made transitive in the comparator. Moving the
+// elevation fallback here, applied once at write time, leaves a single key
+// that both the server's ORDER BY and the client's comparator can use
+// unconditionally.
+//
+// The interpolation is a bracket, not a proportional fit: find the
+// lowest-positioned surveyed run still ABOVE this one by elevation and the
+// highest-positioned one still BELOW it, and take the midpoint. Proportional
+// interpolation would imply elevation is linear in flowline index, which it is
+// not — only the ordering is meaningful.
+//
+// Degenerate cases resolve themselves through the next tier rather than
+// needing special handling. A run above every surveyed run brackets to
+// (min_seq-1, min_seq), whose midpoint is min_seq itself; it ties with the
+// topmost run and elevation DESC then puts it first, which is the right
+// answer. Same, mirrored, at the bottom. Two inferred runs landing in one gap
+// tie and are separated by elevation.
+//
+// Non-monotonic surveyed data (elevation disagreeing with topology — the flat
+// rivers this all exists for) cannot produce a cycle here either: the bracket
+// is still a single number, so the result stays a total order. It may place
+// the run oddly, but oddly is recoverable and a cyclic comparator is not.
+//
+// Runs with no elevation are left NULL deliberately. There is nothing to
+// interpolate from, and inventing a position would be worse than sorting last.
+func inferRuns(ctx context.Context, db Execer, riverID string, reachID *string) (int, error) {
+	tag, err := db.Exec(ctx, `
+		WITH surveyed AS (
+			SELECT ur.river_sequence AS seq, ur.put_in_elevation_ft AS elev
+			FROM user_reaches ur
+			WHERE ur.river_id = $1::uuid
+			  AND ur.deleted_at IS NULL
+			  AND ur.river_sequence IS NOT NULL
+			  AND NOT ur.river_sequence_inferred
+			  AND ur.put_in_elevation_ft IS NOT NULL
+		),
+		bounds AS (
+			SELECT min(seq) AS min_seq, max(seq) AS max_seq FROM surveyed
+		),
+		target AS (
+			SELECT ur.id, ur.put_in_elevation_ft AS elev
+			FROM user_reaches ur
+			WHERE ur.river_id = $1::uuid
+			  AND ur.deleted_at IS NULL
+			  AND ur.river_sequence IS NULL
+			  AND ur.put_in_elevation_ft IS NOT NULL
+			  AND ($2::uuid IS NULL OR ur.id = $2::uuid)
+		),
+		calc AS (
+			SELECT t.id,
+			       ( COALESCE((SELECT max(s.seq) FROM surveyed s WHERE s.elev > t.elev), b.min_seq - 1)
+			       + COALESCE((SELECT min(s.seq) FROM surveyed s WHERE s.elev < t.elev), b.max_seq + 1)
+			       ) / 2 AS seq
+			FROM target t CROSS JOIN bounds b
+			WHERE b.min_seq IS NOT NULL
+		)
+		UPDATE user_reaches ur
+		SET river_sequence = calc.seq,
+		    river_sequence_inferred = TRUE
+		FROM calc
+		WHERE ur.id = calc.id
+	`, riverID, reachID)
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+// Resequence recomputes one run's river_sequence from cached data only — no
+// NLDI, no network. Called on every path that creates a run or moves its
+// endpoints.
+//
+// Without this a new run stays NULL until someone runs
+// cmd/backfill-river-topology by hand, which is both the wrong ordering and
+// invisible until it is noticed. The flowline order for the river is already
+// stored (mig 000151 exists to make this a lookup), so there is no reason to
+// defer it.
+//
+// Failure is worth reporting but never worth failing a create over: the run is
+// already written, and the backfill re-derives sequences for the whole river
+// anyway. Callers log and continue.
+func Resequence(ctx context.Context, db Execer, reachID string) error {
+	// Surveyed first. The subquery form (rather than UPDATE ... FROM) is what
+	// makes this correct on an EDIT: when a moved put-in snaps to a comid that
+	// is not in the order, the sequence must go back to NULL so the infer pass
+	// below can replace it. A join would simply match no rows and leave the
+	// stale value in place, pointing at the run's old position on the river.
+	if _, err := db.Exec(ctx, `
+		UPDATE user_reaches ur
+		SET river_sequence = (
+		        SELECT o.seq FROM river_flowline_order o
+		        WHERE o.river_id = ur.river_id AND o.comid = ur.up_comid
+		    ),
+		    river_sequence_inferred = FALSE
+		WHERE ur.id = $1::uuid
+	`, reachID); err != nil {
+		return err
+	}
+
+	var riverID *string
+	if err := db.QueryRow(ctx,
+		`SELECT river_id::text FROM user_reaches WHERE id = $1::uuid`, reachID,
+	).Scan(&riverID); err != nil {
+		return err
+	}
+	if riverID == nil {
+		// A run with no river has nothing to be sequenced against.
+		return nil
+	}
+
+	_, err := inferRuns(ctx, db, *riverID, &reachID)
+	return err
+}
+
+// InferAll re-infers sequences on every river that has at least one surveyed
+// run. Network-free — it reads only cached topology — so it is cheap enough to
+// re-run routinely, unlike a full SyncRiver sweep.
+//
+// It exists because the per-run Resequence on the create path can only place a
+// run against the surveyed runs that exist AT THAT MOMENT. Sequencing a river
+// for the first time, or a later run filling in a gap, changes the brackets
+// around every guess made before it. This recomputes them all.
+func (s *Syncer) InferAll(ctx context.Context) (int, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT DISTINCT ur.river_id::text
+		FROM user_reaches ur
+		WHERE ur.deleted_at IS NULL
+		  AND ur.river_id IS NOT NULL
+		  AND ur.river_sequence IS NOT NULL
+		  AND NOT ur.river_sequence_inferred
+		ORDER BY 1
+	`)
+	if err != nil {
+		return 0, err
+	}
+	var rivers []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		rivers = append(rivers, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	total := 0
+	for _, id := range rivers {
+		if err := clearInferred(ctx, s.db, id); err != nil {
+			return total, err
+		}
+		n, err := inferRuns(ctx, s.db, id, nil)
+		if err != nil {
+			return total, err
+		}
+		total += n
 	}
 	return total, nil
 }
