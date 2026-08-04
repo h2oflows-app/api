@@ -31,15 +31,55 @@ import (
 // brand-new river row doesn't trigger a second TIGERweb lookup for a
 // coordinate we just looked up. "" is fine — see riverMetaFromCoords.
 func resolveOrCreateRiver(ctx context.Context, db *pgxpool.Pool, riverName, gnisID string, putInLat, putInLng float64, knownState string) string {
-	riverSlug := kmlimport.Slugify(riverName)
 	var rid string
 
+	// GNIS is the only globally unique river identifier — always try it first.
 	if gnisID != "" {
 		_ = db.QueryRow(ctx, `SELECT id FROM rivers WHERE gnis_id = $1`, gnisID).Scan(&rid)
 	}
 
+	// Metadata is resolved BEFORE the name lookup, because basin is part of a
+	// river's identity here: mig 000056 made the unique key
+	// (lower(name), lower(basin)) precisely so two genuinely different rivers
+	// can share a name — Clear Creek exists twice, GNIS 00180418 in the
+	// Arkansas and 00181805 in the South Platte. Matching on name alone with
+	// LIMIT 1 picks between them arbitrarily, so a new Arkansas Clear Creek run
+	// could attach to the South Platte river row.
+	//
+	// Resolved only when the GNIS lookup missed, so an existing river still
+	// costs zero network calls (riverMetaFromCoords hits TIGERweb).
+	var stateAbbr, basin, huc8 string
 	if rid == "" {
-		_ = db.QueryRow(ctx, `SELECT id FROM rivers WHERE lower(name) = lower($1) LIMIT 1`, riverName).Scan(&rid)
+		if gnisID != "" {
+			stateAbbr, basin, huc8 = riverMetaFromGNIS(ctx, gnisID)
+		} else if putInLat != 0 && putInLng != 0 {
+			stateAbbr, basin, huc8 = riverMetaFromCoords(ctx, putInLat, putInLng, knownState)
+		}
+	}
+
+	// Name + basin — the actual identity.
+	if rid == "" && basin != "" {
+		_ = db.QueryRow(ctx, `
+			SELECT id FROM rivers
+			WHERE lower(name) = lower($1)
+			  AND lower(COALESCE(basin, '')) = lower($2)
+		`, riverName, basin).Scan(&rid)
+	}
+
+	// Name alone, ONLY when the basin is unknown. With a known basin a miss
+	// above means "a different river that happens to share this name", which
+	// must become its own row — falling through to a name-only match is what
+	// would file an Arkansas run under a South Platte river.
+	//
+	// GNIS-bearing rows win the tiebreak: attaching to the authoritative row
+	// beats attaching to a bare stub that an earlier no-GNIS create left behind.
+	if rid == "" && basin == "" {
+		_ = db.QueryRow(ctx, `
+			SELECT id FROM rivers
+			WHERE lower(name) = lower($1)
+			ORDER BY (gnis_id IS NULL), created_at
+			LIMIT 1
+		`, riverName).Scan(&rid)
 	}
 
 	// Backfill GNIS ID + state/basin/huc8 on existing river if we now have a GNIS ID.
@@ -61,18 +101,33 @@ func resolveOrCreateRiver(ctx context.Context, db *pgxpool.Pool, riverName, gnis
 
 	if rid == "" {
 		var gnisParam interface{}
-		var stateAbbr, basin, huc8 string
 		if gnisID != "" {
 			gnisParam = gnisID
-			stateAbbr, basin, huc8 = riverMetaFromGNIS(ctx, gnisID)
-		} else if putInLat != 0 && putInLng != 0 {
-			stateAbbr, basin, huc8 = riverMetaFromCoords(ctx, putInLat, putInLng, knownState)
 		}
+
+		// Slug carries the basin when known, matching the convention mig 000056
+		// established ("clear-creek-south-platte"). A basin-less river keeps the
+		// bare name slug.
+		//
+		// This matters beyond tidiness: mig 000056 re-slugged every existing
+		// basin-bearing river, which FREED the bare slugs. A later create that
+		// used only the name could then take "colorado-river" while the real
+		// Colorado River sat at "colorado-river-colorado-basin" — which is
+		// exactly the stub that filed a Daisy Creek run under the Colorado.
+		riverSlug := kmlimport.Slugify(riverName)
+		if basin != "" {
+			riverSlug = kmlimport.Slugify(riverName + "-" + basin)
+		}
+
+		// ON CONFLICT deliberately does NOT touch name. A slug collision means
+		// some other river already owns this slug; filling in its missing
+		// metadata is helpful, but renaming it to whatever this caller happened
+		// to pass silently rewrites a river out from under every run pointing
+		// at it. The other columns only ever fill NULLs, never overwrite.
 		_ = db.QueryRow(ctx, `
 			INSERT INTO rivers (slug, name, gnis_id, state_abbr, basin, huc8)
 			VALUES ($1, $2, $3, NULLIF($4,''), NULLIF($5,''), NULLIF($6,''))
 			ON CONFLICT (slug) DO UPDATE SET
-				name       = EXCLUDED.name,
 				gnis_id    = COALESCE(rivers.gnis_id,    EXCLUDED.gnis_id),
 				state_abbr = COALESCE(rivers.state_abbr, EXCLUDED.state_abbr),
 				basin      = COALESCE(rivers.basin,      EXCLUDED.basin),
@@ -227,19 +282,19 @@ type userReachSummary struct {
 	// run sits off the sequenced mainstem (a tributary, or a put-in snapped to
 	// the far side of a confluence) — those fall back to elevation rather than
 	// being guessed at. See internal/rivertopology.
-	RiverSequence *int `json:"river_sequence"`
-	Note               *string  `json:"note"`
-	ClassMin           *float64 `json:"class_min"`
-	ClassMax           *float64 `json:"class_max"`
-	CurrentCFS         *float64 `json:"current_cfs"`
-	FlowBand           *string  `json:"flow_band"`
-	FlowStatus         string   `json:"flow_status"`
-	GaugeID            *string  `json:"gauge_id"`
-	GaugeExternalID    *string  `json:"gauge_external_id"`
-	GaugeSource        *string  `json:"gauge_source"`
-	GaugeName          *string  `json:"gauge_name"`
-	GaugeLat           *float64 `json:"gauge_lat"`
-	GaugeLng           *float64 `json:"gauge_lng"`
+	RiverSequence   *int     `json:"river_sequence"`
+	Note            *string  `json:"note"`
+	ClassMin        *float64 `json:"class_min"`
+	ClassMax        *float64 `json:"class_max"`
+	CurrentCFS      *float64 `json:"current_cfs"`
+	FlowBand        *string  `json:"flow_band"`
+	FlowStatus      string   `json:"flow_status"`
+	GaugeID         *string  `json:"gauge_id"`
+	GaugeExternalID *string  `json:"gauge_external_id"`
+	GaugeSource     *string  `json:"gauge_source"`
+	GaugeName       *string  `json:"gauge_name"`
+	GaugeLat        *float64 `json:"gauge_lat"`
+	GaugeLng        *float64 `json:"gauge_lng"`
 	// Gauge's own elevation (gauges.elevation_ft, USGS alt_va) — the
 	// referenced-run fallback for PutInElevationFt, exactly parallel to how
 	// GaugeLng already backs up put_in_lng when is_reference is true (see
