@@ -827,6 +827,16 @@ func (h *UserReachHandler) ReferencedRuns(w http.ResponseWriter, r *http.Request
 			ST_Y(g.location::geometry) AS gauge_lat,
 			ST_X(g.location::geometry) AS gauge_lng,
 			g.elevation_ft AS gauge_elevation_ft,
+			-- The referenced run's OWN put-in elevation/longitude (#397 follow-up).
+			-- This endpoint previously served only the GAUGE's elevation, so the
+			-- dashboard fell back to it for referenced rows — and runs sharing a
+			-- gauge then TIED, leaving their upstream→downstream order arbitrary.
+			-- Pine Creek, The Numbers and Fractions all sit on "Arkansas River
+			-- Below Granite" (8544 ft), which is exactly how Fractions surfaced
+			-- above Pine Creek. Per-run elevation is what orders a river; a
+			-- gauge's altitude is only a fallback for runs that lack one.
+			ur.put_in_elevation_ft,
+			ST_X(ur.put_in::geometry) AS put_in_lng,
 			ur.custom_gauge_id::text AS custom_gauge_id,
 			cg.slug AS custom_gauge_slug,
 			cg.name AS custom_gauge_name,
@@ -882,6 +892,7 @@ func (h *UserReachHandler) ReferencedRuns(w http.ResponseWriter, r *http.Request
 			&s.FlowStatus, &s.FlowBand, &s.GaugeID,
 			&s.GaugeExternalID, &s.GaugeSource, &s.GaugeName,
 			&s.GaugeLat, &s.GaugeLng, &s.GaugeElevationFt,
+			&s.PutInElevationFt, &s.PutInLng,
 			&s.CustomGaugeID, &s.CustomGaugeSlug, &s.CustomGaugeName,
 			&s.AuthorHandle,
 		); err == nil {
