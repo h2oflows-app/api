@@ -21,15 +21,23 @@ func NewUserProfileHandler(db *pgxpool.Pool) *UserProfileHandler {
 }
 
 type userProfileRun struct {
-	ID         string    `json:"id"`
-	Slug       string    `json:"slug"`
-	Name       string    `json:"name"`
-	RiverName  *string   `json:"river_name"`
-	ClassMin   *float64  `json:"class_min"`
-	ClassMax   *float64  `json:"class_max"`
-	CurrentCFS *float64  `json:"current_cfs"`
-	FlowStatus string    `json:"flow_status"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID        string   `json:"id"`
+	Slug      string   `json:"slug"`
+	Name      string   `json:"name"`
+	RiverName *string  `json:"river_name"`
+	ClassMin  *float64 `json:"class_min"`
+	ClassMax  *float64 `json:"class_max"`
+	// PutInElevationFt/PutInLng: river-position ordering basis (mig 000150),
+	// same convention as internal/handlers/user_reaches.go — elevation is
+	// direction-agnostic upstream/downstream signal, longitude is the
+	// fallback for runs still missing an elevation lookup. put_in is
+	// NOT NULL (mig 000071) so PutInLng is never null; elevation is
+	// nullable (EPQS lookup can fail — mig 000150 comment).
+	PutInElevationFt *float64  `json:"put_in_elevation_ft,omitempty"`
+	PutInLng         float64   `json:"put_in_lng"`
+	CurrentCFS       *float64  `json:"current_cfs"`
+	FlowStatus       string    `json:"flow_status"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 type userProfileResponse struct {
@@ -56,6 +64,8 @@ func (h *UserProfileHandler) GetProfile(w http.ResponseWriter, r *http.Request) 
 		SELECT
 			ur.id, ur.slug, ur.name, ur.river_name,
 			ur.class_min, ur.class_max,
+			ur.put_in_elevation_ft,
+			ST_X(ur.put_in::geometry) AS put_in_lng,
 			COALESCE(lr.value, cg.last_value_cfs) AS current_cfs,
 			CASE
 				WHEN fr.band_color IS NULL        THEN 'unknown'
@@ -87,7 +97,7 @@ func (h *UserProfileHandler) GetProfile(w http.ResponseWriter, r *http.Request) 
 		WHERE ur.owner_id = $1 AND ur.visibility = 'public' AND ur.deleted_at IS NULL
 		  AND ur.forked_from_user_reach_id IS NULL
 	`+anonPublicOnMapFilter(r, "ur.owner_id")+`
-		ORDER BY ur.created_at DESC
+		ORDER BY ur.put_in_elevation_ft DESC NULLS LAST, ST_X(ur.put_in::geometry) ASC, ur.created_at DESC
 	`, ownerID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
@@ -101,6 +111,7 @@ func (h *UserProfileHandler) GetProfile(w http.ResponseWriter, r *http.Request) 
 		if err := rows.Scan(
 			&run.ID, &run.Slug, &run.Name, &run.RiverName,
 			&run.ClassMin, &run.ClassMax,
+			&run.PutInElevationFt, &run.PutInLng,
 			&run.CurrentCFS, &run.FlowStatus, &run.CreatedAt,
 		); err == nil {
 			runs = append(runs, run)
@@ -147,6 +158,7 @@ func (h *UserProfileHandler) MapAllByHandle(w http.ResponseWriter, r *http.Reque
 			END AS flow_status,
 			ur.primary_gauge_id::text AS gauge_id,
 			ur.class_max,
+			ur.put_in_elevation_ft,
 			COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0) AS upvote_count,
 			EXISTS(SELECT 1 FROM run_upvotes uv WHERE uv.user_reach_id = ur.id AND uv.user_id = $2::text) AS user_upvoted
 		FROM user_reaches ur
@@ -172,6 +184,7 @@ func (h *UserProfileHandler) MapAllByHandle(w http.ResponseWriter, r *http.Reque
 		WHERE ur.owner_id = $1 AND ur.visibility = 'public' AND ur.deleted_at IS NULL
 		  AND ur.forked_from_user_reach_id IS NULL
 	`+anonPublicOnMapFilter(r, "ur.owner_id")+`
+		ORDER BY ur.put_in_elevation_ft DESC NULLS LAST, ST_X(ur.put_in::geometry) ASC, ur.created_at DESC
 	`, ownerID, callerID)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
@@ -191,6 +204,13 @@ func (h *UserProfileHandler) MapAllByHandle(w http.ResponseWriter, r *http.Reque
 		IsUserReach bool     `json:"is_user_reach"`
 		UpvoteCount int64    `json:"upvote_count"`
 		UserUpvoted bool     `json:"user_upvoted"`
+		// PutInLng/PutInElevationFt: same river-position sort basis as
+		// userProfileRun (mig 000150) — the explore/profile sidebar
+		// (RunsMap.vue's ReachListItem) sorts client-side using these.
+		// PutInLng is never null (put_in is NOT NULL, mig 000071);
+		// PutInElevationFt can be (EPQS lookup failure).
+		PutInLng         float64  `json:"put_in_lng"`
+		PutInElevationFt *float64 `json:"put_in_elevation_ft,omitempty"`
 	}
 	type feature struct {
 		Type       string          `json:"type"`
@@ -210,6 +230,7 @@ func (h *UserProfileHandler) MapAllByHandle(w http.ResponseWriter, r *http.Reque
 			flowStatus             string
 			gaugeID                *string
 			classMax               *float64
+			putInElevationFt       *float64
 			upvoteCount            int64
 			userUpvoted            bool
 		)
@@ -217,7 +238,7 @@ func (h *UserProfileHandler) MapAllByHandle(w http.ResponseWriter, r *http.Reque
 			&id, &slug, &name, &riverName,
 			&centerlineJSON,
 			&putInLng, &putInLat, &takeOutLng, &takeOutLat,
-			&currentCFS, &flowStatus, &gaugeID, &classMax, &upvoteCount, &userUpvoted,
+			&currentCFS, &flowStatus, &gaugeID, &classMax, &putInElevationFt, &upvoteCount, &userUpvoted,
 		); err != nil {
 			continue
 		}
@@ -241,17 +262,19 @@ func (h *UserProfileHandler) MapAllByHandle(w http.ResponseWriter, r *http.Reque
 			Type:     "Feature",
 			Geometry: geom,
 			Properties: featureProps{
-				ID:          id,
-				Slug:        slug,
-				Name:        name,
-				RiverName:   riverName,
-				ClassMax:    classMax,
-				FlowStatus:  flowStatus,
-				CurrentCFS:  currentCFS,
-				GaugeID:     gaugeID,
-				IsUserReach: true,
-				UpvoteCount: upvoteCount,
-				UserUpvoted: userUpvoted,
+				ID:               id,
+				Slug:             slug,
+				Name:             name,
+				RiverName:        riverName,
+				ClassMax:         classMax,
+				FlowStatus:       flowStatus,
+				CurrentCFS:       currentCFS,
+				GaugeID:          gaugeID,
+				IsUserReach:      true,
+				UpvoteCount:      upvoteCount,
+				UserUpvoted:      userUpvoted,
+				PutInLng:         putInLng,
+				PutInElevationFt: putInElevationFt,
 			},
 		})
 	}
