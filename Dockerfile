@@ -7,8 +7,6 @@ RUN go mod download
 COPY . .
 
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o /api             ./cmd/server && \
-    CGO_ENABLED=0 GOOS=linux go build -trimpath -o /seed-flows      ./cmd/seed-flow-ranges && \
-    CGO_ENABLED=0 GOOS=linux go build -trimpath -o /backfill-river-gnis ./cmd/backfill-river-gnis && \
     CGO_ENABLED=0 GOOS=linux go build -trimpath -o /backfill-run-state  ./cmd/backfill-run-state && \
     CGO_ENABLED=0 GOOS=linux go build -trimpath -o /backfill-centerline ./cmd/backfill-centerline && \
     CGO_ENABLED=0 GOOS=linux go build -trimpath -o /backfill-run-elevation ./cmd/backfill-run-elevation && \
@@ -20,8 +18,6 @@ FROM alpine:3.20
 RUN apk add --no-cache ca-certificates tzdata
 
 COPY --from=builder /api             /api
-COPY --from=builder /seed-flows      /seed-flows
-COPY --from=builder /backfill-river-gnis /backfill-river-gnis
 COPY --from=builder /backfill-run-state  /backfill-run-state
 COPY --from=builder /backfill-centerline /backfill-centerline
 COPY --from=builder /backfill-run-elevation /backfill-run-elevation

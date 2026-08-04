@@ -162,7 +162,11 @@ func (h *OGHandler) Report(w http.ResponseWriter, r *http.Request) {
 	err := h.db.QueryRow(r.Context(), `
 		SELECT
 			rep.name,
-			rep.handle,
+			-- reports has no handle column; it carries owner_id and the handle
+			-- lives on user_profiles. The join went missing in runs-unify, so
+			-- this query errored and the handler reported every report as
+			-- "not found" — a silent 404 rather than a visible failure.
+			up.handle,
 			rep.report_date::text,
 			rep.flow_cfs,
 			rep.flow_band,
@@ -170,6 +174,7 @@ func (h *OGHandler) Report(w http.ResponseWriter, r *http.Request) {
 			rch.name AS reach_name,
 			rch.long_name AS reach_common
 		FROM reports rep
+		LEFT JOIN user_profiles up ON up.owner_id = rep.owner_id
 		LEFT JOIN user_reaches rch ON rch.id = rep.user_reach_id
 		WHERE rep.id = $1
 	`, id).Scan(&name, &handle, &reportDate, &flowCfs, &flowBand, &paddled, &reachName, &reachCommon)
