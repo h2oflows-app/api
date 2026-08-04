@@ -9,26 +9,6 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
-    # Throwaway Postgres, created and destroyed with the job. It is NOT the dev
-    # or staging database and holds no data — the schema is built purely from
-    # migrations/, which is the point: a long-lived database drifts (hand-run
-    # SQL, an abandoned branch's migration left applied), so it can silently
-    # disagree with what migrations/ actually produces. A from-scratch build
-    # cannot drift.
-    services:
-      postgres:
-        image: postgis/postgis:16-3.4
-        env:
-          POSTGRES_USER: h2oflows
-          POSTGRES_PASSWORD: h2oflows
-          POSTGRES_DB: h2oflows
-        ports: ['5432:5432']
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
-
     env:
       DATABASE_URL: postgres://h2oflows:h2oflows@localhost:5432/h2oflows?sslmode=disable
 
@@ -49,10 +29,33 @@ jobs:
       - name: Test
         run: go test ./...
 
-      - name: Apply migrations
+      # Built from infra/postgres/Dockerfile — the SAME image definition dev and
+      # prod use, so extension availability (postgis + pgvector) can't drift
+      # between what CI validates and what actually runs. A stock postgis image
+      # lacks pgvector and would fail at mig 000028.
+      #
+      # Built and run explicitly rather than declared under `services:`, which
+      # can only pull a pre-built image.
+      #
+      # This container is created and destroyed with the job. It is NOT the dev
+      # or staging database and holds no data — the schema comes only from
+      # migrations/. That is the point: a long-lived database drifts (hand-run
+      # SQL, an abandoned branch's migration left applied) and can silently
+      # disagree with what migrations/ produces. A from-scratch build cannot.
+      - name: Start Postgres
         run: |
-          go install github.com/golang-migrate/migrate/v4/cmd/migrate@latest
-          migrate -path migrations -database "pgx5://h2oflows:h2oflows@localhost:5432/h2oflows?sslmode=disable" up
+          docker build -t h2oflows-postgres-ci infra/postgres
+          docker run -d --name postgres-ci \
+            -e POSTGRES_USER=h2oflows \
+            -e POSTGRES_PASSWORD=h2oflows \
+            -e POSTGRES_DB=h2oflows \
+            -p 5432:5432 \
+            h2oflows-postgres-ci
+          for i in $(seq 1 60); do
+            docker exec postgres-ci pg_isready -U h2oflows -d h2oflows && exit 0
+            sleep 2
+          done
+          echo "postgres did not become ready"; docker logs postgres-ci; exit 1
 
       # Go does not typecheck embedded SQL, so a query naming a column that a
       # migration dropped builds, vets and tests clean, then fails only when a
@@ -60,8 +63,8 @@ jobs:
       # /api/v1/gauges/batch returned 500 in production for weeks (api#189),
       # and how POST /trips and GET /og/reports/{id} broke unnoticed.
       #
-      # sqlcheck PREPAREs every embedded statement against the schema built
-      # above. PREPARE resolves all table and column references without
-      # executing anything, so drift fails here instead of in production.
+      # sqlcheck applies migrations/ and then PREPAREs every embedded statement
+      # against the result. PREPARE resolves all table and column references
+      # without executing anything, so drift fails here instead of in production.
       - name: SQL schema check
-        run: go run ./cmd/sqlcheck
+        run: go run ./cmd/sqlcheck -migrations migrations

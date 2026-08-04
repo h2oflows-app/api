@@ -48,9 +48,38 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/golang-migrate/migrate/v4"
+	_ "github.com/golang-migrate/migrate/v4/database/pgx/v5"
+	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
+
+// applyMigrations builds the schema from migrations/ before checking.
+//
+// Deliberately uses the same library and driver imports as cmd/server rather
+// than shelling out to the golang-migrate CLI: 'go install …/migrate@latest'
+// resolves to a v3 binary built without the pgx5 driver, which fails with
+// "unknown driver pgx5". Doing it in-process keeps the driver version tied to
+// go.mod and reduces CI to a single step.
+func applyMigrations(dbURL, path string) error {
+	dsn := dbURL
+	for _, prefix := range []string{"postgresql://", "postgres://"} {
+		if strings.HasPrefix(dsn, prefix) {
+			dsn = dsn[len(prefix):]
+			break
+		}
+	}
+	m, err := migrate.New("file://"+path, "pgx5://"+dsn)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		return err
+	}
+	return nil
+}
 
 type stmt struct {
 	file string
@@ -60,6 +89,7 @@ type stmt struct {
 
 func main() {
 	verbose := flag.Bool("v", false, "list every statement checked")
+	migrations := flag.String("migrations", "", "apply migrations from this path before checking")
 	flag.Parse()
 
 	dirs := flag.Args()
@@ -71,6 +101,13 @@ func main() {
 	if dbURL == "" {
 		fmt.Fprintln(os.Stderr, "DATABASE_URL is required")
 		os.Exit(2)
+	}
+
+	if *migrations != "" {
+		if err := applyMigrations(dbURL, *migrations); err != nil {
+			fmt.Fprintf(os.Stderr, "migrations: %v\n", err)
+			os.Exit(2)
+		}
 	}
 
 	stmts, err := collect(dirs)
