@@ -732,6 +732,8 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			ctx_reach.river_id               AS context_reach_river_id,
 			ctx_reach.basin_group            AS context_reach_basin_group,
 			ctx_reach.center_lng             AS context_reach_center_lng,
+			ctx_reach.ctx_river_sequence     AS context_reach_river_sequence,
+			ctx_reach.ctx_put_in_elevation_ft AS context_reach_elevation_ft,
 			ctx_reach.river_order            AS context_reach_river_order,
 			ctx_reach.author_handle          AS context_reach_author_handle,
 			g.current_cfs,
@@ -752,6 +754,7 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			-- single best guess rather than no context at all — the same
 			-- trade-off the existing no-slug fallback already makes.)
 			SELECT common_name, full_name, river_name, basin_group, center_lng,
+			       ctx_river_sequence, ctx_put_in_elevation_ft,
 			       state_abbr, river_order, author_handle, river_id
 			-- runs-unify 5c: context reach resolved from user_reaches (curated
 			-- h2oflows twins prioritised); the legacy reaches branch is retired.
@@ -762,6 +765,13 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 					COALESCE(ur.river_name, ur_rv.name) AS river_name,
 					COALESCE(ur_rv.basin, g.watershed_name) AS basin_group,
 					ST_X(ur.put_in::geometry) AS center_lng,
+					-- The context reach's OWN upstream→downstream keys. Without
+					-- these a gauge row can only offer the GAUGE's sequence and
+					-- altitude, which every run sharing that gauge has in common
+					-- — so they all tie and their order collapses to insertion
+					-- order. Same defect class as #397/#401, on the gauge path.
+					ur.river_sequence        AS ctx_river_sequence,
+					ur.put_in_elevation_ft   AS ctx_put_in_elevation_ft,
 					COALESCE(ur.state_abbr, ur_rv.state_abbr) AS state_abbr,
 					NULL::smallint AS river_order,
 					up.handle AS author_handle,
@@ -842,6 +852,8 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			contextReachRiverID      *string
 			contextReachBasinGroup   *string
 			contextReachCenterLng    *float64
+			contextReachRiverSeq     *int
+			contextReachElevationFt  *float64
 			contextReachRiverOrder   *int16
 			contextReachAuthorHandle *string
 			currentCFS               *float64
@@ -856,7 +868,7 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			&reachNamesRaw, &reachSlugsRaw, &reachCommonNamesRaw,
 			&reachRelationship, &lastReadingAt,
 			&lng, &lat, &elevationFt, &riverSequence, &stateAbbr, &basinName, &watershedName,
-			&contextReachCommonName, &contextReachFullName, &contextReachRiverName, &contextReachRiverID, &contextReachBasinGroup, &contextReachCenterLng, &contextReachRiverOrder, &contextReachAuthorHandle,
+			&contextReachCommonName, &contextReachFullName, &contextReachRiverName, &contextReachRiverID, &contextReachBasinGroup, &contextReachCenterLng, &contextReachRiverSeq, &contextReachElevationFt, &contextReachRiverOrder, &contextReachAuthorHandle,
 			&currentCFS, &flowStatus, &flowBandLabel,
 			&pollHealth, &lastPollSuccessAt,
 		); err != nil {
@@ -870,39 +882,41 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			Type:     "Feature",
 			Geometry: geom,
 			Properties: map[string]any{
-				"id":                          id,
-				"context_reach_slug":          contextReachSlug,
-				"external_id":                 externalID,
-				"source":                      source,
-				"name":                        name,
-				"status":                      status,
-				"featured":                    featured,
-				"prominence_score":            prominenceScore,
-				"reach_name":                  combineReachNames(reachNamesRaw),
-				"reach_names":                 reachNamesRaw,
-				"reach_slug":                  firstOrNil(reachSlugsRaw),
-				"reach_slugs":                 reachSlugsRaw,
-				"reach_common_names":          reachCommonNamesRaw,
-				"reach_relationship":          reachRelationship,
-				"last_reading_at":             lastReadingAt,
-				"elevation_ft":                elevationFt,
-				"river_sequence":              riverSequence,
-				"state_abbr":                  stateAbbr,
-				"basin_name":                  basinName,
-				"watershed_name":              watershedName,
-				"context_reach_common_name":   contextReachCommonName,
-				"context_reach_full_name":     contextReachFullName,
-				"context_reach_river_name":    contextReachRiverName,
-				"context_reach_river_id":      contextReachRiverID,
-				"context_reach_basin_group":   contextReachBasinGroup,
-				"context_reach_center_lng":    contextReachCenterLng,
-				"context_reach_river_order":   contextReachRiverOrder,
-				"context_reach_author_handle": contextReachAuthorHandle,
-				"current_cfs":                 currentCFS,
-				"flow_status":                 flowStatus,
-				"flow_band_label":             flowBandLabel,
-				"poll_health":                 pollHealth,
-				"last_poll_success_at":        lastPollSuccessAt,
+				"id":                           id,
+				"context_reach_slug":           contextReachSlug,
+				"external_id":                  externalID,
+				"source":                       source,
+				"name":                         name,
+				"status":                       status,
+				"featured":                     featured,
+				"prominence_score":             prominenceScore,
+				"reach_name":                   combineReachNames(reachNamesRaw),
+				"reach_names":                  reachNamesRaw,
+				"reach_slug":                   firstOrNil(reachSlugsRaw),
+				"reach_slugs":                  reachSlugsRaw,
+				"reach_common_names":           reachCommonNamesRaw,
+				"reach_relationship":           reachRelationship,
+				"last_reading_at":              lastReadingAt,
+				"elevation_ft":                 elevationFt,
+				"river_sequence":               riverSequence,
+				"state_abbr":                   stateAbbr,
+				"basin_name":                   basinName,
+				"watershed_name":               watershedName,
+				"context_reach_common_name":    contextReachCommonName,
+				"context_reach_full_name":      contextReachFullName,
+				"context_reach_river_name":     contextReachRiverName,
+				"context_reach_river_id":       contextReachRiverID,
+				"context_reach_basin_group":    contextReachBasinGroup,
+				"context_reach_center_lng":     contextReachCenterLng,
+				"context_reach_river_sequence": contextReachRiverSeq,
+				"context_reach_elevation_ft":   contextReachElevationFt,
+				"context_reach_river_order":    contextReachRiverOrder,
+				"context_reach_author_handle":  contextReachAuthorHandle,
+				"current_cfs":                  currentCFS,
+				"flow_status":                  flowStatus,
+				"flow_band_label":              flowBandLabel,
+				"poll_health":                  pollHealth,
+				"last_poll_success_at":         lastPollSuccessAt,
 			},
 		})
 	}
