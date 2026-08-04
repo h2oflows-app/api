@@ -120,7 +120,6 @@ func (h *GaugeHandler) Search(w http.ResponseWriter, r *http.Request) {
 			status              string
 			featured            bool
 			prominenceScore     float64
-			reachID             *string
 			reachNamesRaw       []string
 			reachSlugsRaw       []string
 			reachCommonNamesRaw []string
@@ -140,7 +139,7 @@ func (h *GaugeHandler) Search(w http.ResponseWriter, r *http.Request) {
 		)
 		if err := rows.Scan(
 			&id, &externalID, &source, &name, &status,
-			&featured, &prominenceScore, &reachID, &reachNamesRaw, &reachSlugsRaw, &reachCommonNamesRaw,
+			&featured, &prominenceScore, &reachNamesRaw, &reachSlugsRaw, &reachCommonNamesRaw,
 			&reachRelationship, &lastReadingAt,
 			&lng, &lat, &stateAbbr, &basinName, &watershedName, &riverName,
 			&currentCFS, &flowStatus, &flowBandLabel,
@@ -160,7 +159,6 @@ func (h *GaugeHandler) Search(w http.ResponseWriter, r *http.Request) {
 				"status":               status,
 				"featured":             featured,
 				"prominence_score":     prominenceScore,
-				"reach_id":             reachID,
 				"reach_name":           combineReachNames(reachNamesRaw),
 				"reach_names":          reachNamesRaw,
 				"reach_slug":           firstOrNil(reachSlugsRaw),
@@ -523,7 +521,6 @@ func (h *GaugeHandler) querySearch(r *http.Request, p searchParams) (interface {
 			g.status,
 			g.featured,
 			g.prominence_score,
-			g.reach_id,
 			-- runs-unify 5c: runs on this gauge = user_reaches.primary_gauge_id (h2oflows twins).
 			ARRAY(
 				SELECT ra.name FROM user_reaches ra
@@ -699,7 +696,6 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			g.status,
 			g.featured,
 			g.prominence_score,
-			g.reach_id,
 			ARRAY(
 				SELECT ra.name FROM user_reaches ra
 				WHERE ra.primary_gauge_id = g.id AND ra.owner_id = '00000000-0000-0000-0000-000000000001' AND ra.deleted_at IS NULL
@@ -821,7 +817,6 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			status                   string
 			featured                 bool
 			prominenceScore          float64
-			reachID                  *string
 			reachNamesRaw            []string
 			reachSlugsRaw            []string
 			reachCommonNamesRaw      []string
@@ -849,7 +844,7 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 		)
 		if err := rows.Scan(
 			&id, &contextReachSlug, &externalID, &source, &name, &status,
-			&featured, &prominenceScore, &reachID,
+			&featured, &prominenceScore,
 			&reachNamesRaw, &reachSlugsRaw, &reachCommonNamesRaw,
 			&reachRelationship, &lastReadingAt,
 			&lng, &lat, &elevationFt, &stateAbbr, &basinName, &watershedName,
@@ -875,7 +870,6 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 				"status":                      status,
 				"featured":                    featured,
 				"prominence_score":            prominenceScore,
-				"reach_id":                    reachID,
 				"reach_name":                  combineReachNames(reachNamesRaw),
 				"reach_names":                 reachNamesRaw,
 				"reach_slug":                  firstOrNil(reachSlugsRaw),
