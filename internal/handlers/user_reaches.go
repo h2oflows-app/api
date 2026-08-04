@@ -219,6 +219,15 @@ type userReachSummary struct {
 	PutInElevationFt   *float64 `json:"put_in_elevation_ft"`
 	TakeOutElevationFt *float64 `json:"take_out_elevation_ft"`
 	GradientFpm        *float64 `json:"gradient_fpm"`
+	// Position along the river's NHDPlus flowline order (mig 000151, web#392).
+	// The EXACT upstream→downstream key: elevation and longitude are proxies
+	// for flow direction and each fails predictably (elevation on flat rivers,
+	// longitude on anything not flowing west→east), while this is the network
+	// topology itself. NULL when the river has not been sequenced, or when the
+	// run sits off the sequenced mainstem (a tributary, or a put-in snapped to
+	// the far side of a confluence) — those fall back to elevation rather than
+	// being guessed at. See internal/rivertopology.
+	RiverSequence *int `json:"river_sequence"`
 	Note               *string  `json:"note"`
 	ClassMin           *float64 `json:"class_min"`
 	ClassMax           *float64 `json:"class_max"`
@@ -703,6 +712,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			ST_X(ur.take_out::geometry)  AS take_out_lng,
 			ST_Y(ur.take_out::geometry)  AS take_out_lat,
 			ur.put_in_elevation_ft, ur.take_out_elevation_ft, ur.gradient_fpm,
+			ur.river_sequence,
 			ur.note, ur.created_at,
 			ur.class_min, ur.class_max,
 			COALESCE(lr.value, cg.last_value_cfs) AS current_cfs,
@@ -771,6 +781,7 @@ func (h *UserReachHandler) List(w http.ResponseWriter, r *http.Request) {
 			&s.RiverID, &s.StateAbbr, &s.BasinGroup,
 			&s.PutInLng, &s.PutInLat, &s.TakeOutLng, &s.TakeOutLat,
 			&s.PutInElevationFt, &s.TakeOutElevationFt, &s.GradientFpm,
+			&s.RiverSequence,
 			&s.Note, &s.CreatedAt,
 			&s.ClassMin, &s.ClassMax,
 			&s.CurrentCFS, &s.LastReadAt,
@@ -837,6 +848,11 @@ func (h *UserReachHandler) ReferencedRuns(w http.ResponseWriter, r *http.Request
 			-- gauge's altitude is only a fallback for runs that lack one.
 			ur.put_in_elevation_ft,
 			ST_X(ur.put_in::geometry) AS put_in_lng,
+			-- Topological position (mig 000151, web#392). Referenced runs need
+			-- this for the same reason they needed the elevation above: they
+			-- are other people's runs on your dashboard, and without it they
+			-- fall back to a coarser key than the runs beside them.
+			ur.river_sequence,
 			ur.custom_gauge_id::text AS custom_gauge_id,
 			cg.slug AS custom_gauge_slug,
 			cg.name AS custom_gauge_name,
@@ -892,7 +908,7 @@ func (h *UserReachHandler) ReferencedRuns(w http.ResponseWriter, r *http.Request
 			&s.FlowStatus, &s.FlowBand, &s.GaugeID,
 			&s.GaugeExternalID, &s.GaugeSource, &s.GaugeName,
 			&s.GaugeLat, &s.GaugeLng, &s.GaugeElevationFt,
-			&s.PutInElevationFt, &s.PutInLng,
+			&s.PutInElevationFt, &s.PutInLng, &s.RiverSequence,
 			&s.CustomGaugeID, &s.CustomGaugeSlug, &s.CustomGaugeName,
 			&s.AuthorHandle,
 		); err == nil {

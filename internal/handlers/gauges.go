@@ -716,6 +716,13 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			ST_X(g.location::geometry)       AS lng,
 			ST_Y(g.location::geometry)       AS lat,
 			g.elevation_ft,
+			-- Topological position on the river (mig 000151, web#392). Gauges
+			-- need this MORE than runs do: DWR gauges carry NO elevation at all
+			-- (0 of 19 watched in prod), so gauge-only dashboard groups fell
+			-- straight through to the longitude tier. Sequencing gauges from
+			-- the same per-river flowline order as runs is also what lets the
+			-- two interleave on one comparable key.
+			g.river_sequence,
 			COALESCE(ctx_reach.state_abbr, g.state_abbr) AS state_abbr,
 			g.basin_name,
 			g.watershed_name,
@@ -825,6 +832,7 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			lng                      *float64
 			lat                      *float64
 			elevationFt              *float64
+			riverSequence            *int
 			stateAbbr                *string
 			basinName                *string
 			watershedName            *string
@@ -847,7 +855,7 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			&featured, &prominenceScore,
 			&reachNamesRaw, &reachSlugsRaw, &reachCommonNamesRaw,
 			&reachRelationship, &lastReadingAt,
-			&lng, &lat, &elevationFt, &stateAbbr, &basinName, &watershedName,
+			&lng, &lat, &elevationFt, &riverSequence, &stateAbbr, &basinName, &watershedName,
 			&contextReachCommonName, &contextReachFullName, &contextReachRiverName, &contextReachRiverID, &contextReachBasinGroup, &contextReachCenterLng, &contextReachRiverOrder, &contextReachAuthorHandle,
 			&currentCFS, &flowStatus, &flowBandLabel,
 			&pollHealth, &lastPollSuccessAt,
@@ -878,6 +886,7 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 				"reach_relationship":          reachRelationship,
 				"last_reading_at":             lastReadingAt,
 				"elevation_ft":                elevationFt,
+				"river_sequence":              riverSequence,
 				"state_abbr":                  stateAbbr,
 				"basin_name":                  basinName,
 				"watershed_name":              watershedName,

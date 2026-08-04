@@ -61,6 +61,15 @@ func (c *Client) UpstreamGauges(ctx context.Context, comid string, distanceKm in
 	return c.navigate(ctx, comid, "UT", "nwissite", distanceKm)
 }
 
+// UpstreamMainstemFlowlines walks UP a single channel (UM), unlike
+// UpstreamFlowlines which uses UT and fans out into every tributary. River
+// sequencing (web#392) needs UM: it locates the headwater end of the stem a
+// run sits on so the subsequent DM pass covers the whole river in one
+// ordered sweep. UT would return a tree, which has no meaningful last element.
+func (c *Client) UpstreamMainstemFlowlines(ctx context.Context, comid string, distanceKm int) (*Collection, error) {
+	return c.navigate(ctx, comid, "UM", "flowlines", distanceKm)
+}
+
 // DownstreamFlowlines returns mainstem flowlines downstream of comid (DM = downstream mainstem).
 func (c *Client) DownstreamFlowlines(ctx context.Context, comid string, distanceKm int) (*Collection, error) {
 	return c.navigate(ctx, comid, "DM", "flowlines", distanceKm)
