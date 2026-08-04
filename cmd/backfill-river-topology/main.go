@@ -31,9 +31,18 @@
 //	backfill-river-topology -force              # re-sync every eligible river
 //	backfill-river-topology -gauges             # also snap + assign gauges
 //	backfill-river-topology -river <uuid>       # one river only
+//	backfill-river-topology -infer-only         # re-infer only; no NLDI at all
 //
 // Idempotent: a re-run with no -force reports rivers=0 once every river has a
 // topology_synced_at. Reads DATABASE_URL from the environment.
+//
+// -infer-only is the cheap maintenance pass (web#406). Runs whose comid is not
+// on the sequenced mainstem — forks, tributary runs, put-ins snapped across a
+// confluence — get a sequence interpolated from their put-in elevation instead
+// of staying NULL, because a NULL forces every list to blend two ordering keys
+// and no pairwise comparator can do that transitively. Each run is placed on
+// create, but a guess is only as good as the surveyed runs present at the time,
+// so this recomputes every one against current topology. It touches no network.
 package main
 
 import (
@@ -56,6 +65,7 @@ func main() {
 		gaugeLimit = flag.Int("gauge-limit", 200, "max gauges to snap in one run")
 		river      = flag.String("river", "", "sync only this river id")
 		pauseMS    = flag.Int("pause-ms", 250, "delay between NLDI calls")
+		inferOnly  = flag.Bool("infer-only", false, "re-infer sequences from cached topology; no NLDI")
 	)
 	flag.Parse()
 
@@ -73,6 +83,15 @@ func main() {
 
 	s := rivertopology.New(pool)
 	pause := time.Duration(*pauseMS) * time.Millisecond
+
+	if *inferOnly {
+		n, err := s.InferAll(ctx)
+		if err != nil {
+			log.Fatalf("infer: %v", err)
+		}
+		fmt.Printf("inferred=%d\n", n)
+		return
+	}
 
 	var rivers []string
 	if *river != "" {
@@ -101,7 +120,7 @@ func main() {
 		return
 	}
 
-	var synced, failed, uncovered int
+	var synced, failed, uncovered, inferred int
 	for _, id := range rivers {
 		res := s.SyncRiver(ctx, id)
 		switch {
@@ -113,12 +132,16 @@ func main() {
 		default:
 			synced++
 			uncovered += len(res.Uncovered)
-			log.Printf("ok   %-30s members=%d flowlines=%d sequenced=%d headwater=%s uncovered=%v",
-				res.RiverName, res.Members, res.Flowlines, res.Sequenced, res.Headwater, res.Uncovered)
+			inferred += res.Inferred
+			// sequenced counts SURVEYED runs only and inferred counts guesses,
+			// so the two never overlap — a river reading sequenced=8 inferred=2
+			// has 10 ordered runs, 2 of them placed by elevation.
+			log.Printf("ok   %-30s members=%d flowlines=%d sequenced=%d inferred=%d headwater=%s uncovered=%v",
+				res.RiverName, res.Members, res.Flowlines, res.Sequenced, res.Inferred, res.Headwater, res.Uncovered)
 		}
 		time.Sleep(pause)
 	}
-	fmt.Printf("rivers: synced=%d failed=%d uncovered_members=%d\n", synced, failed, uncovered)
+	fmt.Printf("rivers: synced=%d failed=%d uncovered_members=%d inferred_runs=%d\n", synced, failed, uncovered, inferred)
 
 	if *doGauges {
 		n, err := s.ResolveGaugeComIDs(ctx, *gaugeLimit, pause)
