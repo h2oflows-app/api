@@ -51,8 +51,20 @@ jobs:
             -e POSTGRES_DB=h2oflows \
             -p 5432:5432 \
             h2oflows-postgres-ci
+          # Probe over TCP, not the unix socket, and with a real query rather
+          # than pg_isready.
+          #
+          # The postgres entrypoint runs initdb and every /docker-entrypoint-
+          # initdb.d script against a TEMPORARY server started with
+          # listen_addresses='' — reachable on the unix socket only. `docker
+          # exec pg_isready` talks to that socket, so it reports ready while
+          # the real server does not exist yet, and sqlcheck then connects to
+          # a closing port: "read: connection reset by peer".
+          #
+          # Forcing -h 127.0.0.1 makes TCP the discriminator, which is exactly
+          # what distinguishes the init server from the finished one.
           for i in $(seq 1 60); do
-            docker exec postgres-ci pg_isready -U h2oflows -d h2oflows && exit 0
+            docker exec postgres-ci psql -h 127.0.0.1 -U h2oflows -d h2oflows -c 'SELECT 1' >/dev/null 2>&1 && exit 0
             sleep 2
           done
           echo "postgres did not become ready"; docker logs postgres-ci; exit 1
