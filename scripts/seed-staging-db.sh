@@ -40,12 +40,34 @@ cat "$DUMP" | $STG_DC exec -T postgres-stg pg_restore -U "$DB" -d "$DB" --no-own
 
 rm "$DUMP"
 
-# Free up seeded handles for QA signups. Seeded user_profiles are orphans in
-# staging — keyed by PROD Supabase UUIDs that don't exist in the staging
-# Supabase project (separate UUID space). Suffixing their handles means a QA
-# user can claim any name without colliding with seed data. left(handle,26)
-# keeps the result under the 30-char handle CHECK constraint.
-echo "▶ Freeing seeded handles (append -stg, preserve h2oflows)..."
+# Re-attach known testers BEFORE suffixing, so their identity is never broken
+# in the first place.
+#
+# Seeded user_profiles are orphans in staging — keyed by PROD Supabase UUIDs
+# that don't exist in the staging Supabase project (separate UUID space). For
+# anyone we have a staging uuid on file for, we can simply move their rows onto
+# it: they keep their real handle, their dashboards and watchlists, and are
+# never asked to claim a name. The map is keyed on EMAIL because prod uuids are
+# stable across re-seeds while staging uuids are not.
+MAP="$(dirname "$0")/staging-identity-map"
+if [[ -f "$MAP" ]]; then
+  echo "▶ Re-attaching known staging identities..."
+  while IFS='=' read -r email uuid; do
+    email="$(echo "$email" | xargs)"; uuid="$(echo "$uuid" | xargs)"
+    [[ -z "$email" || "$email" == \#* ]] && continue
+    # Never abort the seed over one tester — the suffix step below is the
+    # backstop, and a stale uuid in the map should not cost the whole refresh.
+    "$(dirname "$0")/reattach-staging-identity.sh" "$email" "$uuid" \
+      || echo "  ! could not re-attach $email (stale uuid in $(basename "$MAP")?) — continuing"
+  done < "$MAP"
+else
+  echo "▶ No $(basename "$MAP") — every seeded handle will be suffixed."
+fi
+
+# Everyone left is still an orphan nobody can log in as. Suffixing frees their
+# handles so a QA signup can claim any name without colliding with seed data.
+# left(handle,26) keeps the result under the 30-char handle CHECK constraint.
+echo "▶ Freeing remaining seeded handles (append -stg, preserve h2oflows)..."
 $STG_DC exec -T postgres-stg psql -U "$DB" -d "$DB" -c \
   "UPDATE user_profiles SET handle = left(handle, 26) || '-stg' WHERE handle !~ '-stg\$' AND handle != 'h2oflows';"
 

@@ -46,3 +46,7 @@ DECISIONS.md
 
 # compiled cmd binaries
 /backfill-river-gnis
+
+# Staging identity map — contains staging Supabase user uuids, per-host.
+# Copy scripts/staging-identity-map.example to scripts/staging-identity-map.
+scripts/staging-identity-map
