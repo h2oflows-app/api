@@ -1,0 +1,24 @@
+# Staging identity map — copy to `staging-identity-map` (gitignored) on the
+# EC2 host and fill in real uuids.
+#
+#   <email> = <staging Supabase uuid>
+#
+# seed-staging-db.sh reads this after restoring the prod dump and re-points
+# each person's seeded rows onto their staging uuid, so they keep their handle,
+# dashboards and watchlists instead of landing on an orphaned prod uuid and
+# being asked to claim a new name.
+#
+# Keyed on EMAIL, not uuid, on purpose: the prod uuid on the left-hand side
+# would change nothing, but the email is the only stable join between a prod
+# dump and a staging Supabase account. Prod uuids stay the same across
+# re-seeds; staging uuids only change if the Supabase project is rebuilt.
+#
+# Find a staging uuid in the staging Supabase dashboard under
+# Authentication → Users, or from a profile already created in staging:
+#
+#   SELECT owner_id, handle, created_at FROM user_profiles ORDER BY created_at DESC LIMIT 5;
+#
+# Anyone NOT listed here keeps the old behaviour: their seeded handle gets a
+# `-stg` suffix so it is free for a QA signup to claim.
+
+# you@example.com = 00000000-0000-0000-0000-000000000000
