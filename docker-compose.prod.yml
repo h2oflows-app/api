@@ -26,6 +26,21 @@ services:
       SUPABASE_JWKS_URL:  ${SUPABASE_JWKS_URL}
       USGS_API_KEY:       ${USGS_API_KEY}
       DWR_API_KEY:        ${DWR_API_KEY}
+      # Invite sync (api#169-178). These have been live on prod since 2026-08-01
+      # but only ever as a hand edit on the EC2 host — restoring this file from
+      # git would have silently un-configured email on the next recreate:
+      # RESEND_API_KEY unset falls back to NoopMailer (internal/mail), so invites
+      # log instead of send, and RSVP_INBOUND_SECRET unset makes the inbound RSVP
+      # handler return 503.
+      #
+      # Listed explicitly rather than via env_file, matching DWR_API_KEY above —
+      # this service deliberately enumerates what it passes through. (Staging is
+      # the opposite: docker-compose.staging.yml uses `env_file: .env.staging`,
+      # which is why it never needed these lines.)
+      MAIL_FROM:          ${MAIL_FROM}
+      RESEND_API_KEY:     ${RESEND_API_KEY}
+      RSVP_INBOUND_SECRET: ${RSVP_INBOUND_SECRET}
+      WEB_BASE_URL:       ${WEB_BASE_URL:-https://h2oflows.app}
       APP_PORT:          "8080"
       APP_DOMAIN:        h2oflows.app
     depends_on:
