@@ -1630,7 +1630,12 @@ func (h *UserReachHandler) Create(w http.ResponseWriter, r *http.Request) {
 		body.TakeOut.Lng, body.TakeOut.Lat,
 		body.UpComID, body.DownComID, body.Note,
 		body.ClassMin, body.ClassMax, createVisibility,
-		riverID != nil, stateAbbr,
+		// river_confirmed: always false on create. The river here came from
+		// automatic attribution, and the wizard pre-fills the name from the NHD
+		// suggestion, so nobody has chosen anything yet — see mig 000153. This
+		// used to pass `riverID != nil`, which recorded whether the RESOLVER
+		// succeeded and made unverified runs look verified.
+		false, stateAbbr,
 		putFt, takeFt,
 	).Scan(&reachID)
 	if err != nil {
@@ -1756,7 +1761,8 @@ func (h *UserReachHandler) Import(w http.ResponseWriter, r *http.Request) { //no
 		body.PutIn.Lng, body.PutIn.Lat,
 		body.TakeOut.Lng, body.TakeOut.Lat,
 		body.UpComID, body.DownComID, body.Note,
-		riverID != nil, stateAbbr,
+		// Same as Create: an imported run's river is auto-attributed, not chosen.
+		false, stateAbbr,
 		putFt, takeFt,
 	).Scan(&reachID)
 	if err != nil {
@@ -1939,6 +1945,22 @@ func (h *UserReachHandler) Update(w http.ResponseWriter, r *http.Request) {
 			slug         = CASE WHEN $4 THEN $5 ELSE slug END,
 			note         = $6,
 			river_name   = CASE WHEN $7 THEN $8 ELSE river_name END,
+			-- The ONLY place river_confirmed becomes true (mig 000153): a human
+			-- submitted a river name that differs from the stored one, i.e. an
+			-- actual correction of automatic attribution.
+			--
+			-- IS DISTINCT FROM, not the $7 flag alone, is the whole point. The run
+			-- wizard sends river_name on every save and pre-fills it from the
+			-- NHD suggestion (web RunWizardMap.client.vue), so keying on
+			-- "a name was supplied" would mark every auto-attributed run as
+			-- human-confirmed and reproduce the exact uselessness this replaced.
+			--
+			-- Never reset to false: a correction stays a correction even if the
+			-- name is later edited back or the run's endpoints move.
+			river_confirmed = CASE
+				WHEN $7 AND $8 IS DISTINCT FROM river_name THEN true
+				ELSE river_confirmed
+			END,
 			class_min    = CASE WHEN $9 THEN $10::numeric ELSE class_min END,
 			class_max    = CASE WHEN $11 THEN $12::numeric ELSE class_max END,
 			visibility   = CASE WHEN $13 THEN $14::run_visibility ELSE visibility END,
@@ -2891,6 +2913,10 @@ func forkRunTx(ctx context.Context, q pgxQueryer, ownerID, srcRunID string) (new
 		AuthorHandle       *string
 		RiverID            *string
 		RiverName          *string
+		// Carried so a fork inherits it rather than resetting to false: the
+		// fork copies the source's river verbatim, so a river a human vouched
+		// for on the original is equally vouched for here (mig 000153).
+		RiverConfirmed     bool
 		Note               *string
 		ClassMin           *float64
 		ClassMax           *float64
@@ -2915,7 +2941,8 @@ func forkRunTx(ctx context.Context, q pgxQueryer, ownerID, srcRunID string) (new
 			ST_X(ur.put_in::geometry),  ST_Y(ur.put_in::geometry),
 			ST_X(ur.take_out::geometry), ST_Y(ur.take_out::geometry),
 			ST_AsGeoJSON(ur.centerline::geometry),
-			ur.put_in_elevation_ft, ur.take_out_elevation_ft, ur.gradient_fpm
+			ur.put_in_elevation_ft, ur.take_out_elevation_ft, ur.gradient_fpm,
+			ur.river_confirmed
 		FROM user_reaches ur
 		LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
 		WHERE ur.id = $1 AND ur.deleted_at IS NULL
@@ -2929,6 +2956,7 @@ func forkRunTx(ctx context.Context, q pgxQueryer, ownerID, srcRunID string) (new
 		&src.TakeOutLng, &src.TakeOutLat,
 		&src.Centerline,
 		&src.PutInElevationFt, &src.TakeOutElevationFt, &src.GradientFpm,
+		&src.RiverConfirmed,
 	)
 	if err != nil {
 		return "", "", fmt.Errorf("run not found: %w", err)
@@ -2977,7 +3005,7 @@ func forkRunTx(ctx context.Context, q pgxQueryer, ownerID, srcRunID string) (new
 		src.ClassMin, src.ClassMax, src.GaugeID,
 		src.ID,
 		src.AuthorHandle, src.OwnerID,
-		src.RiverID != nil,
+		src.RiverConfirmed,
 		src.Note,
 		src.PutInElevationFt, src.TakeOutElevationFt, src.GradientFpm,
 	).Scan(&newID); err != nil {

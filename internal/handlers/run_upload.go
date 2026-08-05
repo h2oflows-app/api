@@ -661,7 +661,13 @@ func (h *UserReachHandler) UploadUpdate(w http.ResponseWriter, r *http.Request) 
 				up_comid               = NULLIF($7, ''),
 				down_comid             = NULLIF($8, ''),
 				state_abbr             = CASE WHEN $9 THEN NULLIF($10, '') ELSE state_abbr END,
-				river_confirmed        = false,
+				-- Left alone deliberately. This branch runs when an upload moves
+				-- a run's endpoints, which re-derives the river automatically —
+				-- but under mig 000153 the flag records that a HUMAN chose the
+				-- river, and clearing it here would erase a correction someone
+				-- made in the app. Endpoints moving does not un-make that choice.
+				-- (It used to hardcode false, which was consistent with the old
+				-- "did the resolver succeed" meaning.)
 				put_in_elevation_ft    = CASE WHEN $11 THEN $12::numeric ELSE put_in_elevation_ft END,
 				take_out_elevation_ft  = CASE WHEN $13 THEN $14::numeric ELSE take_out_elevation_ft END,
 				gradient_fpm           = CASE WHEN $15 THEN $16::numeric ELSE gradient_fpm END,
