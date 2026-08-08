@@ -574,6 +574,13 @@ type reachListItem struct {
 	GaugeStatus     *string  `json:"gauge_status"`
 	IsSpecial       bool     `json:"is_special"`
 	AuthorHandle    *string  `json:"author_handle"`
+	// Upstream→downstream sort keys, in tier order — the same basis every other
+	// run-listing endpoint uses. This endpoint omitted them entirely, which is
+	// why web's /rivers page could not order runs within a river at all (its
+	// ReachListItem declared them optional and they were always undefined).
+	RiverSequence   *int     `json:"river_sequence"`
+	PutInElevationFt *float64 `json:"put_in_elevation_ft"`
+	PutInLng        *float64 `json:"put_in_lng"`
 }
 
 // queryAllListItems returns a lightweight slice of all reaches with current
@@ -621,7 +628,10 @@ func (h *ReachHandler) queryAllListItems(ctx context.Context, anonOnly bool) ([]
 				ELSE                                   'runnable'
 			END AS flow_status,
 			COALESCE(up.is_special, false) AS is_special,
-			up.handle AS author_handle
+			up.handle AS author_handle,
+			r.river_sequence,
+			r.put_in_elevation_ft,
+			ST_X(r.put_in::geometry) AS put_in_lng
 		FROM user_reaches r
 		LEFT JOIN rivers rv ON rv.id = r.river_id
 		LEFT JOIN gauges g ON g.id = r.primary_gauge_id
@@ -642,9 +652,23 @@ func (h *ReachHandler) queryAllListItems(ctx context.Context, anonOnly bool) ([]
 		WHERE r.owner_id = '00000000-0000-0000-0000-000000000001'
 		  AND r.deleted_at IS NULL
 	`+extra+`
+		-- Ordered on the RUN's own position, not its gauge's.
+		--
+		-- This used to sort by g.elevation_ft — the GAUGE's altitude. Runs share
+		-- gauges constantly (71 of 135 live runs, across 24 gauges), and every
+		-- run on one gauge gets the identical value, so they tied and fell
+		-- through to longitude — which is backwards on any river not flowing
+		-- west→east. That is the same defect fixed three times already in
+		-- web#397, web#401 and api#192; this endpoint was the last one carrying
+		-- it, and the only one nobody had looked at because /rivers never
+		-- ordered runs client-side either.
+		--
+		-- river_sequence (mig 000151) is the exact NHDPlus topological key;
+		-- elevation and longitude below are the documented proxy fallbacks.
 		ORDER BY rv.basin NULLS LAST,
 		         r.river_name NULLS LAST,
-		         g.elevation_ft DESC NULLS LAST,
+		         r.river_sequence ASC NULLS LAST,
+		         r.put_in_elevation_ft DESC NULLS LAST,
 		         ST_X(r.put_in::geometry) ASC NULLS LAST
 	`)
 	if err != nil {
@@ -664,6 +688,7 @@ func (h *ReachHandler) queryAllListItems(ctx context.Context, anonOnly bool) ([]
 			&item.GaugeExternalID, &item.GaugeSource, &item.GaugeName,
 			&item.GaugeStatus, &item.FlowStatus,
 			&item.IsSpecial, &item.AuthorHandle,
+			&item.RiverSequence, &item.PutInElevationFt, &item.PutInLng,
 		); err != nil {
 			continue
 		}
