@@ -374,7 +374,22 @@ type userReachDetail struct {
 	AccessPoints            []userReachAccessPoint `json:"access_points"`
 	UpvoteCount             int                    `json:"upvote_count"`
 	UserUpvoted             bool                   `json:"user_upvoted"`
+	// IsOwn means "the caller may EDIT this run", which for a role member
+	// includes runs owned by the account whose role they hold — a site admin
+	// holding the h2oflows role gets is_own = true on every house run.
+	//
+	// IsOwner is strict: the caller's id IS the row's owner_id.
+	//
+	// The distinction is load-bearing for anything that decides how a run is
+	// STORED rather than whether a control is shown. Adding a run to a
+	// dashboard is the example: your own run becomes a watchlist row keyed by
+	// reach_slug, someone else's becomes a reference keyed by run id. Choosing
+	// that on is_own sends a house run down the reach_slug path, where
+	// POST /watchlist's auto-fork branch finds no user_reaches row under the
+	// caller's owner_id and forks the run instead of referencing it — so the
+	// run the caller asked for never appears and a surprise copy does.
 	IsOwn                   bool                   `json:"is_own"`
+	IsOwner                 bool                   `json:"is_owner"`
 	RiverConfirmed          bool                   `json:"river_confirmed"`
 	ReferenceCount          int                    `json:"reference_count"`
 }
@@ -1322,6 +1337,7 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 
 	d.IsPrivate = d.Visibility != "public"
 	if callerID != "" {
+		d.IsOwner = authorID == callerID
 		for _, id := range editableOwnerIDs(r.Context(), h.db, callerID) {
 			if id == authorID {
 				d.IsOwn = true
