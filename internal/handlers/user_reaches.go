@@ -893,6 +893,12 @@ func (h *UserReachHandler) ReferencedRuns(w http.ResponseWriter, r *http.Request
 	rows, err := h.db.Query(r.Context(), `
 		SELECT
 			ur.id, ur.slug, ur.name, ur.long_name, ur.river_name,
+			-- river_id keys the dashboards per-user basin override. /me/reaches has
+			-- always served it; this endpoint never did, so a river group made up
+			-- only of referenced runs resolved riverId to null and lost its
+			-- basin-edit pencil. Rivers where the caller happens to own a run kept
+			-- theirs, which is why it looked arbitrary.
+			ur.river_id::text,
 			COALESCE(ur.state_abbr, rv.state_abbr) AS state_abbr, rv.basin AS basin_group,
 			COALESCE(lr.value, cg.last_value_cfs) AS current_cfs,
 			COALESCE(lr.timestamp, cg.last_value_at) AS last_reading_at,
@@ -975,6 +981,7 @@ func (h *UserReachHandler) ReferencedRuns(w http.ResponseWriter, r *http.Request
 		var s userReachSummary
 		if err := rows.Scan(
 			&s.ID, &s.Slug, &s.Name, &s.LongName, &s.RiverName,
+			&s.RiverID,
 			&s.StateAbbr, &s.BasinGroup,
 			&s.CurrentCFS, &s.LastReadAt,
 			&s.FlowStatus, &s.FlowBand, &s.GaugeID,
