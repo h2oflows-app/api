@@ -958,7 +958,7 @@ Full architecture decision logged in memory (project_issue16_pr_plan, project_ga
 
 **User reach Get handler.**
 - `userReachDetail` currently does not include rapids / access lists. Extend the Get query (or add separate sub-queries) to return:
-  - `rapids[]` — `{ id, name, description, class_rating, is_surf_wave, is_permanent_hazard, hazard_type, lng, lat }`
+  - `rapids[]` — `{ id, name, description, class_rating, is_surf_wave, is_riffle, is_permanent_hazard, hazard_type, lng, lat }`
   - `access_points[]` — `{ id, access_type, name, notes, lng, lat }`
 - Reach detail map (`my/reaches/[slug].vue`) reads from these arrays and renders pin markers reusing the curated `ReachMap` pin rendering logic.
 

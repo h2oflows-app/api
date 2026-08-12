@@ -323,6 +323,7 @@ type userReachRapid struct {
 	Description       *string  `json:"description"`
 	ClassRating       *float64 `json:"class_rating"`
 	IsSurfWave        bool     `json:"is_surf_wave"`
+	IsRiffle          bool     `json:"is_riffle"`
 	IsPermanentHazard bool     `json:"is_permanent_hazard"`
 	HazardType        *string  `json:"hazard_type"`
 	Lng               *float64 `json:"lng"`
@@ -1150,7 +1151,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 	d.Rapids = make([]userReachRapid, 0)
 	rapRows, _ := h.db.Query(r.Context(), `
 		SELECT id, name, description, class_rating,
-		       is_surf_wave, is_permanent_hazard, hazard_type,
+		       is_surf_wave, is_riffle, is_permanent_hazard, hazard_type,
 		       ST_X(location::geometry), ST_Y(location::geometry),
 		       ST_LineLocatePoint((SELECT centerline FROM user_reaches WHERE id = $1)::geometry, location::geometry) AS line_position
 		FROM rapids
@@ -1162,7 +1163,7 @@ func (h *UserReachHandler) Get(w http.ResponseWriter, r *http.Request) {
 		for rapRows.Next() {
 			var rr userReachRapid
 			if rapRows.Scan(&rr.ID, &rr.Name, &rr.Description, &rr.ClassRating,
-				&rr.IsSurfWave, &rr.IsPermanentHazard, &rr.HazardType,
+				&rr.IsSurfWave, &rr.IsRiffle, &rr.IsPermanentHazard, &rr.HazardType,
 				&rr.Lng, &rr.Lat, &rr.LinePosition) == nil {
 				d.Rapids = append(d.Rapids, rr)
 			}
@@ -1385,7 +1386,7 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 	d.Rapids = make([]userReachRapid, 0)
 	rapRows, _ := h.db.Query(r.Context(), `
 		SELECT id, name, description, class_rating,
-		       is_surf_wave, is_permanent_hazard, hazard_type,
+		       is_surf_wave, is_riffle, is_permanent_hazard, hazard_type,
 		       ST_X(location::geometry), ST_Y(location::geometry),
 		       ST_LineLocatePoint((SELECT centerline FROM user_reaches WHERE id = $1)::geometry, location::geometry) AS line_position
 		FROM rapids WHERE user_reach_id = $1
@@ -1396,7 +1397,7 @@ func (h *UserReachHandler) getPublicByID(w http.ResponseWriter, r *http.Request,
 		for rapRows.Next() {
 			var rr userReachRapid
 			if rapRows.Scan(&rr.ID, &rr.Name, &rr.Description, &rr.ClassRating,
-				&rr.IsSurfWave, &rr.IsPermanentHazard, &rr.HazardType,
+				&rr.IsSurfWave, &rr.IsRiffle, &rr.IsPermanentHazard, &rr.HazardType,
 				&rr.Lng, &rr.Lat, &rr.LinePosition) == nil {
 				d.Rapids = append(d.Rapids, rr)
 			}
@@ -1511,7 +1512,7 @@ func (h *UserReachHandler) ListFeatures(w http.ResponseWriter, r *http.Request) 
 	apRows, _ := h.db.Query(ctx, `
 		SELECT id, COALESCE(name, ''), access_type FROM reach_access
 		WHERE user_reach_id = $1::uuid
-		  AND access_type IN ('camp','parking','boat_ramp','intermediate','shuttle_drop')
+		  AND access_type IN ('camp','parking','boat_ramp','intermediate','shuttle_drop','poi')
 		ORDER BY ST_LineLocatePoint((SELECT centerline FROM user_reaches WHERE id = $1::uuid)::geometry, location::geometry) ASC NULLS LAST, access_type, name
 	`, runID)
 	if apRows != nil {
@@ -2394,6 +2395,7 @@ var editableAccessTypes = map[string]bool{
 	"boat_ramp":    true,
 	"intermediate": true,
 	"shuttle_drop": true,
+	"poi":          true,
 }
 
 type rapidInput struct {
@@ -2401,6 +2403,7 @@ type rapidInput struct {
 	Description       *string  `json:"description"`
 	ClassRating       *float64 `json:"class_rating"`
 	IsSurfWave        bool     `json:"is_surf_wave"`
+	IsRiffle          bool     `json:"is_riffle"`
 	IsPermanentHazard bool     `json:"is_permanent_hazard"`
 	HazardType        *string  `json:"hazard_type"`
 	Lng               *float64 `json:"lng"`
@@ -2470,18 +2473,18 @@ func (h *UserReachHandler) SetRapids(w http.ResponseWriter, r *http.Request) {
 		if rp.Lng != nil && rp.Lat != nil {
 			_, insertErr = tx.Exec(ctx, `
 				INSERT INTO rapids (user_reach_id, name, location, description, class_rating,
-				                    is_surf_wave, is_permanent_hazard, hazard_type, data_source, verified)
+				                    is_surf_wave, is_riffle, is_permanent_hazard, hazard_type, data_source, verified)
 				VALUES ($1, $2, ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography,
-				        NULLIF($5, ''), $6, $7, $8, NULLIF($9, ''), 'community', true)
+				        NULLIF($5, ''), $6, $7, $8, $9, NULLIF($10, ''), 'community', true)
 			`, reachID, rp.Name, rp.Lng, rp.Lat, rp.Description, rp.ClassRating,
-				rp.IsSurfWave, rp.IsPermanentHazard, rp.HazardType)
+				rp.IsSurfWave, rp.IsRiffle, rp.IsPermanentHazard, rp.HazardType)
 		} else {
 			_, insertErr = tx.Exec(ctx, `
 				INSERT INTO rapids (user_reach_id, name, description, class_rating,
-				                    is_surf_wave, is_permanent_hazard, hazard_type, data_source, verified)
-				VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, NULLIF($7, ''), 'community', true)
+				                    is_surf_wave, is_riffle, is_permanent_hazard, hazard_type, data_source, verified)
+				VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, $7, NULLIF($8, ''), 'community', true)
 			`, reachID, rp.Name, rp.Description, rp.ClassRating,
-				rp.IsSurfWave, rp.IsPermanentHazard, rp.HazardType)
+				rp.IsSurfWave, rp.IsRiffle, rp.IsPermanentHazard, rp.HazardType)
 		}
 		if insertErr != nil {
 			if isUniqueViolation(insertErr) {
@@ -3107,10 +3110,10 @@ func copyRunFeatures(ctx context.Context, q pgxQueryer, dstID, srcID string) {
 		INSERT INTO rapids
 			(user_reach_id, name, river_mile, location, class_rating, class_at_low, class_at_high,
 			 description, portage_description, is_portage_recommended,
-			 is_surf_wave, is_permanent_hazard, hazard_type, data_source, verified)
+			 is_surf_wave, is_riffle, is_permanent_hazard, hazard_type, data_source, verified)
 		SELECT $1, name, river_mile, location, class_rating, class_at_low, class_at_high,
 			 description, portage_description, is_portage_recommended,
-			 is_surf_wave, is_permanent_hazard, hazard_type, 'community', verified
+			 is_surf_wave, is_riffle, is_permanent_hazard, hazard_type, 'community', verified
 		FROM rapids WHERE user_reach_id = $2
 	`, dstID, srcID)
 

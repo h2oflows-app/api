@@ -38,6 +38,7 @@ type uploadRapid struct {
 	ClassRating       *float64      `json:"class_rating"`
 	HazardType        string        `json:"hazard_type"`
 	IsSurfWave        bool          `json:"is_surf_wave"`
+	IsRiffle          bool          `json:"is_riffle"`
 	IsPermanentHazard bool          `json:"is_permanent_hazard"`
 	Description       *string       `json:"description"`
 	Location          *uploadLatLng `json:"location"`
@@ -70,7 +71,7 @@ type uploadRunInput struct {
 // validAccessTypes is the human-facing list of accepted access_type values,
 // mirroring editableAccessTypes (user_reaches.go). Kept as a literal for a
 // clear validation error message.
-const validAccessTypes = "camp, parking, boat_ramp, intermediate, shuttle_drop"
+const validAccessTypes = "camp, parking, boat_ramp, intermediate, shuttle_drop, poi"
 
 // validateUploadChildren rejects malformed rapids/access before any DB write so
 // the uploader gets a loud, specific error rather than silently-dropped rows —
@@ -359,18 +360,18 @@ func (h *UserReachHandler) createOneUploadRun(ctx context.Context, ownerID, name
 		if rp.Location != nil {
 			_, insertErr = tx.Exec(ctx, `
 				INSERT INTO rapids (user_reach_id, name, location, description, class_rating,
-				                    is_surf_wave, is_permanent_hazard, hazard_type, data_source, verified)
+				                    is_surf_wave, is_riffle, is_permanent_hazard, hazard_type, data_source, verified)
 				VALUES ($1, $2, ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography,
-				        NULLIF($5, ''), $6, $7, $8, NULLIF($9, ''), 'community', true)
+				        NULLIF($5, ''), $6, $7, $8, $9, NULLIF($10, ''), 'community', true)
 			`, id, rpName, rp.Location.Lng, rp.Location.Lat, rp.Description, rp.ClassRating,
-				rp.IsSurfWave, rp.IsPermanentHazard, rp.HazardType)
+				rp.IsSurfWave, rp.IsRiffle, rp.IsPermanentHazard, rp.HazardType)
 		} else {
 			_, insertErr = tx.Exec(ctx, `
 				INSERT INTO rapids (user_reach_id, name, description, class_rating,
-				                    is_surf_wave, is_permanent_hazard, hazard_type, data_source, verified)
-				VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, NULLIF($7, ''), 'community', true)
+				                    is_surf_wave, is_riffle, is_permanent_hazard, hazard_type, data_source, verified)
+				VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, $7, NULLIF($8, ''), 'community', true)
 			`, id, rpName, rp.Description, rp.ClassRating,
-				rp.IsSurfWave, rp.IsPermanentHazard, rp.HazardType)
+				rp.IsSurfWave, rp.IsRiffle, rp.IsPermanentHazard, rp.HazardType)
 		}
 		if insertErr != nil {
 			return "", "", "", fmt.Errorf("rapid insert failed: %w", insertErr)
@@ -702,18 +703,18 @@ func (h *UserReachHandler) UploadUpdate(w http.ResponseWriter, r *http.Request) 
 			if rp.Location != nil {
 				_, _ = h.db.Exec(ctx, `
 					INSERT INTO rapids (user_reach_id, name, location, description, class_rating,
-					                    is_surf_wave, is_permanent_hazard, hazard_type, data_source, verified)
+					                    is_surf_wave, is_riffle, is_permanent_hazard, hazard_type, data_source, verified)
 					VALUES ($1, $2, ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography,
-					        NULLIF($5, ''), $6, $7, $8, NULLIF($9, ''), 'community', true)
+					        NULLIF($5, ''), $6, $7, $8, $9, NULLIF($10, ''), 'community', true)
 				`, reachID, rpName, rp.Location.Lng, rp.Location.Lat, rp.Description, rp.ClassRating,
-					rp.IsSurfWave, rp.IsPermanentHazard, rp.HazardType)
+					rp.IsSurfWave, rp.IsRiffle, rp.IsPermanentHazard, rp.HazardType)
 			} else {
 				_, _ = h.db.Exec(ctx, `
 					INSERT INTO rapids (user_reach_id, name, description, class_rating,
-					                    is_surf_wave, is_permanent_hazard, hazard_type, data_source, verified)
-					VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, NULLIF($7, ''), 'community', true)
+					                    is_surf_wave, is_riffle, is_permanent_hazard, hazard_type, data_source, verified)
+					VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, $7, NULLIF($8, ''), 'community', true)
 				`, reachID, rpName, rp.Description, rp.ClassRating,
-					rp.IsSurfWave, rp.IsPermanentHazard, rp.HazardType)
+					rp.IsSurfWave, rp.IsRiffle, rp.IsPermanentHazard, rp.HazardType)
 			}
 		}
 	}
