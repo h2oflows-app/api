@@ -1,0 +1,23 @@
+-- Move the user_reaches.base_color default back to red (web#430), reversing the
+-- default half of migration 000125.
+--
+-- base_color is the band below a run's lowest threshold — "Too Low". 000125 made
+-- it neutral so a run with no configured flow bands didn't render a red chart
+-- background; the sheet rework (web#361/#427) replaced that background with
+-- dotted threshold lines, so the reason is gone and the grey now actively
+-- misleads: it reads as "this gauge is inactive" rather than "the water is low",
+-- and grey is being given that first meaning explicitly (stale gauges go neutral
+-- in web#430). It was also wrong on its own terms — flowStatusFromColor maps
+-- red → 'caution' and neutral → 'runnable', so a run sitting below its lowest
+-- threshold reported as runnable.
+--
+-- Only the DEFAULT changes. 000125 also back-filled every red-3 row to
+-- neutral-3; this deliberately does NOT back-fill the other way. That rewrite
+-- already happened once, and repeating it would silently overwrite anyone who
+-- has since chosen neutral on purpose. Existing runs keep whatever they carry.
+--
+-- The column default only applies to rows created without a flow_bands payload
+-- (the upload API, forks) — the web wizard always sends one, and as of web#430
+-- what it sends is red-3.
+ALTER TABLE user_reaches
+  ALTER COLUMN base_color SET DEFAULT 'red-3';
