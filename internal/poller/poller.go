@@ -183,7 +183,7 @@ func (p *Poller) fetchAndStore(ctx context.Context, src gauge.GaugeSource, g dbG
 		log.Printf("poller: write reading for %s/%s: %v", src.Name(), g.externalID, err)
 		return
 	}
-	p.recordSuccess(ctx, g.id)
+	p.recordSuccess(ctx, g.id, reading.Timestamp)
 	p.updateDetectedInterval(ctx, g.id)
 }
 
@@ -201,7 +201,14 @@ func (p *Poller) writeReading(ctx context.Context, gaugeID string, r gauge.Readi
 	if err != nil {
 		return err
 	}
-	// Keep gauges.current_cfs and flow_status in sync — only advance forward in time.
+	// Keep gauges.current_cfs and flow_status in sync — only advance forward in
+	// time. The guard below compares last_reading_at against this reading's own
+	// timestamp, which only means "forward in time" now that last_reading_at
+	// holds a reading timestamp too (api#206). While it held NOW() the two sides
+	// were different clocks, and the comparison quietly turned into "is the
+	// source publishing faster than we poll" — true often enough to look fine,
+	// but it would have frozen current_cfs on any gauge whose publish lag
+	// exceeded the poll interval.
 	_, err = p.db.Exec(ctx, `
 		UPDATE gauges
 		SET current_cfs = $2,
@@ -242,10 +249,20 @@ func (p *Poller) writeReading(ctx context.Context, gaugeID string, r gauge.Readi
 
 // recordSuccess resets the failure counter, stamps last_poll_success_at, and
 // restores poll_health to healthy. Auto-managed inactive gauges are re-activated.
-func (p *Poller) recordSuccess(ctx context.Context, gaugeID string) {
+//
+// readingAt is the timestamp the SOURCE put on the reading, not the time we
+// fetched it. Those are different by however far behind the source is
+// publishing — measured at 18-63 minutes across prod gauges (api#206) — and
+// this column previously stored NOW(), making it a byte-identical duplicate of
+// last_poll_success_at and overstating data freshness everywhere it surfaced.
+//
+// GREATEST so a source that briefly re-serves an older value can't rewind it.
+// Postgres GREATEST ignores NULLs, so a gauge with no prior reading takes
+// readingAt directly.
+func (p *Poller) recordSuccess(ctx context.Context, gaugeID string, readingAt time.Time) {
 	_, err := p.db.Exec(ctx, `
 		UPDATE gauges
-		SET last_reading_at           = NOW(),
+		SET last_reading_at           = GREATEST(last_reading_at, $2),
 		    last_poll_success_at      = NOW(),
 		    consecutive_poll_failures = 0,
 		    poll_health               = 'healthy',
@@ -254,7 +271,7 @@ func (p *Poller) recordSuccess(ctx context.Context, gaugeID string) {
 		        ELSE status
 		    END
 		WHERE id = $1
-	`, gaugeID)
+	`, gaugeID, readingAt)
 	if err != nil {
 		log.Printf("poller: record success for %s: %v", gaugeID, err)
 	}
@@ -417,7 +434,7 @@ func (p *Poller) FetchNowIfStale(ctx context.Context, gaugeID string, maxAge tim
 		log.Printf("poller: on-demand write for %s: %v", gaugeID, err)
 		return false
 	}
-	p.recordSuccess(ctx, gaugeID)
+	p.recordSuccess(ctx, gaugeID, reading.Timestamp)
 	return true
 }
 
