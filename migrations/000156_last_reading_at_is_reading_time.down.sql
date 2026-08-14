@@ -1,0 +1,11 @@
+-- Reverse of 000156.
+--
+-- The data half cannot be meaningfully undone: the old values were poll times
+-- that carried no information the new ones don't, and the poll time for each
+-- historical reading was never recorded anywhere else. Restoring the previous
+-- behaviour is the code change (recordSuccess writing NOW()); rolling the rows
+-- back to a fabricated NOW() would be worse than leaving them correct, since
+-- the next poll under the old code overwrites them within one cadence anyway.
+--
+-- So this only drops the comment.
+COMMENT ON COLUMN gauges.last_reading_at IS NULL;
