@@ -136,6 +136,7 @@ func (h *GaugeHandler) Search(w http.ResponseWriter, r *http.Request) {
 			flowBandLabel       *string
 			pollHealth          string
 			lastPollSuccessAt   *time.Time
+			detectedInterval    *int32
 		)
 		if err := rows.Scan(
 			&id, &externalID, &source, &name, &status,
@@ -143,10 +144,12 @@ func (h *GaugeHandler) Search(w http.ResponseWriter, r *http.Request) {
 			&reachRelationship, &lastReadingAt,
 			&lng, &lat, &stateAbbr, &basinName, &watershedName, &riverName,
 			&currentCFS, &flowStatus, &flowBandLabel,
-			&pollHealth, &lastPollSuccessAt,
+			&pollHealth, &lastPollSuccessAt, &detectedInterval,
 		); err != nil {
 			continue
 		}
+
+		readingAge, readingStale := readingFreshness(lastReadingAt, detectedInterval, time.Now())
 
 		features = append(features, Feature{
 			Type:     "Feature",
@@ -175,6 +178,8 @@ func (h *GaugeHandler) Search(w http.ResponseWriter, r *http.Request) {
 				"flow_band_label":      flowBandLabel,
 				"poll_health":          pollHealth,
 				"last_poll_success_at": lastPollSuccessAt,
+				"reading_age_seconds":  readingAge,
+				"reading_stale":        readingStale,
 			},
 		})
 	}
@@ -552,7 +557,8 @@ func (h *GaugeHandler) querySearch(r *http.Request, p searchParams) (interface {
 			COALESCE(fr_band.flow_status, 'unknown') AS flow_status,
 			fr_band.label                            AS flow_band_label,
 			g.poll_health,
-			g.last_poll_success_at
+			g.last_poll_success_at,
+			g.detected_interval_seconds
 		FROM gauges g
 		LEFT JOIN LATERAL (
 			SELECT
@@ -740,7 +746,8 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			COALESCE(fr_band.flow_status, 'unknown') AS flow_status,
 			fr_band.label                    AS flow_band_label,
 			g.poll_health,
-			g.last_poll_success_at
+			g.last_poll_success_at,
+			g.detected_interval_seconds
 		FROM ctx
 		JOIN gauges g ON g.id = ctx.gauge_id
 		LEFT JOIN LATERAL (
@@ -861,6 +868,7 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			flowBandLabel            *string
 			pollHealth               string
 			lastPollSuccessAt        *time.Time
+			detectedInterval         *int32
 		)
 		if err := rows.Scan(
 			&id, &contextReachSlug, &externalID, &source, &name, &status,
@@ -870,7 +878,7 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			&lng, &lat, &elevationFt, &riverSequence, &stateAbbr, &basinName, &watershedName,
 			&contextReachCommonName, &contextReachFullName, &contextReachRiverName, &contextReachRiverID, &contextReachBasinGroup, &contextReachCenterLng, &contextReachRiverSeq, &contextReachElevationFt, &contextReachRiverOrder, &contextReachAuthorHandle,
 			&currentCFS, &flowStatus, &flowBandLabel,
-			&pollHealth, &lastPollSuccessAt,
+			&pollHealth, &lastPollSuccessAt, &detectedInterval,
 		); err != nil {
 			continue
 		}
@@ -878,6 +886,8 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 		if lng != nil && lat != nil {
 			geom = PointGeometry{Type: "Point", Coordinates: [2]float64{*lng, *lat}}
 		}
+		readingAge, readingStale := readingFreshness(lastReadingAt, detectedInterval, time.Now())
+
 		features = append(features, Feature{
 			Type:     "Feature",
 			Geometry: geom,
@@ -916,6 +926,8 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 				"flow_status":                  flowStatus,
 				"flow_band_label":              flowBandLabel,
 				"poll_health":                  pollHealth,
+				"reading_age_seconds":          readingAge,
+				"reading_stale":                readingStale,
 				"last_poll_success_at":         lastPollSuccessAt,
 			},
 		})
