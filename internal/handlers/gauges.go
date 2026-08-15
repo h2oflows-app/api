@@ -625,27 +625,69 @@ func parseFloats(ss []string) ([]float64, error) {
 	return out, nil
 }
 
+// isUUID reports whether s is the canonical 8-4-4-4-12 hex form. Deliberately
+// hand-rolled: the module carries no uuid dependency, and this only has to
+// answer "will Postgres accept this in a ::uuid[] cast".
+func isUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i := 0; i < 36; i++ {
+		c := s[i]
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if c != '-' {
+				return false
+			}
+			continue
+		}
+		switch {
+		case c >= '0' && c <= '9',
+			c >= 'a' && c <= 'f',
+			c >= 'A' && c <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // splitBatchItems parses a slice of "uuid:reach-slug" or plain "uuid" strings
 // into parallel gaugeIDs and reachSlugs slices (empty string = no reach context).
 // Capped at 200 items.
+//
+// Non-UUID ids are dropped rather than passed through. Every id goes to Postgres
+// inside ONE $1::uuid[], so a single malformed entry aborted the whole query:
+// the endpoint answered 500 and the caller's ENTIRE dashboard failed to hydrate,
+// not just the bad row. That is the wrong blast radius for a hydration endpoint
+// whose ids come from long-lived client state (the watchlist store persists to
+// localStorage), where one stale or junk id can outlive several releases.
 func splitBatchItems(items []string) (gaugeIDs, reachSlugs []string) {
 	if len(items) > 200 {
 		items = items[:200]
 	}
 	gaugeIDs = make([]string, 0, len(items))
 	reachSlugs = make([]string, 0, len(items))
+	var skipped []string
 	for _, item := range items {
 		item = strings.TrimSpace(item)
 		if item == "" {
 			continue
 		}
+		id, slug := item, ""
 		if i := strings.IndexByte(item, ':'); i >= 0 {
-			gaugeIDs = append(gaugeIDs, item[:i])
-			reachSlugs = append(reachSlugs, item[i+1:])
-		} else {
-			gaugeIDs = append(gaugeIDs, item)
-			reachSlugs = append(reachSlugs, "")
+			id, slug = item[:i], item[i+1:]
 		}
+		if !isUUID(id) {
+			skipped = append(skipped, item)
+			continue
+		}
+		gaugeIDs = append(gaugeIDs, id)
+		reachSlugs = append(reachSlugs, slug)
+	}
+	if len(skipped) > 0 {
+		// Logged, not silent: a client emitting these has a bug of its own, and
+		// the 200 that replaces the 500 would otherwise hide it completely.
+		log.Printf("gauges batch: skipped %d non-uuid id(s): %v", len(skipped), skipped)
 	}
 	return
 }
