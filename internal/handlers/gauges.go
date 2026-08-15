@@ -625,27 +625,69 @@ func parseFloats(ss []string) ([]float64, error) {
 	return out, nil
 }
 
+// isUUID reports whether s is the canonical 8-4-4-4-12 hex form. Deliberately
+// hand-rolled: the module carries no uuid dependency, and this only has to
+// answer "will Postgres accept this in a ::uuid[] cast".
+func isUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i := 0; i < 36; i++ {
+		c := s[i]
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if c != '-' {
+				return false
+			}
+			continue
+		}
+		switch {
+		case c >= '0' && c <= '9',
+			c >= 'a' && c <= 'f',
+			c >= 'A' && c <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // splitBatchItems parses a slice of "uuid:reach-slug" or plain "uuid" strings
 // into parallel gaugeIDs and reachSlugs slices (empty string = no reach context).
 // Capped at 200 items.
+//
+// Non-UUID ids are dropped rather than passed through. Every id goes to Postgres
+// inside ONE $1::uuid[], so a single malformed entry aborted the whole query:
+// the endpoint answered 500 and the caller's ENTIRE dashboard failed to hydrate,
+// not just the bad row. That is the wrong blast radius for a hydration endpoint
+// whose ids come from long-lived client state (the watchlist store persists to
+// localStorage), where one stale or junk id can outlive several releases.
 func splitBatchItems(items []string) (gaugeIDs, reachSlugs []string) {
 	if len(items) > 200 {
 		items = items[:200]
 	}
 	gaugeIDs = make([]string, 0, len(items))
 	reachSlugs = make([]string, 0, len(items))
+	var skipped []string
 	for _, item := range items {
 		item = strings.TrimSpace(item)
 		if item == "" {
 			continue
 		}
+		id, slug := item, ""
 		if i := strings.IndexByte(item, ':'); i >= 0 {
-			gaugeIDs = append(gaugeIDs, item[:i])
-			reachSlugs = append(reachSlugs, item[i+1:])
-		} else {
-			gaugeIDs = append(gaugeIDs, item)
-			reachSlugs = append(reachSlugs, "")
+			id, slug = item[:i], item[i+1:]
 		}
+		if !isUUID(id) {
+			skipped = append(skipped, item)
+			continue
+		}
+		gaugeIDs = append(gaugeIDs, id)
+		reachSlugs = append(reachSlugs, slug)
+	}
+	if len(skipped) > 0 {
+		// Logged, not silent: a client emitting these has a bug of its own, and
+		// the 200 that replaces the 500 would otherwise hide it completely.
+		log.Printf("gauges batch: skipped %d non-uuid id(s): %v", len(skipped), skipped)
 	}
 	return
 }
@@ -789,8 +831,20 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 				JOIN user_profiles up ON up.owner_id = ur.owner_id
 				WHERE ur.primary_gauge_id = g.id
 				  AND ur.deleted_at IS NULL
+				  -- Both branches are LIMIT 1: a scalar subquery that returns two
+				  -- rows is a runtime ERROR, not a wrong answer. user_reaches is
+				  -- UNIQUE (owner_id, slug), NOT unique on slug, so the moment a
+				  -- second owner holds the same slug on the same gauge — routine,
+				  -- since slugs derive from run names — this exploded with
+				  -- "more than one row returned by a subquery used as an
+				  -- expression". pgx surfaces that on rows.Err(), so the endpoint
+				  -- 500'd and every gauge on the caller's dashboard failed to
+				  -- hydrate off one duplicated slug (web#440 follow-up). Every
+				  -- candidate row here carries the identical slug value, so LIMIT 1
+				  -- picks the same string whichever row it lands on; the outer
+				  -- ORDER BY _prio still decides WHOSE run supplies the context.
 				  AND ur.slug = COALESCE(
-				      (SELECT slug FROM user_reaches WHERE primary_gauge_id = g.id AND deleted_at IS NULL AND slug = ctx.reach_slug),
+				      (SELECT slug FROM user_reaches WHERE primary_gauge_id = g.id AND deleted_at IS NULL AND slug = ctx.reach_slug LIMIT 1),
 				      (SELECT slug FROM user_reaches WHERE primary_gauge_id = g.id AND deleted_at IS NULL ORDER BY slug LIMIT 1)
 				  )
 			) _cr
@@ -809,8 +863,11 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			FROM (
 				SELECT id, base_label, base_color FROM user_reaches
 				WHERE primary_gauge_id = g.id AND owner_id = '00000000-0000-0000-0000-000000000001' AND deleted_at IS NULL
+				  -- Owner-scoped, so UNIQUE (owner_id, slug) does hold it to one row
+				  -- today. LIMIT 1 anyway: same shape as the ctx_reach branch above,
+				  -- and the failure mode is a 500 rather than a bad row.
 				  AND slug = COALESCE(
-				      (SELECT slug FROM user_reaches WHERE primary_gauge_id = g.id AND owner_id = '00000000-0000-0000-0000-000000000001' AND deleted_at IS NULL AND slug = ctx.reach_slug),
+				      (SELECT slug FROM user_reaches WHERE primary_gauge_id = g.id AND owner_id = '00000000-0000-0000-0000-000000000001' AND deleted_at IS NULL AND slug = ctx.reach_slug LIMIT 1),
 				      (SELECT slug FROM user_reaches WHERE primary_gauge_id = g.id AND owner_id = '00000000-0000-0000-0000-000000000001' AND deleted_at IS NULL ORDER BY slug LIMIT 1)
 				  )
 				LIMIT 1
