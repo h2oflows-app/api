@@ -831,8 +831,20 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 				JOIN user_profiles up ON up.owner_id = ur.owner_id
 				WHERE ur.primary_gauge_id = g.id
 				  AND ur.deleted_at IS NULL
+				  -- Both branches are LIMIT 1: a scalar subquery that returns two
+				  -- rows is a runtime ERROR, not a wrong answer. user_reaches is
+				  -- UNIQUE (owner_id, slug), NOT unique on slug, so the moment a
+				  -- second owner holds the same slug on the same gauge — routine,
+				  -- since slugs derive from run names — this exploded with
+				  -- "more than one row returned by a subquery used as an
+				  -- expression". pgx surfaces that on rows.Err(), so the endpoint
+				  -- 500'd and every gauge on the caller's dashboard failed to
+				  -- hydrate off one duplicated slug (web#440 follow-up). Every
+				  -- candidate row here carries the identical slug value, so LIMIT 1
+				  -- picks the same string whichever row it lands on; the outer
+				  -- ORDER BY _prio still decides WHOSE run supplies the context.
 				  AND ur.slug = COALESCE(
-				      (SELECT slug FROM user_reaches WHERE primary_gauge_id = g.id AND deleted_at IS NULL AND slug = ctx.reach_slug),
+				      (SELECT slug FROM user_reaches WHERE primary_gauge_id = g.id AND deleted_at IS NULL AND slug = ctx.reach_slug LIMIT 1),
 				      (SELECT slug FROM user_reaches WHERE primary_gauge_id = g.id AND deleted_at IS NULL ORDER BY slug LIMIT 1)
 				  )
 			) _cr
@@ -851,8 +863,11 @@ func (h *GaugeHandler) executeBatch(w http.ResponseWriter, r *http.Request, gaug
 			FROM (
 				SELECT id, base_label, base_color FROM user_reaches
 				WHERE primary_gauge_id = g.id AND owner_id = '00000000-0000-0000-0000-000000000001' AND deleted_at IS NULL
+				  -- Owner-scoped, so UNIQUE (owner_id, slug) does hold it to one row
+				  -- today. LIMIT 1 anyway: same shape as the ctx_reach branch above,
+				  -- and the failure mode is a 500 rather than a bad row.
 				  AND slug = COALESCE(
-				      (SELECT slug FROM user_reaches WHERE primary_gauge_id = g.id AND owner_id = '00000000-0000-0000-0000-000000000001' AND deleted_at IS NULL AND slug = ctx.reach_slug),
+				      (SELECT slug FROM user_reaches WHERE primary_gauge_id = g.id AND owner_id = '00000000-0000-0000-0000-000000000001' AND deleted_at IS NULL AND slug = ctx.reach_slug LIMIT 1),
 				      (SELECT slug FROM user_reaches WHERE primary_gauge_id = g.id AND owner_id = '00000000-0000-0000-0000-000000000001' AND deleted_at IS NULL ORDER BY slug LIMIT 1)
 				  )
 				LIMIT 1
