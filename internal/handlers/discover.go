@@ -44,6 +44,10 @@ type discoverRun struct {
 	UpvoteCount          int64      `json:"upvote_count"`
 	LastForkedAt         *time.Time `json:"last_forked_at"`
 	GaugeName            *string    `json:"gauge_name"`
+	GaugeID              *string    `json:"gauge_id"`
+	CurrentCFS           *float64   `json:"current_cfs"`
+	FlowBand             *string    `json:"flow_band"`
+	FlowColor            *string    `json:"flow_color"`
 	PutInLng             *float64   `json:"put_in_lng"`
 	PutInLat             *float64   `json:"put_in_lat"`
 	OriginalAuthorHandle *string    `json:"original_author_handle"`
@@ -51,26 +55,13 @@ type discoverRun struct {
 }
 
 // ListRuns handles GET /api/v1/discover/runs.
-// Params: q, min_class, max_class, has_gauge, handle, limit, offset.
+// Params: q, min_class, max_class, has_gauge, handle, in_band, limit, offset.
 // Returns curated + community runs interleaved, ranked per V15.
+// Flow fields (web#335): current_cfs + flow_band/flow_color (the p<n> palette
+// key the web resolves) — NOT flow_status, whose red%/blue% CASE went
+// degenerate when mig 000129 moved colors to palette indices.
 func (h *DiscoverHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
-	q := strings.TrimSpace(r.URL.Query().Get("q"))
-
-	var minClass *float64
-	if v := r.URL.Query().Get("min_class"); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			minClass = &f
-		}
-	}
-	var maxClass *float64
-	if v := r.URL.Query().Get("max_class"); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			maxClass = &f
-		}
-	}
-
-	hasGauge := r.URL.Query().Get("has_gauge") == "true"
-	handle := strings.TrimSpace(r.URL.Query().Get("handle"))
+	f := parseRunFilters(r)
 
 	limit := 20
 	if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && l > 0 && l <= 50 {
@@ -86,6 +77,7 @@ func (h *DiscoverHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 			id, slug, name, river_name, state_abbr, handle, is_special,
 			class_min, class_max, length_mi,
 			upvote_count, last_forked_at, gauge_name,
+			gauge_id, current_cfs, flow_band, flow_color,
 			put_in_lng, put_in_lat,
 			original_author_handle,
 			fork_count,
@@ -113,6 +105,10 @@ func (h *DiscoverHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 				)::bigint                           AS upvote_count,
 				ur.original_forked_at               AS last_forked_at,
 				COALESCE(g.name, cg.name)           AS gauge_name,
+				ur.primary_gauge_id::text           AS gauge_id,
+				COALESCE(lr.value, cg.last_value_cfs) AS current_cfs,
+				fr.band_label                       AS flow_band,
+				fr.band_color                       AS flow_color,
 				ST_X(ur.put_in::geometry)           AS put_in_lng,
 				ST_Y(ur.put_in::geometry)           AS put_in_lat,
 				ur.original_author_handle           AS original_author_handle,
@@ -129,20 +125,21 @@ func (h *DiscoverHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 			LEFT JOIN gauges g ON g.id = ur.primary_gauge_id
 			LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
 			LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
+	` + flowBandLateralSQL + `
 			WHERE ur.visibility = 'public' AND ur.deleted_at IS NULL
 			  AND ur.completeness_score >= 0.2
 			  AND ur.forked_from_user_reach_id IS NULL
-			  AND ($1 = '' OR ur.name ILIKE '%' || $1 || '%' OR ur.river_name ILIKE '%' || $1 || '%')
+			  AND ($1 = '' OR ur.name ILIKE '%' || $1 || '%' OR ur.river_name ILIKE '%' || $1 || '%' OR up.handle ILIKE '%' || $1 || '%')
 			  AND ($2::float8 IS NULL OR ur.class_max >= $2)
 			  AND ($3::float8 IS NULL OR ur.class_min <= $3)
 			  AND (NOT $4::bool OR (g.id IS NOT NULL OR cg.id IS NOT NULL))
 			  AND ($5 = '' OR up.handle = $5)
-	` + anonPublicOnMapFilter(r, "ur.owner_id") + `
+	` + inBandPredicateSQL + anonPublicOnMapFilter(r, "ur.owner_id") + `
 		) combined
 		ORDER BY upvote_count DESC, is_special DESC, text_rank DESC, last_forked_at DESC NULLS LAST
-		LIMIT $6 OFFSET $7
+		LIMIT $7 OFFSET $8
 	`
-	rows, err := h.db.Query(r.Context(), query, q, minClass, maxClass, hasGauge, handle, limit+1, offset)
+	rows, err := h.db.Query(r.Context(), query, f.Q, f.MinClass, f.MaxClass, f.HasGauge, f.Handle, f.InBand, limit+1, offset)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
 		return
@@ -157,6 +154,7 @@ func (h *DiscoverHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 			&run.ID, &run.Slug, &run.Name, &run.RiverName, &run.StateAbbr, &run.Handle, &run.IsSpecial,
 			&run.ClassMin, &run.ClassMax, &run.LengthMi,
 			&run.UpvoteCount, &run.LastForkedAt, &run.GaugeName,
+			&run.GaugeID, &run.CurrentCFS, &run.FlowBand, &run.FlowColor,
 			&run.PutInLng, &run.PutInLat,
 			&run.OriginalAuthorHandle, &run.ForkCount,
 			&textRank,

@@ -563,7 +563,16 @@ func (h *UserReachHandler) MapAll(w http.ResponseWriter, r *http.Request) {
 //
 // Returns GeoJSON FeatureCollection of all public user reaches (is_private=FALSE).
 // Same shape as MapAll. Public endpoint — no auth required.
+//
+// web#335: accepts the shared runFilters (q, min_class, max_class, has_gauge,
+// handle, in_band) parsed identically to /discover/runs so the explore page's
+// pins always equal its list. Fork exclusion + completeness gate match
+// discover too (is_fork is retained in the props for shape compat and is now
+// always false). The clustering CTEs stay UNFILTERED on purpose — cluster
+// identity is defined over the whole public set; only the outer SELECT
+// narrows.
 func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) {
+	f := parseRunFilters(r)
 	query := `
 		WITH geo_clusters AS (
 			-- Geometry-based clustering: same COMID + within 1mi at put-in and take-out.
@@ -600,6 +609,11 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 			LEFT JOIN geo_clusters gc ON gc.run_id = ur.id
 			WHERE ur.visibility = 'public' AND ur.deleted_at IS NULL
 		)
+		-- The subquery wrap keeps this Go literal syntactically incomplete on
+		-- its own, so cmd/sqlcheck 42601-skips it instead of failing the
+		-- spliced flowBandLateralSQL references; flowBandLateralCanary keeps
+		-- the fragment's columns under PREPARE coverage.
+		SELECT * FROM (
 		SELECT
 			ur.id, ur.slug, ur.name, ur.river_name,
 			ST_AsGeoJSON(ur.centerline::geometry)  AS centerline_json,
@@ -616,6 +630,10 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 			END AS flow_status,
 			ur.primary_gauge_id::text AS gauge_id,
 			ur.class_max,
+			ur.class_min,
+			fr.band_label AS flow_band,
+			fr.band_color AS flow_color,
+			COALESCE((SELECT COUNT(*) FROM run_upvotes uv WHERE uv.user_reach_id = ur.id), 0)::bigint AS upvote_count,
 			up.handle AS author_handle,
 			COALESCE(up.is_special, false) AS is_special,
 			COALESCE(cgrp.cluster_id, ur.id::text) AS cluster_id,
@@ -633,31 +651,19 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 		LEFT JOIN custom_gauges cg ON cg.id = ur.custom_gauge_id
 		LEFT JOIN user_profiles up ON up.owner_id = ur.owner_id
 		LEFT JOIN cluster_groups cgrp ON cgrp.run_id = ur.id
-		LEFT JOIN LATERAL (
-			SELECT value FROM gauge_readings
-			WHERE gauge_id = ur.primary_gauge_id
-			  AND timestamp > NOW() - INTERVAL '48 hours'
-			ORDER BY timestamp DESC LIMIT 1
-		) lr ON TRUE
-		LEFT JOIN LATERAL (
-			SELECT label, color FROM user_reach_flow_ranges
-			WHERE user_reach_id = ur.id
-			  AND COALESCE(lr.value, cg.last_value_cfs) >= value
-			ORDER BY value DESC
-			LIMIT 1
-		) thresh ON TRUE,
-		LATERAL (
-			SELECT
-				CASE WHEN EXISTS(SELECT 1 FROM user_reach_flow_ranges WHERE user_reach_id = ur.id) THEN
-					COALESCE(thresh.label, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_label END)
-				END AS band_label,
-				CASE WHEN EXISTS(SELECT 1 FROM user_reach_flow_ranges WHERE user_reach_id = ur.id) THEN
-					COALESCE(thresh.color, CASE WHEN COALESCE(lr.value, cg.last_value_cfs) IS NOT NULL THEN ur.base_color END)
-				END AS band_color
-		) fr
+	` + flowBandLateralSQL + `
 		WHERE ur.visibility = 'public' AND ur.deleted_at IS NULL
-	` + anonPublicOnMapFilter(r, "ur.owner_id")
-	rows, err := h.db.Query(r.Context(), query)
+		  AND ur.completeness_score >= 0.2
+		  AND ur.forked_from_user_reach_id IS NULL
+		  AND ($1 = '' OR ur.name ILIKE '%' || $1 || '%' OR ur.river_name ILIKE '%' || $1 || '%' OR up.handle ILIKE '%' || $1 || '%')
+		  AND ($2::float8 IS NULL OR ur.class_max >= $2)
+		  AND ($3::float8 IS NULL OR ur.class_min <= $3)
+		  AND (NOT $4::bool OR (ur.primary_gauge_id IS NOT NULL OR ur.custom_gauge_id IS NOT NULL))
+		  AND ($5 = '' OR up.handle = $5)
+	` + inBandPredicateSQL + anonPublicOnMapFilter(r, "ur.owner_id") + `
+		) sub
+	`
+	rows, err := h.db.Query(r.Context(), query, f.Q, f.MinClass, f.MaxClass, f.HasGauge, f.Handle, f.InBand)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, "query failed")
 		return
@@ -671,8 +677,12 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 		RiverName    *string  `json:"river_name"`
 		CommonName   *string  `json:"common_name"`
 		ClassMax     *float64 `json:"class_max"`
+		ClassMin     *float64 `json:"class_min"`
 		FlowStatus   string   `json:"flow_status"`
+		FlowBand     *string  `json:"flow_band"`
+		FlowColor    *string  `json:"flow_color"`
 		CurrentCFS   *float64 `json:"current_cfs"`
+		UpvoteCount  int64    `json:"upvote_count"`
 		GaugeID      *string  `json:"gauge_id"`
 		IsUserReach  bool     `json:"is_user_reach"`
 		AuthorHandle *string  `json:"author_handle"`
@@ -699,7 +709,9 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 			currentCFS             *float64
 			flowStatus             string
 			gaugeID                *string
-			classMax               *float64
+			classMax, classMin     *float64
+			flowBand, flowColor    *string
+			upvoteCount            int64
 			authorHandle           *string
 			isSpecial              bool
 			clusterID              string
@@ -711,7 +723,8 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 			&id, &slug, &name, &riverName,
 			&centerlineJSON,
 			&putInLng, &putInLat, &takeOutLng, &takeOutLat,
-			&currentCFS, &flowStatus, &gaugeID, &classMax,
+			&currentCFS, &flowStatus, &gaugeID, &classMax, &classMin,
+			&flowBand, &flowColor, &upvoteCount,
 			&authorHandle, &isSpecial,
 			&clusterID, &isFork, &forkCount, &rankScore,
 		); err != nil {
@@ -743,8 +756,12 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 				RiverName:    riverName,
 				CommonName:   nil,
 				ClassMax:     classMax,
+				ClassMin:     classMin,
 				FlowStatus:   flowStatus,
+				FlowBand:     flowBand,
+				FlowColor:    flowColor,
 				CurrentCFS:   currentCFS,
+				UpvoteCount:  upvoteCount,
 				GaugeID:      gaugeID,
 				IsUserReach:  true,
 				AuthorHandle: authorHandle,
@@ -762,7 +779,11 @@ func (h *UserReachHandler) MapCommunity(w http.ResponseWriter, r *http.Request) 
 		Features []feature `json:"features"`
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "public, max-age=60")
+	// Body varies by auth (anonPublicOnMapFilter) and, since web#335, by query
+	// params — a shared cache serving an anon-narrowed body to an authed
+	// caller would silently hide community runs. private + Vary both ways.
+	w.Header().Set("Cache-Control", "private, max-age=60")
+	w.Header().Set("Vary", "Authorization")
 	_ = json.NewEncoder(w).Encode(featureCollection{Type: "FeatureCollection", Features: features})
 }
 
