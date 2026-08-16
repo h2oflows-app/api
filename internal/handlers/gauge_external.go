@@ -173,15 +173,29 @@ func (h *GaugeExternalHandler) AddExternal(w http.ResponseWriter, r *http.Reques
 
 	extID := normalizeExternalID(strings.TrimSpace(body.ExternalID), body.Source)
 
-	// dashboard_id is NOT NULL — resolve to user's first dashboard if not supplied.
+	// dashboard_id is NOT NULL — resolve to user's first dashboard if not
+	// supplied, auto-creating one for a zero-dashboard account (web#335:
+	// matches watchlist.go Add/AddReference; previously this path left
+	// DashboardID nil and the insert below failed on the NOT NULL column).
 	if body.DashboardID == nil {
 		var dbID string
-		if err := h.db.QueryRow(r.Context(),
-			`SELECT id FROM user_dashboards WHERE owner_id = $1 ORDER BY position LIMIT 1`,
+		err := h.db.QueryRow(r.Context(),
+			`SELECT id::text FROM user_dashboards WHERE owner_id = $1 ORDER BY position, created_at LIMIT 1`,
 			ownerID,
-		).Scan(&dbID); err == nil {
-			body.DashboardID = &dbID
+		).Scan(&dbID)
+		if err != nil {
+			err = h.db.QueryRow(r.Context(), `
+				INSERT INTO user_dashboards (owner_id, slug, name, position)
+				VALUES ($1, 'default', 'My Dashboard', 0)
+				ON CONFLICT (owner_id, slug) DO UPDATE SET name = EXCLUDED.name
+				RETURNING id::text
+			`, ownerID).Scan(&dbID)
+			if err != nil {
+				errorResponse(w, http.StatusInternalServerError, "dashboard resolution failed")
+				return
+			}
 		}
+		body.DashboardID = &dbID
 	}
 
 	// Upsert gauge record.
